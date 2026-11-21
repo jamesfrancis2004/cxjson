@@ -26,9 +26,11 @@ The result is **`cxjson`**.
 
 ---
 
-## Python JSON Library Benchmarks
+## Python JSON Library Benchmarks (Apple M2 / ARM64)
 
-All benchmarks were run locally on an **Apple M2 (ARM64)** with **Python 3.12.3** across 8 representative real-world JSON datasets (`twitter.json`, `citm_catalog.json`, `canada.json`, `gsoc-2018.json`, `usgs_earthquakes_week.json`, `pypi_numpy.json`, `semanticscholar-corpus.json`, `npm_typescript.json`).
+All charts and tables below were measured locally on an **Apple M2 (ARM64)** with **Python 3.12.3** across 8 representative real-world JSON datasets (`twitter.json`, `citm_catalog.json`, `canada.json`, `gsoc-2018.json`, `usgs_earthquakes_week.json`, `pypi_numpy.json`, `semanticscholar-corpus.json`, `npm_typescript.json`).
+
+> **Note on x86_64:** `cxjson` includes runtime-dispatched SSE2, AVX2, and AVX-512BW kernels for x86_64, but all benchmarks below were measured on Apple Silicon (ARM64). We haven't thoroughly benchmarked or tuned bare-metal x86_64 performance yet, so results on x86_64 will vary and there are likely still x86-specific optimizations on the table (contributions and x86 benchmarks are very welcome!).
 
 ![Python JSON Libraries Overview](docs/images/python_libraries_overview.png)
 
@@ -70,7 +72,7 @@ All benchmarks were run locally on an **Apple M2 (ARM64)** with **Python 3.12.3*
 
 To make sure we hadn't accidentally hyper-optimized for a handful of classic benchmark files, we expanded the benchmark suite to **28 diverse datasets**—including live production JSON payloads pulled directly from the PyPI JSON API (`requests`, `pandas`, `numpy`), npm registry (`react`, `typescript`, `lodash`), USGS Earthquake GeoJSON feeds, Nobel Prize API, Semantic Scholar corpus, GitHub events, and deeply nested pretty-printed trees.
 
-`cxjson` swept **56 / 56 (100%)** against `orjson`:
+`cxjson` swept **56 / 56 (100%)** against `orjson` on Apple M2:
 
 ![28 Real-World Datasets vs orjson](docs/images/benchmark_28_datasets.png)
 
