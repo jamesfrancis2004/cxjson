@@ -11,8 +11,10 @@
 
 #define CJSON_SCHEMA_JIT 1
 
+#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 
@@ -42,6 +44,16 @@ typedef char *(*CJsonJitSplitLoopFn)(
     JitRunCtx *ctx            /* R8 */
 );
 
+static int g_jit_enabled_state = -1;
+
+static inline int cjson_jit_is_enabled(void) {
+  if (CJSON_UNLIKELY(g_jit_enabled_state < 0)) {
+    const char *env = getenv("CXJSON_JIT");
+    g_jit_enabled_state = (env != NULL && env[0] == '0' && env[1] == '\0') ? 0 : 1;
+  }
+  return g_jit_enabled_state;
+}
+
 __attribute__((noinline))
 static char *cjson_jit_write_long(char *dst, PyObject *val) {
   return write_py_long(dst, val);
@@ -57,16 +69,20 @@ static char *cjson_jit_write_double(double d, char *dst) {
 }
 
 __attribute__((noinline))
-static char *cjson_jit_emit_str(JsonBuffer *b, char *dst, char **safe_end_p, PyObject *val) {
-  return emit_str_inline(b, dst, safe_end_p, val);
-}
-
-__attribute__((noinline))
 static char *cjson_jit_grow(JsonBuffer *b, char *dst, char **safe_end_p) {
   b->len = (Py_ssize_t)(dst - b->data);
   if (json_buffer_grow(b, b->len + 4096) < 0) return NULL;
   *safe_end_p = b->data + b->cap - 128;
   return b->data + b->len;
+}
+
+__attribute__((noinline))
+static char *cjson_jit_emit_str(JsonBuffer *b, char *dst, char **safe_end_p, PyObject *val) {
+  if (CJSON_UNLIKELY(dst > *safe_end_p)) {
+    dst = cjson_jit_grow(b, dst, safe_end_p);
+    if (dst == NULL) return NULL;
+  }
+  return emit_str_inline(b, dst, safe_end_p, val);
 }
 
 __attribute__((noinline))
@@ -257,8 +273,7 @@ typedef struct {
   CJsonJitSplitLoopFn fn;
 } JitSchemaEntry;
 
-static uint8_t *g_jit_mem = NULL;
-static size_t g_jit_used = 0;
+static pthread_mutex_t g_jit_mu = PTHREAD_MUTEX_INITIALIZER;
 static JitSchemaEntry g_jit_cache[CJSON_JIT_CACHE_SLOTS];
 static uint32_t g_jit_next_slot = 0;
 
@@ -267,7 +282,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile(
     const uint16_t *koff, const uint16_t *klen,
     const uint8_t *vtypes, const uint8_t *order,
     uint8_t psize, const uint8_t *prefix) {
-  if (n == 0 || n > 30 || kbuf_len > 1024) return NULL;
+  if (!cjson_jit_is_enabled() || n == 0 || n > 30 || kbuf_len > 1024) return NULL;
 
   uint64_t h = (uint64_t)n * 0x9E3779B97F4A7C15ULL ^ ((uint64_t)kbuf_len << 32) ^ psize;
   for (uint32_t j = 0; j < n; j++) {
@@ -279,24 +294,22 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile(
 
   for (int s = 0; s < CJSON_JIT_CACHE_SLOTS; s++) {
     JitSchemaEntry *e = &g_jit_cache[s];
-    if (e->fn != NULL && e->sig_hash == h && e->n == n && e->kbuf_len == kbuf_len &&
+    CJsonJitSplitLoopFn fn = __atomic_load_n(&e->fn, __ATOMIC_ACQUIRE);
+    if (fn != NULL && e->sig_hash == h && e->n == n && e->kbuf_len == kbuf_len &&
         e->psize == psize &&
         memcmp(e->vtypes, vtypes, n) == 0 &&
         memcmp(e->order, order, n) == 0 &&
         (psize == 0 || memcmp(e->prefix, prefix, psize) == 0) &&
         memcmp(e->kbuf, kbuf, kbuf_len) == 0) {
-      return e->fn;
+      return fn;
     }
   }
 
-  if (g_jit_mem == NULL) {
-    void *m = mmap(NULL, CJSON_JIT_POOL_BYTES, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (m == MAP_FAILED) return NULL;
-    g_jit_mem = (uint8_t *)m;
-    g_jit_used = 0;
+  pthread_mutex_lock(&g_jit_mu);
+  if (g_jit_next_slot >= CJSON_JIT_CACHE_SLOTS) {
+    pthread_mutex_unlock(&g_jit_mu);
+    return NULL;
   }
-  if (g_jit_used + 8192 > CJSON_JIT_POOL_BYTES) return NULL;
 
   uint8_t tmp_code[8192];
   X64Asm a = {tmp_code, 0, sizeof(tmp_code)};
@@ -537,22 +550,24 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile(
   size_t br_epi = x64_jmp32(&a);
   x64_patch32(&a, br_epi, epilogue_label);
 
-  if (a.len >= a.cap) return NULL;
+  if (a.len >= a.cap) { pthread_mutex_unlock(&g_jit_mu); return NULL; }
 
   for (size_t k = 0; k < n_done; k++) x64_patch32(&a, done_patches[k], done_label);
   for (size_t k = 0; k < n_err; k++) x64_patch32(&a, err_patches[k], err_label);
 
-  size_t aligned = (a.len + 15u) & ~15u;
-  if (g_jit_used + aligned > CJSON_JIT_POOL_BYTES) return NULL;
+  /* Dedicated per-schema immutable W^X page (100% thread-safe) */
+  size_t page_sz = (a.len + 4095u) & ~4095u;
+  void *page = mmap(NULL, page_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (page == MAP_FAILED) { pthread_mutex_unlock(&g_jit_mu); return NULL; }
+  memcpy(page, tmp_code, a.len);
+  if (mprotect(page, page_sz, PROT_READ | PROT_EXEC) != 0) {
+    munmap(page, page_sz);
+    pthread_mutex_unlock(&g_jit_mu);
+    return NULL;
+  }
 
-  uint8_t *dest = g_jit_mem + g_jit_used;
-  if (mprotect(g_jit_mem, CJSON_JIT_POOL_BYTES, PROT_READ | PROT_WRITE) != 0) return NULL;
-  memcpy(dest, tmp_code, a.len);
-  if (mprotect(g_jit_mem, CJSON_JIT_POOL_BYTES, PROT_READ | PROT_EXEC) != 0) return NULL;
-  g_jit_used += aligned;
-
-  CJsonJitSplitLoopFn fn = (CJsonJitSplitLoopFn)(uintptr_t)dest;
-  JitSchemaEntry *slot = &g_jit_cache[(g_jit_next_slot++) & (CJSON_JIT_CACHE_SLOTS - 1u)];
+  CJsonJitSplitLoopFn fn = (CJsonJitSplitLoopFn)(uintptr_t)page;
+  JitSchemaEntry *slot = &g_jit_cache[g_jit_next_slot++];
   slot->sig_hash = h;
   slot->n = n;
   slot->kbuf_len = kbuf_len;
@@ -561,8 +576,17 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile(
   memcpy(slot->order, order, n);
   if (psize > 0) memcpy(slot->prefix, prefix, psize);
   memcpy(slot->kbuf, kbuf, kbuf_len);
-  slot->fn = fn;
+  __atomic_store_n(&slot->fn, fn, __ATOMIC_RELEASE);
+  pthread_mutex_unlock(&g_jit_mu);
   return fn;
+}
+
+static inline CJsonJitSplitLoopFn cjson_jit_get_or_compile_combined(
+    uint32_t n, const char *kbuf, uint32_t kbuf_len,
+    const uint16_t *koff, const uint16_t *klen,
+    const uint8_t *vtypes, PyObject *const *expected_keys) {
+  (void)n; (void)kbuf; (void)kbuf_len; (void)koff; (void)klen; (void)vtypes; (void)expected_keys;
+  return NULL;
 }
 
 #endif /* (__APPLE__ || __linux__) && __x86_64__ */

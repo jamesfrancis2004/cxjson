@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, experimental-jit]
   pull_request:
     branches: [main]
 
@@ -47,6 +47,11 @@ jobs:
           PYTHONPATH: src
         run: python tests/test_regressions_v011.py
 
+      - name: Run JIT security, fuzz, and concurrency tests
+        env:
+          PYTHONPATH: src
+        run: python tests/test_jit_security.py
+
       - name: Run conformance, fork, and fuzz tests
         shell: bash
         env:
@@ -90,6 +95,7 @@ jobs:
           LD_PRELOAD="$ASAN_LIB" python tests/test_conformance_fuzz.py
           LD_PRELOAD="$ASAN_LIB" python tests/test_numpy.py
           LD_PRELOAD="$ASAN_LIB" python tests/test_regressions_v011.py
+          LD_PRELOAD="$ASAN_LIB" python tests/test_jit_security.py
 
   benchmark-gate:
     name: Perf Gate (${{ matrix.label }})
