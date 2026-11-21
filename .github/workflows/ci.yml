@@ -42,6 +42,11 @@ jobs:
           PYTHONPATH: src
         run: python tests/test_memory_leaks.py
 
+      - name: Run v0.1.1 regression tests
+        env:
+          PYTHONPATH: src
+        run: python tests/test_regressions_v011.py
+
       - name: Run conformance, fork, and fuzz tests
         shell: bash
         env:
@@ -84,6 +89,7 @@ jobs:
           LD_PRELOAD="$ASAN_LIB" python tests/test_serializer.py
           LD_PRELOAD="$ASAN_LIB" python tests/test_conformance_fuzz.py
           LD_PRELOAD="$ASAN_LIB" python tests/test_numpy.py
+          LD_PRELOAD="$ASAN_LIB" python tests/test_regressions_v011.py
 
   benchmark-gate:
     name: Perf Gate (${{ matrix.label }})

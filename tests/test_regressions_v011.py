@@ -1,0 +1,200 @@
+"""Regression tests for v0.1.1 fixes:
+- GC cycle collection & gc.is_tracked parity on split-table dicts (P0)
+- OPT_SORT_KEYS prefix-keyed insertion sort & quicksort across all key sizes/edge cases
+- Float serialization fuzzing across random IEEE-754 bit patterns & uniform(-180, 180)
+- Parallel vs single-threaded dumps byte-identical output
+"""
+
+import gc
+import json
+import math
+import os
+import random
+import struct
+import subprocess
+import sys
+import weakref
+
+import cxjson
+
+try:
+    import orjson
+except ImportError:
+    orjson = None
+
+
+def test_split_dict_gc_cycles_and_tracking():
+    class Node:
+        pass
+
+    payload = b'{"id":1,"children":[1,2,3],"meta":{"nested":true}}'
+    for _ in range(6):
+        cxjson.loads(payload)
+
+    refs = []
+    for _ in range(1500):
+        d = cxjson.loads(payload)
+        n = Node()
+        n.data = d
+        d["children"].append(n)
+        refs.append(weakref.ref(n))
+    del d, n
+    gc.collect()
+    gc.collect()
+    alive = sum(r() is not None for r in refs)
+    assert alive <= 3, f"Cycle leak: {alive} surviving objects"
+
+    # Compare tracked dict count on a repeated-schema document vs stdlib json
+    doc = json.dumps([
+        {"a": i, "b": [i, i + 1], "c": {"x": i, "y": "s"}}
+        for i in range(100)
+    ]).encode()
+
+    def count_tracked_dicts(obj):
+        total = 0
+        stack = [obj]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, dict):
+                if gc.is_tracked(cur):
+                    total += 1
+                stack.extend(cur.values())
+            elif isinstance(cur, list):
+                stack.extend(cur)
+        return total
+
+    cx_tracked = count_tracked_dicts(cxjson.loads(doc))
+    std_tracked = count_tracked_dicts(json.loads(doc))
+    assert cx_tracked == std_tracked, f"Tracked dicts mismatch: cxjson={cx_tracked}, json={std_tracked}"
+
+
+def test_opt_sort_keys_all_sizes_and_edge_cases():
+    rng = random.Random(12345)
+
+    # Test key counts spanning 0, 1, 2, 3, 8, 9, 16, 24, 25, 32, 64, 65, 200
+    for n in (0, 1, 2, 3, 4, 8, 9, 16, 24, 25, 32, 64, 65, 200):
+        keys = [f"k_{rng.randint(0, 10**9)}_{i}" for i in range(n)]
+        d = {k: i for i, k in enumerate(keys)}
+        for opt in (
+            cxjson.OPT_SORT_KEYS,
+            cxjson.OPT_SORT_KEYS | cxjson.OPT_INDENT_2,
+        ):
+            got = cxjson.dumps(d, option=opt)
+            if orjson is not None:
+                o_opt = orjson.OPT_SORT_KEYS | (orjson.OPT_INDENT_2 if (opt & cxjson.OPT_INDENT_2) else 0)
+                exp = orjson.dumps(d, option=o_opt)
+                assert got == exp, f"OPT_SORT_KEYS mismatch for n={n}, opt={opt}"
+            else:
+                loaded = json.loads(got)
+                assert list(loaded.keys()) == sorted(d.keys())
+
+    # Shared >8-byte prefixes, short prefixes, empty key, embedded NUL, Unicode
+    tricky = {
+        "": 0,
+        "a": 1,
+        "a\x00": 2,
+        "a\x00b": 3,
+        "ab": 4,
+        "abcdefgh": 5,
+        "abcdefghi": 6,
+        "abcdefgh\x00": 7,
+        "abcdefgh_1": 8,
+        "abcdefgh_0": 9,
+        "prefix_shared_00010": 10,
+        "prefix_shared_00002": 11,
+        "prefix_shared_00001": 12,
+        "é": 13,
+        "日本語": 14,
+        "🎉": 15,
+    }
+    # Shuffle insertion order
+    items = list(tricky.items())
+    rng.shuffle(items)
+    d_tricky = dict(items)
+    got = cxjson.dumps(d_tricky, option=cxjson.OPT_SORT_KEYS)
+    if orjson is not None:
+        assert got == orjson.dumps(d_tricky, option=orjson.OPT_SORT_KEYS)
+    else:
+        assert list(json.loads(got).keys()) == sorted(d_tricky.keys(), key=lambda s: s.encode("utf-8"))
+
+    # OPT_SORT_KEYS + OPT_NON_STR_KEYS
+    d_non_str = {10: "ten", 2: "two", 1: "one", 20: "twenty", 3: "three", 15: "fifteen", 7: "seven", 8: "eight", 9: "nine"}
+    got_ns = cxjson.dumps(d_non_str, option=cxjson.OPT_SORT_KEYS | cxjson.OPT_NON_STR_KEYS)
+    if orjson is not None:
+        assert got_ns == orjson.dumps(d_non_str, option=orjson.OPT_SORT_KEYS | orjson.OPT_NON_STR_KEYS)
+    else:
+        assert list(json.loads(got_ns).keys()) == sorted(str(k) for k in d_non_str)
+
+
+def test_float_fuzz_exactness():
+    rng = random.Random(2026)
+
+    # 1. Special boundary values
+    specials = [
+        0.0, -0.0, 1.0, -1.0, 0.5, -0.5,
+        1e-4, 9.999999e-5, 1e-5, 1e-9, 1e-10, 1e-308, 5e-324,
+        1e15, 1e16, 1e17, 1e308, 1.7976931348623157e308,
+        float("inf"), float("-inf"), float("nan"),
+        4503599627370495.0, 4503599627370496.0, -4503599627370496.0,
+    ]
+    if orjson is not None:
+        assert cxjson.dumps(specials) == orjson.dumps(specials)
+
+    # 2. 50,000 random IEEE-754 bit patterns across all exponents + subnormals
+    rand_bits = []
+    for _ in range(50_000):
+        u = rng.getrandbits(64)
+        f = struct.unpack("<d", struct.pack("<Q", u))[0]
+        if math.isfinite(f):
+            rand_bits.append(f)
+
+    # 3. 50,000 geographic-style floats in [-180, 180]
+    geo = [rng.uniform(-180.0, 180.0) for _ in range(50_000)]
+
+    for batch in (rand_bits, geo):
+        cx_out = cxjson.dumps(batch)
+        if orjson is not None:
+            or_out = orjson.dumps(batch)
+            assert cx_out == or_out, "Float serialization differs from orjson!"
+        else:
+            rt = cxjson.loads(cx_out)
+            assert rt == batch
+
+
+def test_parallel_vs_single_threaded_identical():
+    # Spawn a subprocess with CXJSON_MAX_THREADS=1 and verify byte-identical output
+    # against default multi-threaded dumps on >1 MB payloads.
+    script = """
+import os, random, string, cxjson
+rng = random.Random(99)
+def rstr(n): return ''.join(rng.choices(string.ascii_letters + string.digits + ' ', k=n))
+payloads = [
+    list(range(250_000)),
+    [rng.uniform(-1e6, 1e6) for _ in range(100_000)],
+    [rstr(rng.randint(5, 40)) for _ in range(50_000)],
+    [{"id": i, "name": rstr(15), "vals": [i, i * 0.25, True, None]} for i in range(5000)],
+]
+import hashlib
+digests = [hashlib.sha256(cxjson.dumps(p)).hexdigest() for p in payloads]
+print("|".join(digests))
+"""
+    env_mt = os.environ.copy()
+    env_mt.pop("CXJSON_MAX_THREADS", None)
+    env_st = os.environ.copy()
+    env_st["CXJSON_MAX_THREADS"] = "1"
+
+    out_mt = subprocess.check_output([sys.executable, "-c", script], env=env_mt, text=True).strip()
+    out_st = subprocess.check_output([sys.executable, "-c", script], env=env_st, text=True).strip()
+    assert out_mt == out_st, f"Parallel vs 1T mismatch:\nMT={out_mt}\nST={out_st}"
+
+
+if __name__ == "__main__":
+    test_split_dict_gc_cycles_and_tracking()
+    print("PASS: test_split_dict_gc_cycles_and_tracking")
+    test_opt_sort_keys_all_sizes_and_edge_cases()
+    print("PASS: test_opt_sort_keys_all_sizes_and_edge_cases")
+    test_float_fuzz_exactness()
+    print("PASS: test_float_fuzz_exactness")
+    test_parallel_vs_single_threaded_identical()
+    print("PASS: test_parallel_vs_single_threaded_identical")
+    print("\nALL v0.1.1 REGRESSION TESTS PASSED!")

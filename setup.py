@@ -29,6 +29,7 @@ c_extension = Extension(
         "src/c/serializer.c",
         "src/c/deserializer.c",
         "src/c/zmij/zmij.c",
+        "src/c/zmij/zmij_sse41.c",
     ],
     include_dirs=["src/c", "src/c/zmij", "src/c/jeaiii"],
     extra_compile_args=extra_compile_args,

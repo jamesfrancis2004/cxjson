@@ -44,6 +44,14 @@ static inline int cjson_clz64(uint64_t x) {
 static inline uint64_t cjson_umul128(uint64_t a, uint64_t b, uint64_t *hi) {
   return _umul128(a, b, hi);
 }
+
+static inline uint32_t cjson_bswap32(uint32_t x) {
+  return (uint32_t)_byteswap_ulong((unsigned long)x);
+}
+
+static inline uint64_t cjson_bswap64(uint64_t x) {
+  return _byteswap_uint64(x);
+}
 #else
 #define CJSON_ALWAYS_INLINE __attribute__((always_inline)) static inline
 #define CJSON_NOINLINE      __attribute__((noinline))
@@ -70,6 +78,14 @@ static inline uint64_t cjson_umul128(uint64_t a, uint64_t b, uint64_t *hi) {
   __uint128_t p = (__uint128_t)a * (__uint128_t)b;
   *hi = (uint64_t)(p >> 64);
   return (uint64_t)p;
+}
+
+static inline uint32_t cjson_bswap32(uint32_t x) {
+  return __builtin_bswap32(x);
+}
+
+static inline uint64_t cjson_bswap64(uint64_t x) {
+  return __builtin_bswap64(x);
 }
 #endif
 

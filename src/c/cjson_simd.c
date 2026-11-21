@@ -795,7 +795,26 @@ cjson_find_str_special_fn_t cjson_find_str_special_long_fn = find_str_special_sw
 cjson_escape_chunk_fn_t cjson_escape_chunk_fn = escape_chunk_swar;
 #endif
 
+int cjson_cpu_has_sse41 = 0;
+
+static int cpu_supports_sse41(void) {
+#if defined(__SSE4_1__)
+  return 1;
+#elif defined(_MSC_VER) && defined(_M_X64)
+  int info[4] = {0};
+  __cpuid(info, 1);
+  return (info[2] & (1 << 19)) != 0;
+#elif (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
+  unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+  if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx)) return 0;
+  return (ecx & (1u << 19)) != 0;
+#else
+  return 0;
+#endif
+}
+
 void cjson_simd_init(void) {
+  cjson_cpu_has_sse41 = cpu_supports_sse41();
 #if !defined(CJSON_NO_SIMD) && (defined(__x86_64__) || defined(_M_X64)) && \
     (defined(__AVX512BW__) || defined(__AVX2__) || defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER))
   if (cpu_supports_avx512bw()) {

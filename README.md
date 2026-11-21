@@ -1,6 +1,6 @@
 # cxjson
 
-> **I tasked Gemini with building a JSON library in C to beat `orjson` — the fastest JSON library in Python. It didn't just beat `orjson`; it swept 56/56 benchmarks across 28 real-world datasets and used 4.7×–10.6× less RAM.**
+> **A zero-dependency pure-C JSON library for Python built to rival and beat `orjson`—with runtime-dispatched SIMD (NEON / SSE2 / SSE4.1 / AVX2 / AVX-512BW), CPython split-table dicts, direct PEP 3118 NumPy serialization, and adaptive multi-threaded `dumps`.**
 
 [![CI](https://github.com/jamesfrancis2004/cxjson/actions/workflows/ci.yml/badge.svg)](https://github.com/jamesfrancis2004/cxjson/actions/workflows/ci.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%20|%203.13%20|%203.14-blue.svg)](#)
@@ -18,80 +18,63 @@ I wanted to see what would happen if I tasked Gemini with building a zero-depend
 
 The result is **`cxjson`**.
 
-### Headline Results (Apple M2, Python 3.12.3)
+### Headline Results (Apple M2, Python 3.12.3, `orjson 3.13.0`, GC On)
 
-- **56 / 56 wins (100%) vs `orjson`** across **28 real-world JSON datasets** (`twitter`, `citm_catalog`, `canada`, `gsoc-2018`, `usgs_earthquakes`, `pypi_numpy`, `npm_typescript`, `semanticscholar-corpus`, and 20 more)
-- **1.79× faster `dumps`** and **1.46× faster `loads`** (geo-mean vs `orjson`)
-- **4.7×–10.6× lower peak memory** during `loads` than `orjson`
-- **4.0+ GB/s** adaptive `dumps` (**2.8 GB/s** single-threaded) and **~1.0 GB/s** `loads` — beating `orjson`, `msgspec`, `jiter`, `ujson`, `python-rapidjson`, and Python's stdlib `json`
+- **1.84× faster `dumps`** and **1.50× faster `loads`** (geo-mean vs `orjson 3.13.0`, interleaved median of 9 runs with Python GC enabled across 8 real-world datasets)
+- **Up to 25% less retained memory** after `loads()` on repeated-schema JSON payloads (`tracemalloc`, via CPython split-table dicts)
+- **5+ GB/s** adaptive multi-threaded `dumps` on large payloads and **~0.9–1.7 GB/s** `loads`
+- **2.46× faster NumPy serialization** (`OPT_SERIALIZE_NUMPY`, geo-mean across 7 dtypes/shapes on Apple M2; **~1.9×** on single-core x86_64)
+- **1.45× faster `OPT_SORT_KEYS`** than `orjson` via 64-bit prefix-keyed inline sorting
 
 ---
 
 ## Python JSON Library Benchmarks (Apple M2 / ARM64)
 
-All charts and tables below were measured locally on an **Apple M2 (ARM64)** with **Python 3.12.3** across 8 representative real-world JSON datasets (`twitter.json`, `citm_catalog.json`, `canada.json`, `gsoc-2018.json`, `usgs_earthquakes_week.json`, `pypi_numpy.json`, `semanticscholar-corpus.json`, `npm_typescript.json`).
+Measured locally on an **Apple M2 (ARM64)** with **Python 3.12.3** and **`orjson 3.13.0`** (interleaved order, GC enabled, median of 9 rounds) across 8 representative real-world JSON datasets (`twitter.json`, `citm_catalog.json`, `canada.json`, `gsoc-2018.json`, `usgs_earthquakes_week.json`, `pypi_numpy.json`, `semanticscholar-corpus.json`, `npm_typescript.json`).
 
-> **Note on x86_64:** `cxjson` includes runtime-dispatched SSE2, AVX2, and AVX-512BW kernels for x86_64, but all benchmarks below were measured on Apple Silicon (ARM64). We haven't thoroughly benchmarked or tuned bare-metal x86_64 performance yet, so results on x86_64 will vary and there are likely still x86-specific optimizations on the table (contributions and x86 benchmarks are very welcome!).
+> **Note on x86_64 & single-core environments:** `cxjson` includes runtime-dispatched SSE2, SSE4.1 (`zmij` float formatting), AVX2, and AVX-512BW kernels for x86_64. On single-core x86_64 containers (where adaptive multi-threaded `dumps` does not activate), `cxjson` is typically ~1.0×–1.2× vs `orjson` on `loads` and ~1.0× on `dumps` (and ~1.9× on NumPy). Multi-core machines see the full adaptive `dumps` speedup (configurable via `CXJSON_MAX_THREADS`).
 
-![Python JSON Libraries Overview](docs/images/python_libraries_overview.png)
+#### Serialization (`dumps`) — MB/s (higher is better, Apple M2, Python 3.12.3, GC On)
 
-### Per-Dataset Breakdown
+| Dataset | Size | **`cxjson`** | `orjson 3.13.0` | Speedup |
+|---|---:|---:|---:|---:|
+| `twitter.json` | 0.45 MB | **2,829** | 2,231 | **1.27×** |
+| `citm_catalog.json` | 0.48 MB | **1,805** | 1,299 | **1.39×** |
+| `canada.json` | 1.99 MB | **2,147** | 1,097 | **1.96×** |
+| `gsoc-2018.json` | 2.93 MB | **3,190** | 2,973 | **1.07×** |
+| `usgs_earthquakes_week.json` | 1.28 MB | **3,477** | 1,192 | **2.92×** |
+| `pypi_numpy.json` | 3.61 MB | **2,487** | 2,107 | **1.18×** |
+| `semanticscholar-corpus.json` | 8.19 MB | **5,332** | 1,752 | **3.04×** |
+| `npm_typescript.json` | 15.22 MB | **5,179** | 1,506 | **3.44×** |
+| **Geo-Mean** | — | — | — | **1.84×** |
 
-![Per-Dataset Throughput Comparison](docs/images/python_per_dataset.png)
+#### Deserialization (`loads`) — MB/s (higher is better, Apple M2, Python 3.12.3, GC On)
 
-#### Serialization (`dumps` / `encode`) — MB/s (higher is better)
-
-| Dataset | Size | **`cxjson`** | **`cxjson (1T)`** | `orjson` | `msgspec` | `ujson` | `rapidjson` | `json` (stdlib) |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `twitter.json` | 0.60 MB | 3,514 | **3,516** | 2,738 | 1,705 | 524 | 316 | 321 |
-| `citm_catalog.json` | 1.65 MB | 1,872 | **2,161** | 1,382 | 1,208 | 263 | 242 | 178 |
-| `canada.json` | 2.15 MB | **2,573** | 1,611 | 1,208 | 723 | 190 | 53 | 56 |
-| `gsoc-2018.json` | 3.17 MB | **6,268** | 4,917 | 4,603 | 2,427 | 978 | 392 | 451 |
-| `usgs_earthquakes_week.json` | 1.28 MB | **6,463** | 2,179 | 1,341 | 996 | 309 | 211 | 180 |
-| `pypi_numpy.json` | 3.61 MB | **4,251** | 3,367 | 2,810 | 1,566 | 588 | 349 | 334 |
-| `semanticscholar-corpus.json` | 8.20 MB | **5,558** | 3,428 | 1,766 | 1,447 | 489 | 332 | 306 |
-| `npm_typescript.json` | 15.22 MB | **4,596** | 2,474 | 1,362 | 1,293 | 389 | 296 | 278 |
-| **Geo-Mean (MB/s)** | — | **4,064** | **2,797** | **1,928** | **1,342** | **415** | **241** | **228** |
-
-#### Deserialization (`loads` / `decode`) — MB/s (higher is better)
-
-| Dataset | Size | **`cxjson`** | `orjson` | `msgspec` | `jiter` | `ujson` | `json` (stdlib) | `rapidjson` |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| `twitter.json` | 0.60 MB | **1,087** | 753 | 599 | 492 | 441 | 348 | 214 |
-| `citm_catalog.json` | 1.65 MB | **1,343** | 717 | 614 | 590 | 534 | 401 | 300 |
-| `canada.json` | 2.15 MB | **494** | 358 | 297 | 314 | 207 | 99 | 94 |
-| `gsoc-2018.json` | 3.17 MB | **1,776** | 1,181 | 1,330 | 1,443 | 782 | 714 | 389 |
-| `usgs_earthquakes_week.json` | 1.28 MB | **962** | 417 | 373 | 305 | 243 | 171 | 154 |
-| `pypi_numpy.json` | 3.61 MB | **1,641** | 665 | 663 | 598 | 410 | 339 | 240 |
-| `semanticscholar-corpus.json` | 8.20 MB | **926** | 448 | 502 | 402 | 330 | 319 | 178 |
-| `npm_typescript.json` | 15.22 MB | **708** | 383 | 377 | 405 | 253 | 263 | 193 |
-| **Geo-Mean (MB/s)** | — | **1,036** | **568** | **536** | **500** | **365** | **288** | **204** |
+| Dataset | Size | **`cxjson`** | `orjson 3.13.0` | Speedup |
+|---|---:|---:|---:|---:|
+| `twitter.json` | 0.60 MB | **889** | 694 | **1.28×** |
+| `citm_catalog.json` | 1.65 MB | **839** | 704 | **1.19×** |
+| `canada.json` | 2.15 MB | **388** | 348 | **1.12×** |
+| `gsoc-2018.json` | 3.17 MB | **1,669** | 1,108 | **1.51×** |
+| `usgs_earthquakes_week.json` | 1.28 MB | **737** | 350 | **2.11×** |
+| `pypi_numpy.json` | 3.61 MB | **1,202** | 658 | **1.83×** |
+| `semanticscholar-corpus.json` | 8.20 MB | **673** | 410 | **1.64×** |
+| `npm_typescript.json` | 15.22 MB | **622** | 388 | **1.60×** |
+| **Geo-Mean** | — | — | — | **1.50×** |
 
 ---
 
-## Did We Overfit? Testing 28 Real-World Datasets
+## Retained Memory Footprint
 
-To make sure we hadn't accidentally hyper-optimized for a handful of classic benchmark files, we expanded the benchmark suite to **28 diverse datasets**—including live production JSON payloads pulled directly from the PyPI JSON API (`requests`, `pandas`, `numpy`), npm registry (`react`, `typescript`, `lodash`), USGS Earthquake GeoJSON feeds, Nobel Prize API, Semantic Scholar corpus, GitHub events, and deeply nested pretty-printed trees.
+When parsing arrays of objects with repeated schemas (like REST API payloads or catalogs), `cxjson` builds CPython split-table dicts sharing a single `PyDictKeysObject` across objects—cutting retained Python heap memory (`tracemalloc.get_traced_memory()` after `loads()`, Python 3.12.3) by up to **25%**:
 
-`cxjson` swept **56 / 56 (100%)** against `orjson` on Apple M2:
-
-![28 Real-World Datasets vs orjson](docs/images/benchmark_28_datasets.png)
-
----
-
-## Peak Memory Footprint
-
-Speed is only half the story—when parsing large API payloads in production, memory spikes are often what OOM-kill Python workers. Because `cxjson` builds CPython split-table dicts sharing a single `PyDictKeysObject` across repeated object schemas, peak allocation during `loads()` drops by **4.7×–10.6×** compared to `orjson`:
-
-![Peak Memory Comparison](docs/images/memory_comparison.png)
-
-| Dataset | `cxjson` Peak `loads` | `orjson` Peak `loads` | Reduction |
+| Dataset | `cxjson` Retained `loads` | `orjson 3.13.0` Retained `loads` | Reduction |
 |---|---:|---:|---:|
-| `twitter.json` | **0.85 MB** | 8.24 MB | **9.7× less** |
-| `citm_catalog.json` | **2.16 MB** | 22.85 MB | **10.6× less** |
-| `gsoc-2018.json` | **4.43 MB** | 42.96 MB | **9.7× less** |
-| `canada.json` | **6.94 MB** | 32.57 MB | **4.7× less** |
-| `semanticscholar-corpus.json` | **17.41 MB** | 121.45 MB | **7.0× less** |
+| `twitter.json` | **0.86 MB** | 1.01 MB | **1.18× less** |
+| `citm_catalog.json` | **2.31 MB** | 3.08 MB | **1.34× less** |
+| `gsoc-2018.json` | **4.43 MB** | 4.88 MB | **1.10× less** |
+| `canada.json` | **6.81 MB** | 6.81 MB | **1.00×** |
+| `semanticscholar-corpus.json` | **17.34 MB** | 23.10 MB | **1.33× less** |
 
 ---
 
@@ -116,8 +99,8 @@ Speed is only half the story—when parsing large API payloads in production, me
 
 There is no magic—just relentless elimination of per-character branches, redundant copies, and CPython object allocations:
 
-1. **Runtime-Dispatched SIMD (ARM64 NEON, x86_64 AVX2, SSE2):** String scanning, quote/escape detection, UTF-8 ASCII runs, and Latin-1 narrowing process 16–32 bytes per cycle. On x86_64, `cxjson` detects AVX2 vs SSE2 at import time via CPUID so a single wheel runs optimally on any CPU.
-2. **CPython Split-Table Dicts (Python 3.12, 3.13, & 3.14):** When parsing arrays of objects with repeated schemas (like REST API responses or GeoJSON features), `cxjson` learns the key schema and builds CPython split-table dicts sharing a single `PyDictKeysObject`. This eliminates per-dict hash table allocations and is why `loads` uses **7×–10.5× less peak memory** than `orjson` while running **1.5×–2.5× faster**.
+1. **Runtime-Dispatched SIMD (ARM64 NEON, x86_64 SSE2 / SSE4.1 / AVX2 / AVX-512BW):** String scanning, quote/escape detection, UTF-8 ASCII runs, Latin-1 narrowing, and `zmij` SSE4.1 float formatting dispatch at import time via CPUID so a single wheel runs optimally on any CPU.
+2. **CPython Split-Table Dicts (Python 3.12, 3.13, & 3.14):** When parsing arrays of objects with repeated schemas (like REST API responses or GeoJSON features), `cxjson` learns the key schema and builds CPython split-table dicts sharing a single `PyDictKeysObject` (verified by a startup self-check and full GC-tracking parity). This eliminates per-dict hash table allocations and reduces retained memory by up to **25%** on repeated-schema workloads.
 3. **Key & Value-String Caching:** L1-resident direct-mapped/2-way caches for ASCII dict keys (`1..64B`), UTF-8 keys, and repeated ASCII string values (`2..48B`), plus singletons for `""`, 1-char ASCII strings, and small integers.
 4. **State-of-the-Art Number Formatting & Parsing:** Vendored [`zmij`](src/c/zmij) (float → string) and [`jeaiii`](src/c/jeaiii) (int → string) for serialization, paired with 8-digit SWAR mantissa parsing + Clinger's fast path + Eisel-Lemire for bit-exact IEEE-754 float parsing.
 5. **Adaptive Multi-Threaded `dumps` (with `pthread_atfork()` Safety):** For payloads ≥ 512 KB of pure built-in types, `cxjson` scales worker threads by payload size while holding the GIL (workers read immutable Python memory without touching refcounts or C-API). It is safe across `os.fork()`, automatically disabled on free-threaded Python (`Py_GIL_DISABLED`), and configurable via `CXJSON_MAX_THREADS=1`.

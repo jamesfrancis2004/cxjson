@@ -208,8 +208,38 @@ def test_refcounts_preserved():
     print("PASS: exact refcounts preserved across success & error paths")
 
 
+def test_split_table_gc_cycles():
+    import weakref
+
+    class Node:
+        pass
+
+    payload = b'{"id":1,"children":[1,2,3]}'
+    for _ in range(5):
+        cxjson.loads(payload)
+
+    refs = []
+    for _ in range(2000):
+        d = cxjson.loads(payload)
+        n = Node()
+        n.data = d
+        d["children"].append(n)
+        refs.append(weakref.ref(n))
+    del d, n
+    gc.collect()
+    gc.collect()
+    alive = sum(r() is not None for r in refs)
+    assert alive <= 3, f"GC cycle leak in split-table dicts: {alive} of 2000 objects still alive"
+
+    # Verify gc.is_tracked parity for nested containers
+    sample = cxjson.loads(payload)
+    assert gc.is_tracked(sample), "split-table dict containing a list must be GC-tracked"
+    print(f"PASS: split-table GC cycles collected (alive={alive}/2000, gc.is_tracked=True)")
+
+
 if __name__ == "__main__":
     test_split_table_dicts_and_mutations()
+    test_split_table_gc_cycles()
     test_schema_switching_and_fallbacks()
     test_malformed_json_error_paths()
     test_unicode_and_escaped_strings()

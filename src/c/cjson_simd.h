@@ -591,6 +591,7 @@ typedef const unsigned char *(*cjson_escape_chunk_fn_t)(
 extern cjson_copy_clean_prefix_fn_t cjson_copy_clean_prefix_long_fn;
 extern cjson_find_str_special_fn_t cjson_find_str_special_long_fn;
 extern cjson_escape_chunk_fn_t cjson_escape_chunk_fn;
+extern int cjson_cpu_has_sse41;
 void cjson_simd_init(void);
 
 /* Copy clean prefix of src into dst and return clean byte count copied. */

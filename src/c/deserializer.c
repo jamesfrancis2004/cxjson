@@ -11,6 +11,10 @@ PyAPI_FUNC(int) _PyDict_SetItem_KnownHash(PyObject *mp, PyObject *key, PyObject 
 
 PyObject *JSONDecodeError = NULL;
 
+#if defined(CJSON_SPLIT_DICT_FAST)
+static int g_split_dict_enabled = 1;
+#endif
+
 #define CJSON_REC_PARSE_DEPTH 64
 
 /* Tiny inline fast-path + noinline GPR SWAR whitespace skipper */
@@ -1868,6 +1872,16 @@ static PyObject *parse_object_rec(
         mp->ma_values = (PyDictValues *)dst_vals;
         mp->ma_used = (Py_ssize_t)expected_len;
 #endif
+        /* PyDict_New() returns an untracked empty dict on Python 3.12/3.13;
+         * mirror CPython's MAINTAIN_TRACKING rule since we bypassed PyDict_SetItem. */
+        for (uint32_t j = 0; j < (uint32_t)expected_len; j++) {
+          if (PyObject_IS_GC(split_vals[j])) {
+            if (!PyObject_GC_IsTracked(sdict)) {
+              PyObject_GC_Track(sdict);
+            }
+            break;
+          }
+        }
         *p_io = p;
         return sdict;
       }
@@ -2114,7 +2128,7 @@ static PyObject *parse_object_rec(
   } else {
     sc->miss_streak = 0;
 #if defined(CJSON_SPLIT_DICT_FAST)
-    if (!sc->split_ok && sc->len >= 1 && sc->len <= CJSON_SPLIT_MAX_KEYS &&
+    if (g_split_dict_enabled && !sc->split_ok && sc->len >= 1 && sc->len <= CJSON_SPLIT_MAX_KEYS &&
         PyDict_GET_SIZE(dict) == (Py_ssize_t)sc->len) {
       if (++sc->stable_hits >= 2) {
         schema_promote_to_split(sc);
@@ -2529,6 +2543,52 @@ PyObject *c_json_loads(PyObject *self, PyObject *const *args, Py_ssize_t nargs) 
   return result;
 }
 
+#if defined(CJSON_SPLIT_DICT_FAST)
+static void verify_split_dict_selfcheck(void) {
+  const char *probe = "{\"_cx_a\":1,\"_cx_b\":[2,3]}";
+  Py_ssize_t plen = (Py_ssize_t)strlen(probe);
+  PyObject *d = NULL;
+  for (int i = 0; i < 4; i++) {
+    Py_XDECREF(d);
+    JsonParser jp;
+    parser_init(&jp, probe, plen);
+    const char *p = probe;
+    d = parse_value_rec(&jp, &p, probe + plen);
+    parser_cleanup(&jp);
+    if (d == NULL) {
+      PyErr_Clear();
+      g_split_dict_enabled = 0;
+      return;
+    }
+  }
+  int ok = 1;
+  if (!PyDict_CheckExact(d) || PyDict_GET_SIZE(d) != 2) ok = 0;
+  if (ok && !PyObject_GC_IsTracked(d)) ok = 0;
+  PyObject *va = ok ? PyDict_GetItemString(d, "_cx_a") : NULL;
+  PyObject *vb = ok ? PyDict_GetItemString(d, "_cx_b") : NULL;
+  if (ok && (va == NULL || !PyLong_CheckExact(va) || PyLong_AsLong(va) != 1)) ok = 0;
+  if (ok && (vb == NULL || !PyList_CheckExact(vb) || PyList_GET_SIZE(vb) != 2)) ok = 0;
+  if (ok) {
+    PyObject *cp = PyDict_Copy(d);
+    if (cp == NULL || PyObject_RichCompareBool(d, cp, Py_EQ) != 1) ok = 0;
+    Py_XDECREF(cp);
+  }
+  if (ok) {
+    PyObject *r = PyObject_Repr(d);
+    if (r == NULL) ok = 0;
+    Py_XDECREF(r);
+  }
+  if (ok && PyDict_SetItemString(d, "_cx_c", Py_True) < 0) ok = 0;
+  if (ok && PyDict_DelItemString(d, "_cx_a") < 0) ok = 0;
+  if (ok && PyDict_GET_SIZE(d) != 2) ok = 0;
+  Py_DECREF(d);
+  PyErr_Clear();
+  if (!ok) {
+    g_split_dict_enabled = 0;
+  }
+}
+#endif
+
 int init_deserializer_types(void) {
   if (g_empty_str == NULL) {
     g_empty_str = PyUnicode_FromStringAndSize("", 0);
@@ -2555,5 +2615,8 @@ int init_deserializer_types(void) {
   JSONDecodeError = PyErr_NewException("cxjson.JSONDecodeError", base_err, NULL);
   Py_DECREF(base_err);
   if (JSONDecodeError == NULL) return -1;
+#if defined(CJSON_SPLIT_DICT_FAST)
+  verify_split_dict_selfcheck();
+#endif
   return 0;
 }
