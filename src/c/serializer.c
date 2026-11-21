@@ -2924,6 +2924,346 @@ static int json_buffer_append_dataclass_opts(SerializeContext *ctx, PyObject *ob
   return rc;
 }
 
+typedef enum {
+  NP_UNSUPPORTED = 0,
+  NP_F64,
+  NP_F32,
+  NP_I64,
+  NP_U64,
+  NP_I32,
+  NP_U32,
+  NP_I16,
+  NP_U16,
+  NP_I8,
+  NP_U8,
+  NP_BOOL
+} NumpyKind;
+
+static inline NumpyKind numpy_parse_format(const char *fmt, Py_ssize_t itemsize) {
+  if (fmt == NULL) return NP_UNSUPPORTED;
+  if (fmt[0] == '@' || fmt[0] == '=') {
+    fmt++;
+  } else if (fmt[0] == '<') {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    fmt++;
+#else
+    return NP_UNSUPPORTED;
+#endif
+  } else if (fmt[0] == '>' || fmt[0] == '!') {
+    return NP_UNSUPPORTED;
+  }
+  if (fmt[1] != '\0') return NP_UNSUPPORTED;
+  switch (fmt[0]) {
+    case 'd': return (itemsize == 8) ? NP_F64 : NP_UNSUPPORTED;
+    case 'f': return (itemsize == 4) ? NP_F32 : NP_UNSUPPORTED;
+    case 'q': return (itemsize == 8) ? NP_I64 : NP_UNSUPPORTED;
+    case 'Q': return (itemsize == 8) ? NP_U64 : NP_UNSUPPORTED;
+    case 'l': return (itemsize == 8) ? NP_I64 : ((itemsize == 4) ? NP_I32 : NP_UNSUPPORTED);
+    case 'L': return (itemsize == 8) ? NP_U64 : ((itemsize == 4) ? NP_U32 : NP_UNSUPPORTED);
+    case 'i': return (itemsize == 4) ? NP_I32 : NP_UNSUPPORTED;
+    case 'I': return (itemsize == 4) ? NP_U32 : NP_UNSUPPORTED;
+    case 'h': return (itemsize == 2) ? NP_I16 : NP_UNSUPPORTED;
+    case 'H': return (itemsize == 2) ? NP_U16 : NP_UNSUPPORTED;
+    case 'b': return (itemsize == 1) ? NP_I8 : NP_UNSUPPORTED;
+    case 'B': return (itemsize == 1) ? NP_U8 : NP_UNSUPPORTED;
+    case '?': return (itemsize == 1) ? NP_BOOL : NP_UNSUPPORTED;
+    default:  return NP_UNSUPPORTED;
+  }
+}
+
+static inline char *write_float_fast(float vf, char *dst) {
+  float avf = fabsf(vf);
+  if (CJSON_LIKELY(avf >= 1e-4f && avf < 1e16f)) {
+    int64_t ival = (int64_t)vf;
+    if (CJSON_LIKELY((float)ival != vf)) {
+      return zmij_detail_write_f(vf, dst);
+    }
+    if (CJSON_LIKELY(avf < 16777216.0f)) {
+      char *end = jeaiii_to_text_i64(dst, ival);
+      end[0] = '.';
+      end[1] = '0';
+      return end + 2;
+    }
+  }
+  char *end = zmij_detail_write_f(vf, dst);
+  for (char *p = end - 1; p >= dst; p--) {
+    char c = *p;
+    if (c == '.') return end;
+    if (c == 'e') {
+      char *d = p + 2;
+      if (end - d == 2 && d[0] == '0') {
+        d[0] = d[1];
+        end--;
+        if (d[0] == '5' && p[1] == '-') {
+          char digits[16];
+          int nd = 0;
+          char *m = dst;
+          int neg = (*m == '-');
+          if (neg) m++;
+          for (; m < p; m++) {
+            if (*m != '.') digits[nd++] = *m;
+          }
+          char *o = dst;
+          if (neg) *o++ = '-';
+          memcpy(o, "0.0000", 6);
+          o += 6;
+          memcpy(o, digits, (size_t)nd);
+          return o + nd;
+        }
+      }
+      return end;
+    }
+  }
+  end[0] = '.';
+  end[1] = '0';
+  return end + 2;
+}
+
+static inline char *numpy_write_elem(char *dst, const char *p, NumpyKind kind) {
+  switch (kind) {
+    case NP_F64: {
+      double v;
+      memcpy(&v, p, sizeof(double));
+      if (CJSON_UNLIKELY(!isfinite(v))) {
+        memcpy(dst, "null", 4);
+        return dst + 4;
+      }
+      return write_double(v, dst);
+    }
+    case NP_F32: {
+      float vf;
+      memcpy(&vf, p, sizeof(float));
+      if (CJSON_UNLIKELY(!isfinite(vf))) {
+        memcpy(dst, "null", 4);
+        return dst + 4;
+      }
+      return write_float_fast(vf, dst);
+    }
+    case NP_I64: {
+      int64_t v;
+      memcpy(&v, p, sizeof(int64_t));
+      if (v < 0) {
+        *dst++ = '-';
+        return jeaiii_to_text_u64(dst, (uint64_t)(-(v + 1)) + 1ULL);
+      }
+      return jeaiii_to_text_u64(dst, (uint64_t)v);
+    }
+    case NP_U64: {
+      uint64_t v;
+      memcpy(&v, p, sizeof(uint64_t));
+      return jeaiii_to_text_u64(dst, v);
+    }
+    case NP_I32: {
+      int32_t v;
+      memcpy(&v, p, sizeof(int32_t));
+      if (v < 0) {
+        *dst++ = '-';
+        return jeaiii_to_text_u32(dst, (uint32_t)(-(v + 1)) + 1u);
+      }
+      return jeaiii_to_text_u32(dst, (uint32_t)v);
+    }
+    case NP_U32: {
+      uint32_t v;
+      memcpy(&v, p, sizeof(uint32_t));
+      return jeaiii_to_text_u32(dst, v);
+    }
+    case NP_I16: {
+      int16_t v;
+      memcpy(&v, p, sizeof(int16_t));
+      if (v < 0) {
+        *dst++ = '-';
+        return jeaiii_to_text_u32(dst, (uint32_t)(-v));
+      }
+      return jeaiii_to_text_u32(dst, (uint32_t)v);
+    }
+    case NP_U16: {
+      uint16_t v;
+      memcpy(&v, p, sizeof(uint16_t));
+      return jeaiii_to_text_u32(dst, (uint32_t)v);
+    }
+    case NP_I8: {
+      int8_t v = *(const int8_t *)p;
+      if (v < 0) {
+        *dst++ = '-';
+        return jeaiii_to_text_u32(dst, (uint32_t)(-(int)v));
+      }
+      return jeaiii_to_text_u32(dst, (uint32_t)v);
+    }
+    case NP_U8:
+      return jeaiii_to_text_u32(dst, (uint32_t)(*(const uint8_t *)p));
+    case NP_BOOL:
+      if (*(const uint8_t *)p) {
+        memcpy(dst, "true", 4);
+        return dst + 4;
+      }
+      memcpy(dst, "false", 5);
+      return dst + 5;
+    default:
+      return dst;
+  }
+}
+
+static inline Py_ssize_t numpy_max_elem_bytes(NumpyKind kind) {
+  switch (kind) {
+    case NP_F64:
+    case NP_F32: return 34;
+    case NP_I64:
+    case NP_U64: return 22;
+    case NP_I32:
+    case NP_U32: return 12;
+    case NP_I16:
+    case NP_U16: return 7;
+    case NP_BOOL: return 6;
+    default: return 5;
+  }
+}
+
+static int numpy_encode_dim(JsonBuffer *b, const char *base, int ndim,
+                            const Py_ssize_t *shape, const Py_ssize_t *strides,
+                            NumpyKind kind) {
+  Py_ssize_t n = shape[0];
+  if (n == 0) {
+    return json_buffer_append(b, "[]", 2);
+  }
+  Py_ssize_t stride = strides[0];
+  if (ndim == 1) {
+    Py_ssize_t max_per = numpy_max_elem_bytes(kind);
+    if (json_buffer_reserve(b, n * max_per + 16) < 0) return -1;
+    char *dst = b->data + b->len;
+    *dst++ = '[';
+    const char *p = base;
+    if (kind == NP_F64 && stride == 8) {
+      const double *dp = (const double *)base;
+      for (Py_ssize_t i = 0; i < n; i++) {
+        if (i > 0) *dst++ = ',';
+        double v = dp[i];
+        if (CJSON_UNLIKELY(!isfinite(v))) {
+          memcpy(dst, "null", 4);
+          dst += 4;
+        } else {
+          dst = write_double_fast(v, dst);
+        }
+      }
+    } else if (kind == NP_I64 && stride == 8) {
+      const int64_t *ip = (const int64_t *)base;
+      for (Py_ssize_t i = 0; i < n; i++) {
+        if (i > 0) *dst++ = ',';
+        int64_t v = ip[i];
+        if (v < 0) {
+          *dst++ = '-';
+          dst = jeaiii_to_text_u64(dst, (uint64_t)(-(v + 1)) + 1ULL);
+        } else {
+          dst = jeaiii_to_text_u64(dst, (uint64_t)v);
+        }
+      }
+    } else if (kind == NP_I32 && stride == 4) {
+      const int32_t *ip = (const int32_t *)base;
+      for (Py_ssize_t i = 0; i < n; i++) {
+        if (i > 0) *dst++ = ',';
+        int32_t v = ip[i];
+        if (v < 0) {
+          *dst++ = '-';
+          dst = jeaiii_to_text_u32(dst, (uint32_t)(-(v + 1)) + 1u);
+        } else {
+          dst = jeaiii_to_text_u32(dst, (uint32_t)v);
+        }
+      }
+    } else if (kind == NP_F32 && stride == 4) {
+      const float *fp = (const float *)base;
+      for (Py_ssize_t i = 0; i < n; i++) {
+        if (i > 0) *dst++ = ',';
+        float vf = fp[i];
+        if (CJSON_UNLIKELY(!isfinite(vf))) {
+          memcpy(dst, "null", 4);
+          dst += 4;
+        } else {
+          dst = write_float_fast(vf, dst);
+        }
+      }
+    } else if (kind == NP_BOOL && stride == 1) {
+      static const char BOOL_LUT[2][8] = {"false,", "true, "};
+      static const uint8_t BOOL_LEN[2] = {6, 5};
+      const uint8_t *bp = (const uint8_t *)base;
+      for (Py_ssize_t i = 0; i < n; i++) {
+        uint8_t bv = bp[i] != 0;
+        memcpy(dst, BOOL_LUT[bv], 8);
+        dst += BOOL_LEN[bv];
+      }
+      dst--; /* overwrite trailing ',' with ']' below */
+    } else if (kind == NP_U8 && stride == 1) {
+      static char U8_LUT[256][4];
+      static uint8_t U8_LEN[256];
+      static int u8_init = 0;
+      if (CJSON_UNLIKELY(!u8_init)) {
+        for (int k = 0; k < 256; k++) {
+          char *e = jeaiii_to_text_u32(U8_LUT[k], (uint32_t)k);
+          *e++ = ',';
+          U8_LEN[k] = (uint8_t)(e - U8_LUT[k]);
+        }
+        u8_init = 1;
+      }
+      const uint8_t *up = (const uint8_t *)base;
+      for (Py_ssize_t i = 0; i < n; i++) {
+        uint8_t uv = up[i];
+        memcpy(dst, U8_LUT[uv], 4);
+        dst += U8_LEN[uv];
+      }
+      dst--; /* overwrite trailing ',' with ']' below */
+    } else {
+      for (Py_ssize_t i = 0; i < n; i++) {
+        if (i > 0) *dst++ = ',';
+        dst = numpy_write_elem(dst, p, kind);
+        p += stride;
+      }
+    }
+    *dst++ = ']';
+    b->len = (Py_ssize_t)(dst - b->data);
+    return 0;
+  }
+
+  if (json_buffer_append_char(b, '[') < 0) return -1;
+  const char *p = base;
+  for (Py_ssize_t i = 0; i < n; i++) {
+    if (i > 0 && json_buffer_append_char(b, ',') < 0) return -1;
+    if (numpy_encode_dim(b, p, ndim - 1, shape + 1, strides + 1, kind) < 0) return -1;
+    p += stride;
+  }
+  return json_buffer_append_char(b, ']');
+}
+
+/* Direct PEP 3118 C-buffer NumPy serializer (zero NumPy build dependency).
+ * Returns 1 if handled, 0 to fall back to .tolist(), -1 on error. */
+static int json_buffer_append_numpy_buffer(JsonBuffer *b, PyObject *obj) {
+  if (!PyObject_CheckBuffer(obj) || PyBytes_Check(obj) ||
+      PyByteArray_Check(obj) || PyMemoryView_Check(obj)) {
+    return 0;
+  }
+  Py_buffer view;
+  if (PyObject_GetBuffer(obj, &view, PyBUF_STRIDES | PyBUF_FORMAT) < 0) {
+    PyErr_Clear();
+    return 0;
+  }
+  NumpyKind kind = numpy_parse_format(view.format, view.itemsize);
+  if (kind == NP_UNSUPPORTED || view.ndim > 32) {
+    PyBuffer_Release(&view);
+    return 0;
+  }
+  int rc;
+  if (view.ndim == 0) {
+    if (json_buffer_reserve(b, numpy_max_elem_bytes(kind)) < 0) {
+      PyBuffer_Release(&view);
+      return -1;
+    }
+    char *dst = numpy_write_elem(b->data + b->len, (const char *)view.buf, kind);
+    b->len = (Py_ssize_t)(dst - b->data);
+    rc = 0;
+  } else {
+    rc = numpy_encode_dim(b, (const char *)view.buf, view.ndim, view.shape, view.strides, kind);
+  }
+  PyBuffer_Release(&view);
+  return (rc < 0) ? -1 : 1;
+}
+
 static int json_encode_opts(SerializeContext *ctx, PyObject *obj) {
   JsonBuffer *b = ctx->b;
   if (++b->depth > CJSON_MAX_DEPTH) {
@@ -2974,6 +3314,13 @@ static int json_encode_opts(SerializeContext *ctx, PyObject *obj) {
   }
 
   if (ctx->opts & OPT_SERIALIZE_NUMPY) {
+    if (!(ctx->opts & OPT_INDENT_2)) {
+      int nrc = json_buffer_append_numpy_buffer(b, obj);
+      if (nrc != 0) {
+        b->depth--;
+        return (nrc < 0) ? -1 : 0;
+      }
+    }
     if (PyObject_HasAttrString(obj, "tolist")) {
       PyObject *list_obj = PyObject_CallMethod(obj, "tolist", NULL);
       if (list_obj != NULL) {
