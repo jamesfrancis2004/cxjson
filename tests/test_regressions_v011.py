@@ -253,6 +253,7 @@ payloads = [
     [{"k\"1": "v\"1\n\t\\", "a\\b": i, "z": f"caf\u00e9_{i}"} for i in range(8_000)],
     [{f"key_{k:03d}": k + i for k in range(70, 0, -1)} for i in range(1_500)],
     {"wrapper": {"items": [[i * 0.25, -i * 0.5] for i in range(40_000)]}},
+    {f"rec_{i:05d}": {"z": i, "a": f"user_{i}", "m": i * 1.5, "tags": ["x", "y"]} for i in range(10_000)},
 ]
 opts = [
     cxjson.OPT_SORT_KEYS,
@@ -284,6 +285,24 @@ print("|".join(digests))
     expected_sort_ind = json.dumps(deep, indent=2, sort_keys=True).encode("utf-8")
     assert cxjson.dumps(deep, option=cxjson.OPT_INDENT_2) == expected_ind
     assert cxjson.dumps(deep, option=cxjson.OPT_SORT_KEYS | cxjson.OPT_INDENT_2) == expected_sort_ind
+
+    # Direct UUID fast-path boundary values + subclass + parallel array identity
+    import uuid
+    class SubUUID(uuid.UUID):
+        pass
+    edge_uuids = [
+        uuid.UUID(int=0),
+        uuid.UUID(int=1),
+        uuid.UUID(int=(1 << 64) - 1),
+        uuid.UUID(int=(1 << 64)),
+        uuid.UUID(int=(1 << 128) - 1),
+        SubUUID("12345678-1234-5678-1234-567812345678"),
+    ]
+    for u in edge_uuids:
+        assert cxjson.dumps(u) == f'"{u}"'.encode("ascii")
+    many_uuids = [uuid.UUID(int=(i * 0x9E3779B97F4A7C159E3779B97F4A7C15) & ((1 << 128) - 1)) for i in range(40_000)]
+    expected_many = ("[" + ",".join(f'"{u}"' for u in many_uuids) + "]").encode("ascii")
+    assert cxjson.dumps(many_uuids) == expected_many
 
 
 if __name__ == "__main__":
