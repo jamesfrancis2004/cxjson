@@ -241,6 +241,51 @@ print("|".join(digests))
             assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, f"Child failed: {status}"
 
 
+def test_parallel_opts_sort_indent_and_deep_nesting():
+    """Verify parallel OPT_SORT_KEYS / OPT_INDENT_2 dumps matches 1T byte-for-byte
+    and that deep (>32 level) OPT_INDENT_2 nesting does not OOM."""
+    script = r"""
+import hashlib, cxjson
+
+payloads = [
+    [{"z": i, "a": f"user_{i}", "m": i * 1.5, "b": {"y": i & 1, "x": [1, 2, None, True, False]}, "e": {}, "l": []}
+     for i in range(10_000)],
+    [{"k\"1": "v\"1\n\t\\", "a\\b": i, "z": f"caf\u00e9_{i}"} for i in range(8_000)],
+    [{f"key_{k:03d}": k + i for k in range(70, 0, -1)} for i in range(1_500)],
+    {"wrapper": {"items": [[i * 0.25, -i * 0.5] for i in range(40_000)]}},
+]
+opts = [
+    cxjson.OPT_SORT_KEYS,
+    cxjson.OPT_INDENT_2,
+    cxjson.OPT_SORT_KEYS | cxjson.OPT_INDENT_2,
+    cxjson.OPT_SORT_KEYS | cxjson.OPT_INDENT_2 | cxjson.OPT_APPEND_NEWLINE,
+]
+digests = []
+for p in payloads:
+    for o in opts:
+        digests.append(hashlib.sha256(cxjson.dumps(p, option=o)).hexdigest())
+print("|".join(digests))
+"""
+    env_mt = os.environ.copy()
+    env_mt.pop("CXJSON_MAX_THREADS", None)
+    env_st = os.environ.copy()
+    env_st["CXJSON_MAX_THREADS"] = "1"
+
+    out_mt = subprocess.check_output([sys.executable, "-c", script], env=env_mt, text=True).strip()
+    out_st = subprocess.check_output([sys.executable, "-c", script], env=env_st, text=True).strip()
+    assert out_mt == out_st, f"Parallel opts dumps vs 1T mismatch:\nMT={out_mt}\nST={out_st}"
+
+    # Deep (>32 level) OPT_INDENT_2 nesting must not trigger exponential buffer growth
+    nested = {"b": 1, "a": 2}
+    for _ in range(40):
+        nested = [nested]
+    deep = [nested] * 50
+    expected_ind = json.dumps(deep, indent=2).encode("utf-8")
+    expected_sort_ind = json.dumps(deep, indent=2, sort_keys=True).encode("utf-8")
+    assert cxjson.dumps(deep, option=cxjson.OPT_INDENT_2) == expected_ind
+    assert cxjson.dumps(deep, option=cxjson.OPT_SORT_KEYS | cxjson.OPT_INDENT_2) == expected_sort_ind
+
+
 if __name__ == "__main__":
     test_split_dict_gc_cycles_and_tracking()
     print("PASS: test_split_dict_gc_cycles_and_tracking")
@@ -252,4 +297,6 @@ if __name__ == "__main__":
     print("PASS: test_parallel_vs_single_threaded_identical")
     test_parallel_loads_numeric_arrays_and_errors()
     print("PASS: test_parallel_loads_numeric_arrays_and_errors")
+    test_parallel_opts_sort_indent_and_deep_nesting()
+    print("PASS: test_parallel_opts_sort_indent_and_deep_nesting")
     print("\nALL v0.1.1 REGRESSION TESTS PASSED!")

@@ -364,6 +364,660 @@ static char *raw_encode_val(RawSerBuf *rb, char *dst, char **safe_end_p, PyObjec
 }
 
 /* ========================================================================= */
+/* Parallel OPT_SORT_KEYS / OPT_INDENT_2 Read-Only Encoder                   */
+/* ========================================================================= */
+
+static const char RAW_INDENT_SEP[66] =
+    ",\n                                                                ";
+static const char RAW_INDENT_NL[65] =
+    "\n                                                                ";
+
+typedef struct {
+  uint64_t prefix;
+  const char *utf8;
+  Py_ssize_t len;
+  PyObject *val;
+  uint8_t orig_idx;
+} RawSortEntry;
+
+typedef struct {
+  PyObject *keys[24];
+  uint8_t perm[24];
+  uint16_t k_off[24];
+  uint16_t k_len[24];
+  uint8_t n;
+  uint8_t hits;
+} RawSortSchemaSlot;
+
+typedef struct {
+  RawSortSchemaSlot slots[16];
+  char key_buf[4096];
+  uint16_t buf_used;
+  uint8_t consec_misses;
+  uint8_t disabled;
+} RawSortSchemaCache;
+
+static inline uint64_t raw_key_prefix(const char *s, Py_ssize_t len) {
+  uint64_t p = 0;
+  if (CJSON_LIKELY(len >= 8)) {
+    memcpy(&p, s, 8);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    return p;
+#elif defined(_MSC_VER)
+    return _byteswap_uint64(p);
+#else
+    return __builtin_bswap64(p);
+#endif
+  }
+  for (Py_ssize_t i = 0; i < len; i++) {
+    p |= ((uint64_t)(unsigned char)s[i]) << (56 - (int)i * 8);
+  }
+  return p;
+}
+
+static inline int raw_entry_lt(const RawSortEntry *a, const RawSortEntry *b) {
+  if (a->prefix != b->prefix) return a->prefix < b->prefix;
+  Py_ssize_t min_l = a->len < b->len ? a->len : b->len;
+  if (min_l > 8) {
+    int c = memcmp(a->utf8 + 8, b->utf8 + 8, (size_t)(min_l - 8));
+    if (c != 0) return c < 0;
+  }
+  return a->len < b->len;
+}
+
+static inline void raw_sort_entries_insertion(RawSortEntry *a, Py_ssize_t n) {
+  for (Py_ssize_t i = 1; i < n; i++) {
+    RawSortEntry key = a[i];
+    Py_ssize_t j = i - 1;
+    while (j >= 0 && raw_entry_lt(&key, &a[j])) {
+      a[j + 1] = a[j];
+      j--;
+    }
+    a[j + 1] = key;
+  }
+}
+
+static void raw_sort_entries_qsort(RawSortEntry *a, Py_ssize_t n) {
+  while (n > 24) {
+    Py_ssize_t mid = n >> 1;
+    if (raw_entry_lt(&a[mid], &a[0])) { RawSortEntry t = a[0]; a[0] = a[mid]; a[mid] = t; }
+    if (raw_entry_lt(&a[n - 1], &a[0])) { RawSortEntry t = a[0]; a[0] = a[n - 1]; a[n - 1] = t; }
+    if (raw_entry_lt(&a[n - 1], &a[mid])) { RawSortEntry t = a[mid]; a[mid] = a[n - 1]; a[n - 1] = t; }
+    RawSortEntry pivot = a[mid];
+    Py_ssize_t i = 0, j = n - 1;
+    for (;;) {
+      while (raw_entry_lt(&a[i], &pivot)) i++;
+      while (raw_entry_lt(&pivot, &a[j])) j--;
+      if (i >= j) break;
+      RawSortEntry t = a[i]; a[i] = a[j]; a[j] = t;
+      i++;
+      j--;
+    }
+    Py_ssize_t left_n = j + 1;
+    Py_ssize_t right_n = n - left_n;
+    if (left_n < right_n) {
+      raw_sort_entries_qsort(a, left_n);
+      a += left_n;
+      n = right_n;
+    } else {
+      raw_sort_entries_qsort(a + left_n, right_n);
+      n = left_n;
+    }
+  }
+  raw_sort_entries_insertion(a, n);
+}
+
+static char *raw_encode_val_opts(RawSerBuf *rb, char *dst, char **safe_end_p,
+                                 PyObject *obj, int depth, int opts, int indent_level,
+                                 RawKeyCache *kc, RawSortSchemaCache *sc);
+
+static char *raw_encode_array_opts(RawSerBuf *rb, char *dst, char **safe_end_p,
+                                   PyObject *obj, int depth, int opts, int indent_level,
+                                   RawKeyCache *kc, RawSortSchemaCache *sc) {
+  if (CJSON_UNLIKELY(depth > 64)) return NULL;
+  Py_ssize_t len = PySequence_Fast_GET_SIZE(obj);
+  if (len == 0) {
+    dst[0] = '[';
+    dst[1] = ']';
+    return dst + 2;
+  }
+  int indent = (opts & OPT_INDENT_2);
+  if (CJSON_UNLIKELY(indent && indent_level >= 30)) return NULL;
+
+  char *safe_end = *safe_end_p;
+  int child_indent = indent ? (indent_level + 1) : 0;
+  size_t sep_len = (size_t)(2 + child_indent * 2);
+
+  if (indent) {
+    if (CJSON_UNLIKELY(dst > safe_end)) {
+      size_t cur = (size_t)(dst - rb->data);
+      if (raw_buf_grow(rb, cur + 4096) < 0) return NULL;
+      dst = rb->data + cur;
+      safe_end = rb->data + rb->cap - 128;
+    }
+    *dst++ = '[';
+    memcpy(dst, RAW_INDENT_NL, sep_len - 1);
+    dst += sep_len - 1;
+  } else {
+    *dst++ = '[';
+  }
+
+  PyObject **items = PySequence_Fast_ITEMS(obj);
+  PyTypeObject *tp0 = Py_TYPE(items[0]);
+  Py_ssize_t i = 0;
+
+  if (tp0 == &PyFloat_Type) {
+    for (; i < len; i++) {
+      PyObject *item = items[i];
+      if (CJSON_UNLIKELY(Py_TYPE(item) != &PyFloat_Type)) goto gen;
+      if (CJSON_UNLIKELY(dst > safe_end)) {
+        size_t cur = (size_t)(dst - rb->data);
+        if (raw_buf_grow(rb, cur + 4096) < 0) return NULL;
+        dst = rb->data + cur;
+        safe_end = rb->data + rb->cap - 128;
+      }
+      if (i > 0) {
+        if (indent) {
+          memcpy(dst, RAW_INDENT_SEP, sep_len);
+          dst += sep_len;
+        } else {
+          *dst++ = ',';
+        }
+      }
+      double d = PyFloat_AS_DOUBLE(item);
+      if (CJSON_LIKELY(!isnan(d) && !isinf(d))) {
+        dst = write_double_fast(d, dst);
+      } else {
+        memcpy(dst, "null", 4);
+        dst += 4;
+      }
+    }
+    goto close_arr;
+  }
+  if (tp0 == &PyLong_Type) {
+    for (; i < len; i++) {
+      PyObject *item = items[i];
+      if (CJSON_UNLIKELY(Py_TYPE(item) != &PyLong_Type)) goto gen;
+      if (CJSON_UNLIKELY(dst > safe_end)) {
+        size_t cur = (size_t)(dst - rb->data);
+        if (raw_buf_grow(rb, cur + 4096) < 0) return NULL;
+        dst = rb->data + cur;
+        safe_end = rb->data + rb->cap - 128;
+      }
+      if (i > 0) {
+        if (indent) {
+          memcpy(dst, RAW_INDENT_SEP, sep_len);
+          dst += sep_len;
+        } else {
+          *dst++ = ',';
+        }
+      }
+      dst = raw_write_py_long(dst, item);
+      if (CJSON_UNLIKELY(dst == NULL)) return NULL;
+    }
+    goto close_arr;
+  }
+
+gen:;
+  for (; i < len; i++) {
+    if (CJSON_UNLIKELY(dst > safe_end)) {
+      size_t cur = (size_t)(dst - rb->data);
+      if (raw_buf_grow(rb, cur + 4096) < 0) return NULL;
+      dst = rb->data + cur;
+      safe_end = rb->data + rb->cap - 128;
+    }
+    if (i > 0) {
+      if (indent) {
+        memcpy(dst, RAW_INDENT_SEP, sep_len);
+        dst += sep_len;
+        if (CJSON_UNLIKELY(dst > safe_end)) {
+          size_t cur = (size_t)(dst - rb->data);
+          if (raw_buf_grow(rb, cur + 4096) < 0) return NULL;
+          dst = rb->data + cur;
+          safe_end = rb->data + rb->cap - 128;
+        }
+      } else {
+        *dst++ = ',';
+      }
+    }
+    dst = raw_encode_val_opts(rb, dst, &safe_end, items[i], depth + 1, opts, child_indent, kc, sc);
+    if (CJSON_UNLIKELY(dst == NULL)) return NULL;
+  }
+
+close_arr:;
+  if (CJSON_UNLIKELY(dst > safe_end)) {
+    size_t cur = (size_t)(dst - rb->data);
+    if (raw_buf_grow(rb, cur + 256) < 0) return NULL;
+    dst = rb->data + cur;
+    safe_end = rb->data + rb->cap - 128;
+  }
+  if (indent) {
+    size_t close_len = (size_t)(1 + indent_level * 2);
+    memcpy(dst, RAW_INDENT_NL, close_len);
+    dst += close_len;
+  }
+  *dst++ = ']';
+  *safe_end_p = safe_end;
+  return dst;
+}
+
+static char *raw_encode_dict_opts(RawSerBuf *rb, char *dst, char **safe_end_p,
+                                  PyObject *obj, int depth, int opts, int indent_level,
+                                  RawKeyCache *kc, RawSortSchemaCache *sc) {
+  if (CJSON_UNLIKELY(depth > 64)) return NULL;
+  Py_ssize_t dict_size = PyDict_GET_SIZE(obj);
+  if (dict_size == 0) {
+    dst[0] = '{';
+    dst[1] = '}';
+    return dst + 2;
+  }
+  int indent = (opts & OPT_INDENT_2);
+  if (CJSON_UNLIKELY(indent && indent_level >= 30)) return NULL;
+
+  char *safe_end = *safe_end_p;
+  int child_indent = indent ? (indent_level + 1) : 0;
+  size_t sep_len = (size_t)(2 + child_indent * 2);
+
+  if (!(opts & OPT_SORT_KEYS)) {
+    /* OPT_INDENT_2 only (no sorting): reuse RawKeyCache storing `"key": ` */
+    if (CJSON_UNLIKELY(dst > safe_end)) {
+      size_t cur = (size_t)(dst - rb->data);
+      if (raw_buf_grow(rb, cur + 1024) < 0) return NULL;
+      dst = rb->data + cur;
+      safe_end = rb->data + rb->cap - 128;
+    }
+    *dst++ = '{';
+    memcpy(dst, RAW_INDENT_NL, sep_len - 1);
+    dst += sep_len - 1;
+
+    PyObject *key, *dval;
+    Py_ssize_t pos = 0;
+    Py_ssize_t idx = 0;
+    while (PyDict_Next(obj, &pos, &key, &dval)) {
+      if (CJSON_UNLIKELY(dst > safe_end)) {
+        size_t cur = (size_t)(dst - rb->data);
+        if (raw_buf_grow(rb, cur + 1024) < 0) return NULL;
+        dst = rb->data + cur;
+        safe_end = rb->data + rb->cap - 128;
+      }
+      if (idx++ > 0) {
+        memcpy(dst, RAW_INDENT_SEP, sep_len);
+        dst += sep_len;
+        if (CJSON_UNLIKELY(dst > safe_end)) {
+          size_t cur = (size_t)(dst - rb->data);
+          if (raw_buf_grow(rb, cur + 1024) < 0) return NULL;
+          dst = rb->data + cur;
+          safe_end = rb->data + rb->cap - 128;
+        }
+      }
+      uint32_t slot = (uint32_t)(((uintptr_t)key >> 4) ^ ((uintptr_t)key >> 10)) & 63u;
+      RawKeySlot *s = &kc->slots[slot];
+      if (CJSON_LIKELY(s->key_ptr == key)) {
+        uint32_t elen = s->enc_len;
+        if (CJSON_LIKELY(elen <= 16)) {
+          copy_short_ascii(dst, kc->buf + s->offset, elen);
+        } else {
+          memcpy(dst, kc->buf + s->offset, elen);
+        }
+        dst += elen;
+      } else {
+        if (CJSON_UNLIKELY(Py_TYPE(key) != &PyUnicode_Type)) return NULL;
+        size_t kstart_off = (size_t)(dst - rb->data);
+        dst = raw_emit_str(rb, dst, &safe_end, key);
+        if (CJSON_UNLIKELY(dst == NULL)) return NULL;
+        *dst++ = ':';
+        *dst++ = ' ';
+        size_t elen = (size_t)(dst - rb->data) - kstart_off;
+        if (elen <= 64 && kc->used + (uint32_t)elen <= sizeof(kc->buf)) {
+          memcpy(kc->buf + kc->used, rb->data + kstart_off, elen);
+          s->key_ptr = key;
+          s->offset = (uint16_t)kc->used;
+          s->enc_len = (uint16_t)elen;
+          kc->used += (uint32_t)elen;
+        }
+      }
+      if (CJSON_UNLIKELY(dst > safe_end)) {
+        size_t cur = (size_t)(dst - rb->data);
+        if (raw_buf_grow(rb, cur + 1024) < 0) return NULL;
+        dst = rb->data + cur;
+        safe_end = rb->data + rb->cap - 128;
+      }
+      dst = raw_encode_val_opts(rb, dst, &safe_end, dval, depth + 1, opts, child_indent, kc, sc);
+      if (CJSON_UNLIKELY(dst == NULL)) return NULL;
+    }
+    if (CJSON_UNLIKELY(dst > safe_end)) {
+      size_t cur = (size_t)(dst - rb->data);
+      if (raw_buf_grow(rb, cur + 256) < 0) return NULL;
+      dst = rb->data + cur;
+      safe_end = rb->data + rb->cap - 128;
+    }
+    size_t close_len = (size_t)(1 + indent_level * 2);
+    memcpy(dst, RAW_INDENT_NL, close_len);
+    dst += close_len;
+    *dst++ = '}';
+    *safe_end_p = safe_end;
+    return dst;
+  }
+
+  /* OPT_SORT_KEYS (with or without OPT_INDENT_2) */
+  RawSortSchemaSlot *miss_slot = NULL;
+  if (sc != NULL && !sc->disabled && dict_size >= 2 && dict_size <= 24) {
+    Py_ssize_t cpos = 0;
+    PyObject *k0 = NULL, *v0 = NULL;
+    if (PyDict_Next(obj, &cpos, &k0, &v0)) {
+      uint32_t h = (uint32_t)(((uintptr_t)k0 >> 4) ^ ((uintptr_t)k0 >> 10) ^ (uint32_t)dict_size) & 15u;
+      RawSortSchemaSlot *sl = &sc->slots[h];
+      if (sl->n == (uint8_t)dict_size && sl->keys[0] == k0) {
+        PyObject *vals[24];
+        vals[0] = v0;
+        Py_ssize_t j = 1;
+        PyObject *ck, *cv;
+        int match = 1;
+        while (PyDict_Next(obj, &cpos, &ck, &cv)) {
+          if (CJSON_UNLIKELY(ck != sl->keys[j])) {
+            match = 0;
+            break;
+          }
+          vals[j++] = cv;
+        }
+        if (CJSON_LIKELY(match && j == dict_size)) {
+          if (sl->hits < 255) sl->hits++;
+          sc->consec_misses = 0;
+          if (CJSON_UNLIKELY(dst > safe_end)) {
+            size_t cur = (size_t)(dst - rb->data);
+            if (raw_buf_grow(rb, cur + 1024) < 0) return NULL;
+            dst = rb->data + cur;
+            safe_end = rb->data + rb->cap - 128;
+          }
+          *dst++ = '{';
+          if (indent) {
+            memcpy(dst, RAW_INDENT_NL, sep_len - 1);
+            dst += sep_len - 1;
+          }
+          for (Py_ssize_t s = 0; s < dict_size; s++) {
+            uint16_t kl = sl->k_len[s];
+            if (CJSON_UNLIKELY(dst + kl + sep_len > safe_end)) {
+              size_t cur = (size_t)(dst - rb->data);
+              if (raw_buf_grow(rb, cur + kl + 1024) < 0) return NULL;
+              dst = rb->data + cur;
+              safe_end = rb->data + rb->cap - 128;
+            }
+            if (s > 0) {
+              if (indent) {
+                memcpy(dst, RAW_INDENT_SEP, sep_len);
+                dst += sep_len;
+              } else {
+                *dst++ = ',';
+              }
+            }
+            memcpy(dst, sc->key_buf + sl->k_off[s], kl);
+            dst += kl;
+            dst = raw_encode_val_opts(rb, dst, &safe_end, vals[sl->perm[s]], depth + 1, opts, child_indent, kc, sc);
+            if (CJSON_UNLIKELY(dst == NULL)) return NULL;
+          }
+          if (CJSON_UNLIKELY(dst > safe_end)) {
+            size_t cur = (size_t)(dst - rb->data);
+            if (raw_buf_grow(rb, cur + 256) < 0) return NULL;
+            dst = rb->data + cur;
+            safe_end = rb->data + rb->cap - 128;
+          }
+          if (indent) {
+            size_t close_len = (size_t)(1 + indent_level * 2);
+            memcpy(dst, RAW_INDENT_NL, close_len);
+            dst += close_len;
+          }
+          *dst++ = '}';
+          *safe_end_p = safe_end;
+          return dst;
+        }
+      }
+      if (sl->n == 0 || sl->hits < 2) {
+        miss_slot = sl;
+      }
+      if (++sc->consec_misses >= 24) {
+        sc->disabled = 1;
+      }
+    }
+  }
+
+  RawSortEntry stack_entries[64];
+  RawSortEntry *entries = stack_entries;
+  if (CJSON_UNLIKELY(dict_size > 64)) {
+    entries = (RawSortEntry *)malloc((size_t)dict_size * sizeof(RawSortEntry));
+    if (CJSON_UNLIKELY(entries == NULL)) return NULL;
+  }
+
+  PyObject *raw_keys[24];
+  PyObject *key, *dval;
+  Py_ssize_t pos = 0, cnt = 0;
+  int sorted = 1;
+  while (PyDict_Next(obj, &pos, &key, &dval)) {
+    if (CJSON_UNLIKELY(Py_TYPE(key) != &PyUnicode_Type)) {
+      if (entries != stack_entries) free(entries);
+      return NULL;
+    }
+    const char *utf8;
+    Py_ssize_t klen;
+    if (CJSON_LIKELY(PyUnicode_IS_COMPACT_ASCII(key))) {
+      klen = PyUnicode_GET_LENGTH(key);
+      utf8 = (const char *)PyUnicode_1BYTE_DATA(key);
+#ifndef Py_LIMITED_API
+    } else if (PyUnicode_IS_COMPACT(key) && ((PyCompactUnicodeObject *)key)->utf8 != NULL) {
+      PyCompactUnicodeObject *cu = (PyCompactUnicodeObject *)key;
+      klen = cu->utf8_length;
+      utf8 = cu->utf8;
+#endif
+    } else {
+      if (entries != stack_entries) free(entries);
+      return NULL;
+    }
+    if (miss_slot != NULL && cnt < 24) raw_keys[cnt] = key;
+    entries[cnt].prefix = raw_key_prefix(utf8, klen);
+    entries[cnt].utf8 = utf8;
+    entries[cnt].len = klen;
+    entries[cnt].val = dval;
+    entries[cnt].orig_idx = (uint8_t)cnt;
+    if (cnt > 0 && sorted && raw_entry_lt(&entries[cnt], &entries[cnt - 1])) {
+      sorted = 0;
+    }
+    cnt++;
+  }
+
+  if (!sorted && cnt > 1) {
+    if (cnt <= 24) {
+      raw_sort_entries_insertion(entries, cnt);
+    } else {
+      raw_sort_entries_qsort(entries, cnt);
+    }
+  }
+
+  /* Populate schema cache slot on miss if keys are clean and fit in key_buf */
+  if (miss_slot != NULL && cnt >= 2 && cnt <= 24) {
+    uint16_t start_used = sc->buf_used;
+    uint16_t used = start_used;
+    uint16_t tmp_off[24];
+    uint16_t tmp_len[24];
+    int pack_ok = 1;
+    for (Py_ssize_t s = 0; s < cnt; s++) {
+      Py_ssize_t kl = entries[s].len;
+      uint16_t need = (uint16_t)(kl + 3 + (indent ? 1 : 0));
+      if (kl > 60 || (uint32_t)used + need > sizeof(sc->key_buf)) {
+        pack_ok = 0;
+        break;
+      }
+      char *p = sc->key_buf + used;
+      tmp_off[s] = used;
+      *p++ = '"';
+      if (kl > 0 && !copy_if_clean_short(p, entries[s].utf8, kl)) {
+        pack_ok = 0;
+        break;
+      }
+      p += kl;
+      *p++ = '"';
+      *p++ = ':';
+      if (indent) *p++ = ' ';
+      tmp_len[s] = need;
+      used += need;
+    }
+    if (pack_ok) {
+      memcpy(miss_slot->keys, raw_keys, (size_t)cnt * sizeof(PyObject *));
+      for (Py_ssize_t s = 0; s < cnt; s++) {
+        miss_slot->perm[s] = entries[s].orig_idx;
+        miss_slot->k_off[s] = tmp_off[s];
+        miss_slot->k_len[s] = tmp_len[s];
+      }
+      miss_slot->n = (uint8_t)cnt;
+      miss_slot->hits = 1;
+      sc->buf_used = used;
+    }
+  }
+
+  if (CJSON_UNLIKELY(dst > safe_end)) {
+    size_t cur = (size_t)(dst - rb->data);
+    if (raw_buf_grow(rb, cur + 1024) < 0) {
+      if (entries != stack_entries) free(entries);
+      return NULL;
+    }
+    dst = rb->data + cur;
+    safe_end = rb->data + rb->cap - 128;
+  }
+  *dst++ = '{';
+  if (indent) {
+    memcpy(dst, RAW_INDENT_NL, sep_len - 1);
+    dst += sep_len - 1;
+  }
+
+  for (Py_ssize_t i = 0; i < cnt; i++) {
+    if (CJSON_UNLIKELY(dst > safe_end)) {
+      size_t cur = (size_t)(dst - rb->data);
+      if (raw_buf_grow(rb, cur + 1024) < 0) {
+        if (entries != stack_entries) free(entries);
+        return NULL;
+      }
+      dst = rb->data + cur;
+      safe_end = rb->data + rb->cap - 128;
+    }
+    if (i > 0) {
+      if (indent) {
+        memcpy(dst, RAW_INDENT_SEP, sep_len);
+        dst += sep_len;
+        if (CJSON_UNLIKELY(dst > safe_end)) {
+          size_t cur = (size_t)(dst - rb->data);
+          if (raw_buf_grow(rb, cur + 1024) < 0) {
+            if (entries != stack_entries) free(entries);
+            return NULL;
+          }
+          dst = rb->data + cur;
+          safe_end = rb->data + rb->cap - 128;
+        }
+      } else {
+        *dst++ = ',';
+      }
+    }
+    const char *ks = entries[i].utf8;
+    Py_ssize_t kl = entries[i].len;
+    if (CJSON_UNLIKELY(kl == 0)) {
+      dst[0] = '"'; dst[1] = '"'; dst += 2;
+    } else if (CJSON_LIKELY(kl <= 64)) {
+      if (CJSON_LIKELY(copy_if_clean_short(dst + 1, ks, kl))) {
+        dst[0] = '"';
+        dst[kl + 1] = '"';
+        dst += kl + 2;
+      } else {
+        dst = raw_emit_str_escaped(rb, dst, &safe_end, ks, kl, 0);
+        if (CJSON_UNLIKELY(dst == NULL)) {
+          if (entries != stack_entries) free(entries);
+          return NULL;
+        }
+      }
+    } else {
+      size_t cur = (size_t)(dst - rb->data);
+      if (CJSON_UNLIKELY(cur + (size_t)kl + 130 > rb->cap)) {
+        if (raw_buf_grow(rb, cur + (size_t)kl + 256) < 0) {
+          if (entries != stack_entries) free(entries);
+          return NULL;
+        }
+        dst = rb->data + cur;
+        safe_end = rb->data + rb->cap - 128;
+      }
+      Py_ssize_t clean = copy_clean_prefix(dst + 1, ks, kl);
+      if (CJSON_LIKELY(clean == kl)) {
+        dst[0] = '"';
+        dst[kl + 1] = '"';
+        dst += kl + 2;
+      } else {
+        dst = raw_emit_str_escaped(rb, dst, &safe_end, ks, kl, clean);
+        if (CJSON_UNLIKELY(dst == NULL)) {
+          if (entries != stack_entries) free(entries);
+          return NULL;
+        }
+      }
+    }
+    *dst++ = ':';
+    if (indent) *dst++ = ' ';
+    if (CJSON_UNLIKELY(dst > safe_end)) {
+      size_t cur = (size_t)(dst - rb->data);
+      if (raw_buf_grow(rb, cur + 1024) < 0) {
+        if (entries != stack_entries) free(entries);
+        return NULL;
+      }
+      dst = rb->data + cur;
+      safe_end = rb->data + rb->cap - 128;
+    }
+    dst = raw_encode_val_opts(rb, dst, &safe_end, entries[i].val, depth + 1, opts, child_indent, kc, sc);
+    if (CJSON_UNLIKELY(dst == NULL)) {
+      if (entries != stack_entries) free(entries);
+      return NULL;
+    }
+  }
+
+  if (entries != stack_entries) free(entries);
+  if (CJSON_UNLIKELY(dst > safe_end)) {
+    size_t cur = (size_t)(dst - rb->data);
+    if (raw_buf_grow(rb, cur + 256) < 0) return NULL;
+    dst = rb->data + cur;
+    safe_end = rb->data + rb->cap - 128;
+  }
+  if (indent) {
+    size_t close_len = (size_t)(1 + indent_level * 2);
+    memcpy(dst, RAW_INDENT_NL, close_len);
+    dst += close_len;
+  }
+  *dst++ = '}';
+  *safe_end_p = safe_end;
+  return dst;
+}
+
+static char *raw_encode_val_opts(RawSerBuf *rb, char *dst, char **safe_end_p,
+                                 PyObject *obj, int depth, int opts, int indent_level,
+                                 RawKeyCache *kc, RawSortSchemaCache *sc) {
+  PyTypeObject *tp = Py_TYPE(obj);
+  if (tp == &PyUnicode_Type) return raw_emit_str(rb, dst, safe_end_p, obj);
+  if (tp == &PyLong_Type) return raw_write_py_long(dst, obj);
+  if (tp == &PyFloat_Type) {
+    double d = PyFloat_AS_DOUBLE(obj);
+    if (CJSON_LIKELY(!isnan(d) && !isinf(d))) return write_double_fast(d, dst);
+    memcpy(dst, "null", 4);
+    return dst + 4;
+  }
+  if (obj == Py_None) {
+    memcpy(dst, "null", 4);
+    return dst + 4;
+  }
+  if (tp == &PyBool_Type) {
+    if (obj == Py_True) {
+      memcpy(dst, "true", 4);
+      return dst + 4;
+    }
+    memcpy(dst, "false", 5);
+    return dst + 5;
+  }
+  if (tp == &PyDict_Type) return raw_encode_dict_opts(rb, dst, safe_end_p, obj, depth, opts, indent_level, kc, sc);
+  if (tp == &PyList_Type || tp == &PyTuple_Type) return raw_encode_array_opts(rb, dst, safe_end_p, obj, depth, opts, indent_level, kc, sc);
+  return NULL;
+}
+
+/* ========================================================================= */
 /* Persistent Worker Pool (lazily started, configured via CJSON_MAX_THREADS) */
 /* ========================================================================= */
 
@@ -374,6 +1028,8 @@ typedef struct {
 
 typedef struct {
   int is_dict;
+  int opts;
+  int base_indent;
   PyObject **items;
   const ParDictPair *pairs;
   Py_ssize_t start;
@@ -398,7 +1054,82 @@ typedef struct {
 
 static ParPool g_par_pool;
 
+static void par_run_task_opts(ParTask *t) {
+  t->failed = 0;
+  RawSerBuf *rb = &t->out;
+  if (rb->cap < 65536) {
+    if (raw_buf_grow(rb, 65536) < 0) {
+      t->failed = 1;
+      return;
+    }
+  }
+  RawKeyCache kc;
+  memset(kc.slots, 0, sizeof(kc.slots));
+  kc.used = 0;
+  RawSortSchemaCache sc;
+  RawSortSchemaCache *sc_ptr = NULL;
+  if (t->opts & OPT_SORT_KEYS) {
+    for (int i = 0; i < 16; i++) {
+      sc.slots[i].n = 0;
+      sc.slots[i].hits = 0;
+    }
+    sc.buf_used = 0;
+    sc.consec_misses = 0;
+    sc.disabled = 0;
+    sc_ptr = &sc;
+  }
+
+  int opts = t->opts;
+  int indent = (opts & OPT_INDENT_2);
+  int elem_indent = indent ? (t->base_indent + 1) : 0;
+  size_t sep_len = (size_t)(2 + elem_indent * 2);
+
+  char *dst = rb->data;
+  char *safe_end = rb->data + rb->cap - 128;
+
+  PyObject **items = t->items;
+  if (indent) {
+    /* Every element is prefixed with `,\n<2*elem_indent spaces>`.
+     * Stitching replaces slice 0's leading `,` with `[` and appends `\n<2*base_indent>]`. */
+    for (Py_ssize_t i = t->start; i < t->end; i++) {
+      if (CJSON_UNLIKELY(dst > safe_end)) {
+        size_t cur = (size_t)(dst - rb->data);
+        if (raw_buf_grow(rb, cur + 4096) < 0) { t->failed = 1; return; }
+        dst = rb->data + cur;
+        safe_end = rb->data + rb->cap - 128;
+      }
+      memcpy(dst, RAW_INDENT_SEP, sep_len);
+      dst += sep_len;
+      if (CJSON_UNLIKELY(dst > safe_end)) {
+        size_t cur = (size_t)(dst - rb->data);
+        if (raw_buf_grow(rb, cur + 4096) < 0) { t->failed = 1; return; }
+        dst = rb->data + cur;
+        safe_end = rb->data + rb->cap - 128;
+      }
+      dst = raw_encode_val_opts(rb, dst, &safe_end, items[i], 1, opts, elem_indent, &kc, sc_ptr);
+      if (CJSON_UNLIKELY(dst == NULL)) { t->failed = 1; return; }
+    }
+  } else {
+    for (Py_ssize_t i = t->start; i < t->end; i++) {
+      if (CJSON_UNLIKELY(dst > safe_end)) {
+        size_t cur = (size_t)(dst - rb->data);
+        if (raw_buf_grow(rb, cur + 4096) < 0) { t->failed = 1; return; }
+        dst = rb->data + cur;
+        safe_end = rb->data + rb->cap - 128;
+      }
+      dst = raw_encode_val_opts(rb, dst, &safe_end, items[i], 1, opts, 0, &kc, sc_ptr);
+      if (CJSON_UNLIKELY(dst == NULL)) { t->failed = 1; return; }
+      *dst++ = ',';
+    }
+  }
+  rb->len = (size_t)(dst - rb->data);
+}
+
 static void par_run_task(ParTask *t) {
+  if (CJSON_UNLIKELY(t->opts != 0)) {
+    par_run_task_opts(t);
+    return;
+  }
   t->failed = 0;
   RawSerBuf *rb = &t->out;
   if (rb->cap < 65536) {
@@ -605,6 +1336,8 @@ static int cjson_parallel_encode_slices(
     Py_ssize_t e = s + chunk;
     if (e > total) e = total;
     g_par_pool.tasks[t].is_dict = is_dict;
+    g_par_pool.tasks[t].opts = 0;
+    g_par_pool.tasks[t].base_indent = 0;
     g_par_pool.tasks[t].items = items;
     g_par_pool.tasks[t].pairs = pairs;
     g_par_pool.tasks[t].start = s;
@@ -676,6 +1409,115 @@ static int cjson_parallel_encode_slices(
     }
   }
   dst[-1] = is_dict ? '}' : ']';
+  b->len = (Py_ssize_t)(dst - b->data);
+  return 1;
+}
+
+/* Parallel array serializer for OPT_SORT_KEYS / OPT_INDENT_2.
+ * Returns 1 on success (result appended to b with brackets), 0 to fall back, -1 on OOM. */
+__attribute__((noinline))
+static int cjson_parallel_encode_array_opts(
+    JsonBuffer *b, PyObject **items, Py_ssize_t total,
+    Py_ssize_t est_bytes, int opts, int base_indent) {
+  if (g_par_pool.max_threads <= 1) return 0;
+  int indent = (opts & OPT_INDENT_2);
+  if (indent && base_indent >= 28) return 0;
+  if (!cjson_parallel_ensure_started()) return 0;
+
+  int desired = (est_bytes < 1024 * 1024) ? 2 : ((est_bytes < 4 * 1024 * 1024) ? 4 : g_par_pool.max_threads);
+  int nthreads = (desired < g_par_pool.max_threads) ? desired : g_par_pool.max_threads;
+  if (nthreads <= 1 || total < nthreads * 16) return 0;
+
+  int task_opts = opts & (OPT_INDENT_2 | OPT_SORT_KEYS);
+  Py_ssize_t chunk = (total + nthreads - 1) / nthreads;
+  int actual = 0;
+  for (int t = 0; t < nthreads; t++) {
+    Py_ssize_t s = (Py_ssize_t)t * chunk;
+    if (s >= total) break;
+    Py_ssize_t e = s + chunk;
+    if (e > total) e = total;
+    g_par_pool.tasks[t].is_dict = 0;
+    g_par_pool.tasks[t].opts = task_opts;
+    g_par_pool.tasks[t].base_indent = base_indent;
+    g_par_pool.tasks[t].items = items;
+    g_par_pool.tasks[t].pairs = NULL;
+    g_par_pool.tasks[t].start = s;
+    g_par_pool.tasks[t].end = e;
+    g_par_pool.tasks[t].failed = 0;
+    actual++;
+  }
+  if (actual <= 1) return 0;
+
+  cjson_mutex_lock(&g_par_pool.mu);
+  g_par_pool.active_workers = actual - 1;
+  g_par_pool.done_count = 0;
+  g_par_pool.phase = 0;
+  g_par_pool.generation++;
+  cjson_cond_broadcast(&g_par_pool.cv_work);
+  cjson_mutex_unlock(&g_par_pool.mu);
+
+  par_run_task_opts(&g_par_pool.tasks[0]);
+
+  cjson_mutex_lock(&g_par_pool.mu);
+  while (g_par_pool.done_count < g_par_pool.active_workers) {
+    cjson_cond_wait(&g_par_pool.cv_done, &g_par_pool.mu);
+  }
+  cjson_mutex_unlock(&g_par_pool.mu);
+
+  size_t total_bytes = 0;
+  for (int t = 0; t < actual; t++) {
+    if (g_par_pool.tasks[t].failed) return 0;
+    total_bytes += g_par_pool.tasks[t].out.len;
+  }
+  if (total_bytes == 0) return 0;
+
+  size_t close_len = indent ? (size_t)(1 + base_indent * 2) : 0;
+  Py_ssize_t reserve_extra = (Py_ssize_t)(total_bytes + close_len + 4);
+  if (json_buffer_reserve(b, reserve_extra) < 0) return -1;
+
+  char *start_dst = b->data + b->len;
+  char *dst = indent ? start_dst : (start_dst + 1);
+  if (!indent) *start_dst = '[';
+
+  if (total_bytes >= 6 * 1024 * 1024 && actual >= 2) {
+    char *cur_dst = dst;
+    for (int t = 0; t < actual; t++) {
+      g_par_pool.tasks[t].copy_dst = cur_dst;
+      cur_dst += g_par_pool.tasks[t].out.len;
+    }
+    cjson_mutex_lock(&g_par_pool.mu);
+    g_par_pool.active_workers = actual - 1;
+    g_par_pool.done_count = 0;
+    g_par_pool.phase = 1;
+    g_par_pool.generation++;
+    cjson_cond_broadcast(&g_par_pool.cv_work);
+    cjson_mutex_unlock(&g_par_pool.mu);
+
+    if (g_par_pool.tasks[0].out.len > 0) {
+      memcpy(g_par_pool.tasks[0].copy_dst, g_par_pool.tasks[0].out.data, g_par_pool.tasks[0].out.len);
+    }
+
+    cjson_mutex_lock(&g_par_pool.mu);
+    while (g_par_pool.done_count < g_par_pool.active_workers) {
+      cjson_cond_wait(&g_par_pool.cv_done, &g_par_pool.mu);
+    }
+    cjson_mutex_unlock(&g_par_pool.mu);
+    dst = cur_dst;
+  } else {
+    for (int t = 0; t < actual; t++) {
+      memcpy(dst, g_par_pool.tasks[t].out.data, g_par_pool.tasks[t].out.len);
+      dst += g_par_pool.tasks[t].out.len;
+    }
+  }
+
+  if (indent) {
+    start_dst[0] = '[';
+    memcpy(dst, RAW_INDENT_NL, close_len);
+    dst += close_len;
+    *dst++ = ']';
+  } else {
+    dst[-1] = ']';
+  }
   b->len = (Py_ssize_t)(dst - b->data);
   return 1;
 }

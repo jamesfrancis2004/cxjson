@@ -3739,13 +3739,15 @@ static inline char *emit_indent_open_fast(
     return dst + 1 + spaces;
   }
   b->len = (Py_ssize_t)(dst - b->data);
-  if (json_buffer_grow(b, b->len + 2 + spaces + 256) < 0) return NULL;
-  dst = b->data + b->len;
+  if (CJSON_UNLIKELY(b->len + 2 + spaces + 256 > b->cap)) {
+    if (json_buffer_grow(b, b->len + 2 + spaces + 256) < 0) return NULL;
+    dst = b->data + b->len;
+    *safe_end_p = b->data + b->cap - 128;
+  }
   *dst++ = open_ch;
   *dst++ = '\n';
   memset(dst, ' ', (size_t)spaces);
   dst += spaces;
-  *safe_end_p = b->data + b->cap - 128;
   return dst;
 }
 
@@ -3757,13 +3759,15 @@ static inline char *emit_indent_sep_fast(
     return dst + 2 + spaces;
   }
   b->len = (Py_ssize_t)(dst - b->data);
-  if (json_buffer_grow(b, b->len + 2 + spaces + 256) < 0) return NULL;
-  dst = b->data + b->len;
+  if (CJSON_UNLIKELY(b->len + 2 + spaces + 256 > b->cap)) {
+    if (json_buffer_grow(b, b->len + 2 + spaces + 256) < 0) return NULL;
+    dst = b->data + b->len;
+    *safe_end_p = b->data + b->cap - 128;
+  }
   *dst++ = ',';
   *dst++ = '\n';
   memset(dst, ' ', (size_t)spaces);
   dst += spaces;
-  *safe_end_p = b->data + b->cap - 128;
   return dst;
 }
 
@@ -3777,13 +3781,15 @@ static inline char *emit_indent_close_fast(
     return dst;
   }
   b->len = (Py_ssize_t)(dst - b->data);
-  if (json_buffer_grow(b, b->len + 2 + spaces + 256) < 0) return NULL;
-  dst = b->data + b->len;
+  if (CJSON_UNLIKELY(b->len + 2 + spaces + 256 > b->cap)) {
+    if (json_buffer_grow(b, b->len + 2 + spaces + 256) < 0) return NULL;
+    dst = b->data + b->len;
+    *safe_end_p = b->data + b->cap - 128;
+  }
   *dst++ = '\n';
   memset(dst, ' ', (size_t)spaces);
   dst += spaces;
   *dst++ = close_ch;
-  *safe_end_p = b->data + b->cap - 128;
   return dst;
 }
 
@@ -4087,8 +4093,35 @@ static char *encode_array_opts_fast(SerializeContext *ctx, char *dst, char **saf
     return NULL;
   }
 
-  b->depth++;
   int indent = (ctx->opts & OPT_INDENT_2);
+
+#if defined(CJSON_PARALLEL_SER)
+  if (CJSON_UNLIKELY(len >= 64 && b->depth <= 4 && ctx->default_fn == NULL &&
+                     g_par_pool.max_threads > 1 && (!indent || ctx->indent_level < 28))) {
+    PyObject **pitems = PySequence_Fast_ITEMS(obj);
+    Py_ssize_t e0 = estimate_elem_bytes_o1(pitems[0], 3);
+    Py_ssize_t e1 = estimate_elem_bytes_o1(pitems[len >> 1], 3);
+    Py_ssize_t e2 = estimate_elem_bytes_o1(pitems[len - 1], 3);
+    Py_ssize_t elem_b = (e0 + e1 + e2) / 3;
+    Py_ssize_t est_bytes = (elem_b > (PY_SSIZE_T_MAX / len)) ? (16 * 1024 * 1024) : (len * elem_b);
+    if (est_bytes >= 1024 * 1024) {
+      b->len = (Py_ssize_t)(dst - b->data);
+      int prc = cjson_parallel_encode_array_opts(b, pitems, len, est_bytes, ctx->opts, ctx->indent_level);
+      if (prc < 0) return NULL;
+      if (prc > 0) {
+        if (CJSON_UNLIKELY(b->len + 128 > b->cap)) {
+          if (json_buffer_grow(b, b->len + 256) < 0) return NULL;
+        }
+        *safe_end_p = b->data + b->cap - 128;
+        return b->data + b->len;
+      }
+      dst = b->data + b->len;
+      safe_end = b->data + b->cap - 128;
+    }
+  }
+#endif
+
+  b->depth++;
   if (indent) {
     ctx->indent_level++;
     dst = emit_indent_open_fast(b, dst, &safe_end, '[', ctx->indent_level);
