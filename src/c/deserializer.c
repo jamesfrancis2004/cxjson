@@ -1576,24 +1576,34 @@ close_object:;
   {
     size_t base = frames[--frame_sp].base;
     Py_ssize_t count = (Py_ssize_t)(jp->kv_sp - base);
-    PyObject *dict = (count <= 5) ? PyDict_New() : _PyDict_NewPresized(count);
-    if (CJSON_UNLIKELY(dict == NULL)) goto fail;
     KvEntry *entries = &jp->kvs[base];
-    for (Py_ssize_t i = 0; i < count; i++) {
-      int rc = _PyDict_SetItem_KnownHash(dict, entries[i].key, entries[i].val, entries[i].hash);
-      Py_DECREF(entries[i].key);
-      Py_DECREF(entries[i].val);
-      if (CJSON_UNLIKELY(rc < 0)) {
-        for (Py_ssize_t j = i + 1; j < count; j++) {
-          Py_DECREF(entries[j].key);
-          Py_DECREF(entries[j].val);
+    PyObject *dict;
+#if defined(CJSON_SPLIT_DICT_FAST)
+    if (CJSON_LIKELY(g_split_dict_enabled)) {
+      dict = cjson_build_combined_dict_from_kvs(entries, (size_t)count);
+      jp->kv_sp = base;
+      if (CJSON_UNLIKELY(dict == NULL)) goto fail;
+    } else
+#endif
+    {
+      dict = (count <= 5) ? PyDict_New() : _PyDict_NewPresized(count);
+      if (CJSON_UNLIKELY(dict == NULL)) goto fail;
+      for (Py_ssize_t i = 0; i < count; i++) {
+        int rc = _PyDict_SetItem_KnownHash(dict, entries[i].key, entries[i].val, entries[i].hash);
+        Py_DECREF(entries[i].key);
+        Py_DECREF(entries[i].val);
+        if (CJSON_UNLIKELY(rc < 0)) {
+          for (Py_ssize_t j = i + 1; j < count; j++) {
+            Py_DECREF(entries[j].key);
+            Py_DECREF(entries[j].val);
+          }
+          jp->kv_sp = base;
+          Py_DECREF(dict);
+          goto fail;
         }
-        jp->kv_sp = base;
-        Py_DECREF(dict);
-        goto fail;
       }
+      jp->kv_sp = base;
     }
-    jp->kv_sp = base;
     val = dict;
     goto attach_value;
   }
@@ -1932,39 +1942,37 @@ static PyObject *parse_object_rec(
 
   split_fallback:;
     {
-      dict = (expected_len <= 5) ? PyDict_New() : _PyDict_NewPresized((Py_ssize_t)expected_len);
+      size_t kv_base = jp->kv_sp;
       CJsonDictUnicodeEntry *ep =
           (CJsonDictUnicodeEntry *)(saved_dk->dk_indices + ((size_t)1 << saved_dk->dk_log2_index_bytes));
-      if (CJSON_UNLIKELY(dict == NULL)) {
-        for (uint32_t j = 0; j < parsed; j++) Py_DECREF(split_vals[j]);
-        cjson_free_shared_keys(saved_dk);
-        return NULL;
-      }
-      for (uint32_t j = 0; j < parsed; j++) {
-        PyObject *k = ep[j].me_key;
-        int rc = _PyDict_SetItem_KnownHash(dict, k, split_vals[j], PyObject_Hash(k));
-        Py_DECREF(split_vals[j]);
-        if (CJSON_UNLIKELY(rc < 0)) {
-          for (uint32_t r = j + 1; r < parsed; r++) Py_DECREF(split_vals[r]);
+      while (jp->kv_sp + parsed > jp->kv_cap) {
+        if (CJSON_UNLIKELY(parser_grow_kvs(jp) < 0)) {
+          for (uint32_t j = 0; j < parsed; j++) Py_DECREF(split_vals[j]);
           cjson_free_shared_keys(saved_dk);
-          Py_DECREF(dict);
           return NULL;
         }
       }
+      for (uint32_t j = 0; j < parsed; j++) {
+        PyObject *k = ep[j].me_key;
+        Py_INCREF(k);
+        jp->kvs[jp->kv_sp++] = (KvEntry){k, split_vals[j], PyObject_Hash(k)};
+      }
       cjson_free_shared_keys(saved_dk);
       pred_idx = parsed;
+      (void)kv_base;
+      goto parse_kv_loop;
     }
-  } else {
-    dict = (sc->len <= 5) ? PyDict_New() : _PyDict_NewPresized((Py_ssize_t)sc->len);
   }
-#else
-  dict = (sc->len <= 5) ? PyDict_New() : _PyDict_NewPresized((Py_ssize_t)sc->len);
 #endif
-#else
-  (void)schema_slot;
-  PyObject *dict = PyDict_New();
 #endif
-  if (CJSON_UNLIKELY(dict == NULL)) return NULL;
+
+  size_t kv_base = jp->kv_sp;
+#if defined(CJSON_SPLIT_DICT_FAST)
+  if (0) {
+  parse_kv_loop:
+    kv_base = jp->kv_sp - pred_idx;
+  }
+#endif
 
   while (1) {
     p++;
@@ -1988,7 +1996,6 @@ static PyObject *parse_object_rec(
     key = parse_dict_key(jp, &p, end, &kh);
 #endif
     if (CJSON_UNLIKELY(key == NULL)) {
-      Py_DECREF(dict);
       return NULL;
     }
 
@@ -1997,7 +2004,6 @@ static PyObject *parse_object_rec(
       p = skip_ws(p, end);
       if (CJSON_UNLIKELY(p >= end || *p != ':')) {
         Py_DECREF(key);
-        Py_DECREF(dict);
         raise_decode_error(jp, (p >= end) ? "unexpected end of data" : "expected ':' after key", p);
         return NULL;
       }
@@ -2008,7 +2014,6 @@ static PyObject *parse_object_rec(
       p = skip_ws(p, end);
       if (CJSON_UNLIKELY(p >= end)) {
         Py_DECREF(key);
-        Py_DECREF(dict);
         raise_decode_error(jp, "unexpected end of data", p);
         return NULL;
       }
@@ -2056,24 +2061,23 @@ static PyObject *parse_object_rec(
       val = Py_None;
     } else {
       Py_DECREF(key);
-      Py_DECREF(dict);
       raise_unexpected_value_error(jp, p, end);
       return NULL;
     }
 
     if (CJSON_UNLIKELY(val == NULL)) {
       Py_DECREF(key);
-      Py_DECREF(dict);
       return NULL;
     }
 
-    int rc = _PyDict_SetItem_KnownHash(dict, key, val, kh);
-    Py_DECREF(key);
-    Py_DECREF(val);
-    if (CJSON_UNLIKELY(rc < 0)) {
-      Py_DECREF(dict);
-      return NULL;
+    if (CJSON_UNLIKELY(jp->kv_sp == jp->kv_cap)) {
+      if (CJSON_UNLIKELY(parser_grow_kvs(jp) < 0)) {
+        Py_DECREF(key);
+        Py_DECREF(val);
+        return NULL;
+      }
     }
+    jp->kvs[jp->kv_sp++] = (KvEntry){key, val, kh};
 
     if (CJSON_LIKELY(p < end && *p == ',')) {
       p++;
@@ -2082,13 +2086,11 @@ static PyObject *parse_object_rec(
       }
       p = skip_ws(p, end);
       if (CJSON_UNLIKELY(p >= end || *p == '}')) {
-        Py_DECREF(dict);
         raise_decode_error(jp, (p >= end) ? "unexpected end of data" : "trailing comma is not allowed",
                            (p >= end) ? p : (p - 1));
         return NULL;
       }
       if (CJSON_UNLIKELY(*p != '"')) {
-        Py_DECREF(dict);
         raise_decode_error(jp, "expected string key in object", p);
         return NULL;
       }
@@ -2100,20 +2102,17 @@ static PyObject *parse_object_rec(
     }
     p = skip_ws(p, end);
     if (CJSON_UNLIKELY(p >= end)) {
-      Py_DECREF(dict);
       raise_decode_error(jp, "unexpected end of data", p);
       return NULL;
     }
     if (*p == ',') {
       p = skip_ws(p + 1, end);
       if (CJSON_UNLIKELY(p >= end || *p == '}')) {
-        Py_DECREF(dict);
         raise_decode_error(jp, (p >= end) ? "unexpected end of data" : "trailing comma is not allowed",
                            (p >= end) ? p : (p - 1));
         return NULL;
       }
       if (CJSON_UNLIKELY(*p != '"')) {
-        Py_DECREF(dict);
         raise_decode_error(jp, "expected string key in object", p);
         return NULL;
       }
@@ -2123,9 +2122,37 @@ static PyObject *parse_object_rec(
       p++;
       break;
     }
-    Py_DECREF(dict);
     raise_decode_error(jp, "expected ',' or '}' in object", p);
     return NULL;
+  }
+
+  size_t kv_cnt = jp->kv_sp - kv_base;
+  KvEntry *kv_entries = jp->kvs + kv_base;
+#if defined(CJSON_SPLIT_DICT_FAST)
+  if (CJSON_LIKELY(g_split_dict_enabled)) {
+    dict = cjson_build_combined_dict_from_kvs(kv_entries, kv_cnt);
+    jp->kv_sp = kv_base;
+    if (CJSON_UNLIKELY(dict == NULL)) return NULL;
+  } else
+#endif
+  {
+    dict = (kv_cnt <= 5) ? PyDict_New() : _PyDict_NewPresized((Py_ssize_t)kv_cnt);
+    if (CJSON_UNLIKELY(dict == NULL)) return NULL;
+    for (size_t i = 0; i < kv_cnt; i++) {
+      int rc = _PyDict_SetItem_KnownHash(dict, kv_entries[i].key, kv_entries[i].val, kv_entries[i].hash);
+      Py_DECREF(kv_entries[i].key);
+      Py_DECREF(kv_entries[i].val);
+      if (CJSON_UNLIKELY(rc < 0)) {
+        for (size_t j = i + 1; j < kv_cnt; j++) {
+          Py_DECREF(kv_entries[j].key);
+          Py_DECREF(kv_entries[j].val);
+        }
+        jp->kv_sp = kv_base;
+        Py_DECREF(dict);
+        return NULL;
+      }
+    }
+    jp->kv_sp = kv_base;
   }
 
 #if !defined(Py_GIL_DISABLED) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
@@ -2617,6 +2644,23 @@ static void verify_split_dict_selfcheck(void) {
   if (ok && PyDict_DelItemString(d, "_cx_a") < 0) ok = 0;
   if (ok && PyDict_GET_SIZE(d) != 2) ok = 0;
   Py_DECREF(d);
+  if (ok) {
+    /* Also verify direct combined-table dict builder with duplicate keys & GC tracking */
+    const char *dup_probe = "{\"_cx_d\":1,\"_cx_d\":[4,5]}";
+    Py_ssize_t dlen = (Py_ssize_t)strlen(dup_probe);
+    JsonParser jp;
+    parser_init(&jp, dup_probe, dlen);
+    const char *dp = dup_probe;
+    PyObject *dd = parse_value_rec(&jp, &dp, dup_probe + dlen);
+    parser_cleanup(&jp);
+    if (dd == NULL || !PyDict_CheckExact(dd) || PyDict_GET_SIZE(dd) != 1 || !PyObject_GC_IsTracked(dd)) {
+      ok = 0;
+    } else {
+      PyObject *vd = PyDict_GetItemString(dd, "_cx_d");
+      if (vd == NULL || !PyList_CheckExact(vd) || PyList_GET_SIZE(vd) != 2) ok = 0;
+    }
+    Py_XDECREF(dd);
+  }
   PyErr_Clear();
   if (!ok) {
     g_split_dict_enabled = 0;

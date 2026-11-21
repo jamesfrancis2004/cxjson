@@ -444,6 +444,155 @@ static CJsonDictKeysObject *cjson_build_shared_keys(
   }
   return dk;
 }
+
+/* Build an exact-sized combined-table PyDict directly from buffered KvEntry array.
+ * Transfers ownership of all kvs[i].key and kvs[i].val references (even on error!). */
+static PyObject *cjson_build_combined_dict_from_kvs(const KvEntry *kvs, size_t count) {
+  if (CJSON_UNLIKELY(count == 0)) {
+    return PyDict_New();
+  }
+  uint8_t log2_size = 4; /* >= 4 avoids log2_size==3 freelist size assumption */
+  while ((((size_t)1 << log2_size) * 2u) / 3u < count) {
+    log2_size++;
+  }
+  size_t table_size = (size_t)1 << log2_size;
+  Py_ssize_t usable = (Py_ssize_t)((table_size * 2u) / 3u);
+  uint8_t log2_index_bytes = (log2_size <= 7) ? log2_size : ((log2_size <= 15) ? (uint8_t)(log2_size + 1) : (uint8_t)(log2_size + 2));
+  size_t index_bytes = (size_t)1 << log2_index_bytes;
+  size_t alloc_size = sizeof(CJsonDictKeysObject) + index_bytes + (size_t)usable * sizeof(CJsonDictUnicodeEntry);
+
+  CJsonDictKeysObject *dk = (CJsonDictKeysObject *)PyObject_Malloc(alloc_size);
+  if (CJSON_UNLIKELY(dk == NULL)) {
+    for (size_t i = 0; i < count; i++) {
+      Py_DECREF(kvs[i].key);
+      Py_DECREF(kvs[i].val);
+    }
+    PyErr_NoMemory();
+    return NULL;
+  }
+
+  PyObject *dict = PyDict_New();
+  if (CJSON_UNLIKELY(dict == NULL)) {
+    PyObject_Free(dk);
+    for (size_t i = 0; i < count; i++) {
+      Py_DECREF(kvs[i].key);
+      Py_DECREF(kvs[i].val);
+    }
+    return NULL;
+  }
+
+  dk->dk_refcnt = 1;
+  dk->dk_log2_size = log2_size;
+  dk->dk_log2_index_bytes = log2_index_bytes;
+  dk->dk_kind = 1; /* DICT_KEYS_UNICODE */
+  dk->dk_version = 0;
+  memset(dk->dk_indices, 0xFF, index_bytes);
+
+  CJsonDictUnicodeEntry *ep = (CJsonDictUnicodeEntry *)(dk->dk_indices + index_bytes);
+  size_t mask = table_size - 1u;
+  Py_ssize_t nentries = 0;
+  int has_gc = 0;
+
+  if (log2_size <= 7) {
+    int8_t *indices = (int8_t *)dk->dk_indices;
+    for (size_t j = 0; j < count; j++) {
+      PyObject *key = kvs[j].key;
+      PyObject *val = kvs[j].val;
+      Py_hash_t kh = kvs[j].hash;
+      if (!has_gc && PyObject_IS_GC(val)) has_gc = 1;
+      size_t perturb = (size_t)kh;
+      size_t idx = perturb & mask;
+      for (;;) {
+        int8_t ix = indices[idx];
+        if (CJSON_LIKELY(ix == -1)) {
+          indices[idx] = (int8_t)nentries;
+          ep[nentries].me_key = key;
+          ep[nentries].me_value = val;
+          nentries++;
+          break;
+        }
+        PyObject *ek = ep[ix].me_key;
+        if (CJSON_UNLIKELY(ek == key || PyUnicode_Compare(ek, key) == 0)) {
+          Py_DECREF(key);
+          Py_DECREF(ep[ix].me_value);
+          ep[ix].me_value = val;
+          break;
+        }
+        perturb >>= 5;
+        idx = (idx * 5u + 1u + perturb) & mask;
+      }
+    }
+  } else if (log2_size <= 15) {
+    int16_t *indices = (int16_t *)dk->dk_indices;
+    for (size_t j = 0; j < count; j++) {
+      PyObject *key = kvs[j].key;
+      PyObject *val = kvs[j].val;
+      Py_hash_t kh = kvs[j].hash;
+      if (!has_gc && PyObject_IS_GC(val)) has_gc = 1;
+      size_t perturb = (size_t)kh;
+      size_t idx = perturb & mask;
+      for (;;) {
+        int16_t ix = indices[idx];
+        if (CJSON_LIKELY(ix == -1)) {
+          indices[idx] = (int16_t)nentries;
+          ep[nentries].me_key = key;
+          ep[nentries].me_value = val;
+          nentries++;
+          break;
+        }
+        PyObject *ek = ep[ix].me_key;
+        if (CJSON_UNLIKELY(ek == key || PyUnicode_Compare(ek, key) == 0)) {
+          Py_DECREF(key);
+          Py_DECREF(ep[ix].me_value);
+          ep[ix].me_value = val;
+          break;
+        }
+        perturb >>= 5;
+        idx = (idx * 5u + 1u + perturb) & mask;
+      }
+    }
+  } else {
+    int32_t *indices = (int32_t *)dk->dk_indices;
+    for (size_t j = 0; j < count; j++) {
+      PyObject *key = kvs[j].key;
+      PyObject *val = kvs[j].val;
+      Py_hash_t kh = kvs[j].hash;
+      if (!has_gc && PyObject_IS_GC(val)) has_gc = 1;
+      size_t perturb = (size_t)kh;
+      size_t idx = perturb & mask;
+      for (;;) {
+        int32_t ix = indices[idx];
+        if (CJSON_LIKELY(ix == -1)) {
+          indices[idx] = (int32_t)nentries;
+          ep[nentries].me_key = key;
+          ep[nentries].me_value = val;
+          nentries++;
+          break;
+        }
+        PyObject *ek = ep[ix].me_key;
+        if (CJSON_UNLIKELY(ek == key || PyUnicode_Compare(ek, key) == 0)) {
+          Py_DECREF(key);
+          Py_DECREF(ep[ix].me_value);
+          ep[ix].me_value = val;
+          break;
+        }
+        perturb >>= 5;
+        idx = (idx * 5u + 1u + perturb) & mask;
+      }
+    }
+  }
+
+  dk->dk_nentries = nentries;
+  dk->dk_usable = usable - nentries;
+  PyDictObject *mp = (PyDictObject *)dict;
+  mp->ma_keys = (PyDictKeysObject *)dk;
+  mp->ma_values = NULL;
+  mp->ma_used = nentries;
+  if (has_gc && !PyObject_GC_IsTracked(dict)) {
+    PyObject_GC_Track(dict);
+  }
+  return dict;
+}
 #endif
 
 /* 32-byte predicted key entry (2 entries per 64-byte L1 cache line).
