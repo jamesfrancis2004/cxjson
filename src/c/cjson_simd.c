@@ -543,24 +543,30 @@ static const unsigned char *escape_chunk_avx2(
     } else {
       unsigned int idx = (unsigned int)__builtin_ctz(mask);
       dst += idx;
-      p += idx;
-      const CJsonEscapeEntry *esc = &table[*p++];
+      const CJsonEscapeEntry *esc = &table[p[idx]];
       memcpy(dst, esc->str, 8);
       dst += esc->len;
+      unsigned int prev = idx + 1;
       mask &= mask - 1u;
-      if (CJSON_UNLIKELY(mask != 0)) {
-        unsigned int rem_k = 31 - idx;
-        for (unsigned int k = 0; k < rem_k; k++) {
-          uint8_t ch = *p++;
-          const CJsonEscapeEntry *e2 = &table[ch];
-          if (e2->len != 0) {
-            memcpy(dst, e2->str, 8);
-            dst += e2->len;
-          } else {
-            *dst++ = (char)ch;
-          }
+      while (CJSON_UNLIKELY(mask != 0)) {
+        idx = (unsigned int)__builtin_ctz(mask);
+        unsigned int span = idx - prev;
+        if (span > 0) {
+          memcpy(dst, p + prev, span);
+          dst += span;
         }
+        esc = &table[p[idx]];
+        memcpy(dst, esc->str, 8);
+        dst += esc->len;
+        prev = idx + 1;
+        mask &= mask - 1u;
       }
+      unsigned int tail = 32 - prev;
+      if (tail > 0) {
+        memcpy(dst, p + prev, tail);
+        dst += tail;
+      }
+      p += 32;
     }
   }
   *dst_io = dst;
@@ -711,24 +717,30 @@ static const unsigned char *escape_chunk_avx512(
     } else {
       unsigned int idx = (unsigned int)__builtin_ctzll(mask);
       dst += idx;
-      p += idx;
-      const CJsonEscapeEntry *esc = &table[*p++];
+      const CJsonEscapeEntry *esc = &table[p[idx]];
       memcpy(dst, esc->str, 8);
       dst += esc->len;
+      unsigned int prev = idx + 1;
       mask &= mask - 1ULL;
-      if (CJSON_UNLIKELY(mask != 0)) {
-        unsigned int rem_k = 63 - idx;
-        for (unsigned int k = 0; k < rem_k; k++) {
-          uint8_t ch = *p++;
-          const CJsonEscapeEntry *e2 = &table[ch];
-          if (e2->len != 0) {
-            memcpy(dst, e2->str, 8);
-            dst += e2->len;
-          } else {
-            *dst++ = (char)ch;
-          }
+      while (CJSON_UNLIKELY(mask != 0)) {
+        idx = (unsigned int)__builtin_ctzll(mask);
+        unsigned int span = idx - prev;
+        if (span > 0) {
+          memcpy(dst, p + prev, span);
+          dst += span;
         }
+        esc = &table[p[idx]];
+        memcpy(dst, esc->str, 8);
+        dst += esc->len;
+        prev = idx + 1;
+        mask &= mask - 1ULL;
       }
+      unsigned int tail = 64 - prev;
+      if (tail > 0) {
+        memcpy(dst, p + prev, tail);
+        dst += tail;
+      }
+      p += 64;
     }
   }
   *dst_io = dst;

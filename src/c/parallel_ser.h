@@ -111,12 +111,12 @@ static char *raw_emit_str_escaped(RawSerBuf *rb, char *dst, char **safe_end_p,
   const unsigned char *p = (const unsigned char *)src + clean;
   const unsigned char *end = (const unsigned char *)src + slen;
   while (p + 16 <= end) {
-    char *cap_limit = rb->data + rb->cap - 128;
+    char *cap_limit = rb->data + rb->cap - 400;
     if (CJSON_UNLIKELY(dst > cap_limit)) {
       cur = (size_t)(dst - rb->data);
-      if (raw_buf_grow(rb, cur + (size_t)(end - p) + 256) < 0) return NULL;
+      if (raw_buf_grow(rb, cur + (size_t)(end - p) + 512) < 0) return NULL;
       dst = rb->data + cur;
-      cap_limit = rb->data + rb->cap - 128;
+      cap_limit = rb->data + rb->cap - 400;
     }
     const unsigned char *next_p = cjson_escape_chunk_fn(p, end, &dst, cap_limit, ESCAPE_TABLE);
     if (next_p == p) break;
