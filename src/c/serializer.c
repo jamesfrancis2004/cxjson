@@ -1855,14 +1855,14 @@ encode_dict_array_cached(JsonBuffer *b, char *dst, char **safe_end_p,
   uint16_t split_koff[30];
   uint16_t split_klen[30];
   char split_kbuf[1024];
-#ifdef CJSON_ARM64_JIT
+#ifdef CJSON_SCHEMA_JIT
   CJsonJitSplitLoopFn jit_fn = NULL;
   int jit_stalls = 0;
 #endif
 #endif
 
   for (Py_ssize_t i = 0; i < len; i++) {
-#ifdef CJSON_ARM64_JIT
+#ifdef CJSON_SCHEMA_JIT
     if (jit_fn != NULL && b->default_fn == NULL &&
         b->depth < CJSON_REC_SER_DEPTH - 2) {
       JitRunCtx jctx;
@@ -2087,7 +2087,7 @@ encode_dict_array_cached(JsonBuffer *b, char *dst, char **safe_end_p,
           uint32_t sn = (uint32_t)mp->ma_used;
           uint32_t kused = 0;
           int ok = 1;
-#ifdef CJSON_ARM64_JIT
+#ifdef CJSON_SCHEMA_JIT
           uint8_t jit_vtypes[30];
           int jit_ok = (len >= 32 && sn <= 30 && b->default_fn == NULL);
 #endif
@@ -2125,7 +2125,7 @@ encode_dict_array_cached(JsonBuffer *b, char *dst, char **safe_end_p,
 #if PY_VERSION_HEX < 0x030D0000
             split_order[tj] = vraw[-3 - (int)tj];
 #endif
-#ifdef CJSON_ARM64_JIT
+#ifdef CJSON_SCHEMA_JIT
             if (jit_ok) {
               if (tkl > 52) {
                 jit_ok = 0;
@@ -2152,7 +2152,7 @@ encode_dict_array_cached(JsonBuffer *b, char *dst, char **safe_end_p,
             split_psize = psize;
             memcpy(split_prefix, vraw - psize, psize);
 #endif
-#ifdef CJSON_ARM64_JIT
+#ifdef CJSON_SCHEMA_JIT
             if (jit_ok) {
 #if PY_VERSION_HEX >= 0x030D0000
               uint8_t id_order[30] = {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,
