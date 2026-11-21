@@ -56,6 +56,7 @@ PyTypeObject Fragment_Type = {
 #if !defined(Py_GIL_DISABLED)
 static void cjson_parallel_init(void);
 #endif
+static int verify_serializer_selfcheck(void);
 
 int init_serializer_types(void) {
   PyDateTime_IMPORT;
@@ -102,6 +103,10 @@ int init_serializer_types(void) {
 #if !defined(Py_GIL_DISABLED)
   cjson_parallel_init();
 #endif
+
+  if (verify_serializer_selfcheck() < 0) {
+    return -1;
+  }
 
   return 0;
 }
@@ -622,6 +627,53 @@ static inline char *write_uuid_exact_fast(char *dst, PyObject *obj) {
   return NULL;
 }
 
+static int verify_serializer_selfcheck(void) {
+  /* Verify PyLong 30-bit digit serialization matches exact expected strings */
+  static const struct {
+    const char *str;
+    const char *expected;
+  } long_tests[] = {
+      {"0", "0"},
+      {"-42", "-42"},
+      {"2147483648", "2147483648"},
+      {"-9223372036854775808", "-9223372036854775808"},
+      {"18446744073709551615", "18446744073709551615"},
+  };
+  for (size_t i = 0; i < sizeof(long_tests) / sizeof(long_tests[0]); i++) {
+    PyObject *v = PyLong_FromString(long_tests[i].str, NULL, 10);
+    if (v == NULL) return -1;
+    char buf[32];
+    char *end = write_py_long(buf, v);
+    Py_DECREF(v);
+    if (end == NULL || (size_t)(end - buf) != strlen(long_tests[i].expected) ||
+        memcmp(buf, long_tests[i].expected, (size_t)(end - buf)) != 0) {
+      PyErr_SetString(PyExc_ImportError, "cxjson: CPython PyLong layout self-check failed");
+      return -1;
+    }
+  }
+  /* Verify UUID.int slot offset + 128-bit unpack against a known UUID */
+  if (g_uuid_type != NULL && g_uuid_int_offset >= 0) {
+    PyObject *arg = PyUnicode_FromString("01234567-89ab-cdef-0123-456789abcdef");
+    if (arg == NULL) return -1;
+    PyObject *u = PyObject_CallOneArg(g_uuid_type, arg);
+    Py_DECREF(arg);
+    if (u == NULL) {
+      PyErr_Clear();
+      g_uuid_int_offset = -1;
+    } else {
+      char buf[48];
+      char *end = write_uuid_exact_fast(buf, u);
+      Py_DECREF(u);
+      const char *exp = "\"01234567-89ab-cdef-0123-456789abcdef\"";
+      if (end == NULL || (size_t)(end - buf) != 38 || memcmp(buf, exp, 38) != 0) {
+        PyErr_SetString(PyExc_ImportError, "cxjson: CPython UUID slot layout self-check failed");
+        return -1;
+      }
+    }
+  }
+  return 0;
+}
+
 #include "parallel_ser.h"
 
 static inline const char *cjson_get_str_utf8(PyObject *obj, Py_ssize_t *out_len) {
@@ -1029,12 +1081,169 @@ static int json_buffer_append_datetime_fast(JsonBuffer *b, PyObject *obj) {
   return 0;
 }
 
+#if !defined(Py_LIMITED_API) && PY_VERSION_HEX >= 0x030C0000
+#define CJSON_SLOT_DC_CACHE_SIZE 16
+#define CJSON_SLOT_DC_MAX_FIELDS 32
+
+typedef struct {
+  PyTypeObject *tp;
+  unsigned int tp_version;
+  uint8_t nfields;
+  Py_ssize_t offsets[CJSON_SLOT_DC_MAX_FIELDS];
+  uint16_t k_off[CJSON_SLOT_DC_MAX_FIELDS];
+  uint16_t k_len[CJSON_SLOT_DC_MAX_FIELDS];
+  char kbuf[1024];
+} SlotDataclassCacheEntry;
+
+static SlotDataclassCacheEntry g_slot_dc_cache[CJSON_SLOT_DC_CACHE_SIZE];
+
+static SlotDataclassCacheEntry *get_slot_dataclass_cache(PyTypeObject *tp) {
+  unsigned int ver = tp->tp_version_tag;
+  if (CJSON_UNLIKELY(ver == 0)) return NULL;
+  uint32_t h = (uint32_t)(((uintptr_t)tp >> 4) ^ ((uintptr_t)tp >> 10)) & (CJSON_SLOT_DC_CACHE_SIZE - 1u);
+  SlotDataclassCacheEntry *e = &g_slot_dc_cache[h];
+  if (CJSON_LIKELY(e->tp == tp && e->tp_version == ver)) {
+    return e;
+  }
+  PyObject *fields = _PyType_Lookup(tp, g_dataclass_fields_str);
+  if (fields == NULL || !PyDict_CheckExact(fields)) return NULL;
+
+  Py_ssize_t pos = 0;
+  PyObject *key, *field_obj;
+  uint8_t nf = 0;
+  uint32_t kused = 0;
+  Py_ssize_t tmp_off[CJSON_SLOT_DC_MAX_FIELDS];
+  uint16_t tmp_koff[CJSON_SLOT_DC_MAX_FIELDS];
+  uint16_t tmp_klen[CJSON_SLOT_DC_MAX_FIELDS];
+  char tmp_kbuf[1024];
+
+  while (PyDict_Next(fields, &pos, &key, &field_obj)) {
+    if (!PyUnicode_IS_COMPACT_ASCII(key)) return NULL;
+    Py_ssize_t klen = PyUnicode_GET_LENGTH(key);
+    const char *ks = (const char *)PyUnicode_1BYTE_DATA(key);
+    if (klen > 0 && ks[0] == '_') continue;
+    if (nf >= CJSON_SLOT_DC_MAX_FIELDS || klen > 60 || kused + (uint32_t)klen + 4u > sizeof(tmp_kbuf)) {
+      return NULL;
+    }
+    PyObject *descr = _PyType_Lookup(tp, key);
+    if (descr == NULL || Py_TYPE(descr) != &PyMemberDescr_Type) return NULL;
+    PyMemberDef *md = ((PyMemberDescrObject *)descr)->d_member;
+    if (md == NULL || md->type != Py_T_OBJECT_EX) return NULL;
+    char *kdst = tmp_kbuf + kused;
+    kdst[0] = (nf == 0) ? '{' : ',';
+    kdst[1] = '"';
+    if (klen > 0 && !copy_if_clean_short(kdst + 2, ks, klen)) return NULL;
+    kdst[2 + klen] = '"';
+    kdst[3 + klen] = ':';
+    tmp_off[nf] = md->offset;
+    tmp_koff[nf] = (uint16_t)kused;
+    tmp_klen[nf] = (uint16_t)(klen + 4);
+    kused += (uint32_t)(klen + 4);
+    nf++;
+  }
+  e->tp = tp;
+  e->tp_version = ver;
+  e->nfields = nf;
+  if (nf > 0) {
+    memcpy(e->offsets, tmp_off, (size_t)nf * sizeof(Py_ssize_t));
+    memcpy(e->k_off, tmp_koff, (size_t)nf * sizeof(uint16_t));
+    memcpy(e->k_len, tmp_klen, (size_t)nf * sizeof(uint16_t));
+    memcpy(e->kbuf, tmp_kbuf, kused);
+  }
+  return e;
+}
+
+static int encode_slot_dataclass_cached(JsonBuffer *b, PyObject *obj, SlotDataclassCacheEntry *e) {
+  uint8_t nf = e->nfields;
+  if (CJSON_UNLIKELY(nf == 0)) {
+    return json_buffer_append(b, "{}", 2);
+  }
+  if (CJSON_UNLIKELY(b->len + 256 > b->cap)) {
+    if (json_buffer_grow(b, b->len + 512) < 0) return -1;
+  }
+  Py_ssize_t saved_len = b->len;
+  char *dst = b->data + b->len;
+  char *safe_end = b->data + b->cap - 128;
+  const char *base = (const char *)obj;
+
+  for (uint8_t j = 0; j < nf; j++) {
+    PyObject *dval = *(PyObject *const *)(base + e->offsets[j]);
+    if (CJSON_UNLIKELY(dval == NULL)) {
+      b->len = saved_len;
+      return 1; /* uninitialized/deleted slot -> fallback */
+    }
+    uint32_t kl = e->k_len[j];
+    if (CJSON_UNLIKELY(dst + kl + 64 > safe_end)) {
+      b->len = (Py_ssize_t)(dst - b->data);
+      if (json_buffer_grow(b, b->len + (Py_ssize_t)kl + 512) < 0) return -1;
+      dst = b->data + b->len;
+      safe_end = b->data + b->cap - 128;
+    }
+    if (CJSON_LIKELY(kl <= 16)) {
+      copy_short_ascii(dst, e->kbuf + e->k_off[j], kl);
+    } else {
+      memcpy(dst, e->kbuf + e->k_off[j], kl);
+    }
+    dst += kl;
+
+    PyTypeObject *vtp = Py_TYPE(dval);
+    if (vtp == &PyUnicode_Type) {
+      dst = emit_str_inline(b, dst, &safe_end, dval);
+      if (CJSON_UNLIKELY(dst == NULL)) return -1;
+    } else if (vtp == &PyLong_Type) {
+      char *next = write_py_long(dst, dval);
+      if (CJSON_UNLIKELY(next == NULL)) return -1;
+      dst = next;
+    } else if (vtp == &PyFloat_Type) {
+      double d = PyFloat_AS_DOUBLE(dval);
+      if (CJSON_LIKELY(!isnan(d) && !isinf(d))) {
+        dst = write_double_fast(d, dst);
+      } else {
+        memcpy(dst, "null", 4);
+        dst += 4;
+      }
+    } else if (dval == Py_None) {
+      memcpy(dst, "null", 4);
+      dst += 4;
+    } else if (vtp == &PyBool_Type) {
+      if (dval == Py_True) {
+        memcpy(dst, "true", 4);
+        dst += 4;
+      } else {
+        memcpy(dst, "false", 5);
+        dst += 5;
+      }
+    } else {
+      b->len = (Py_ssize_t)(dst - b->data);
+      if (encode_root_fast(b, dval) < 0) return -1;
+      if (CJSON_UNLIKELY(b->len + 128 > b->cap)) {
+        if (json_buffer_grow(b, b->len + 256) < 0) return -1;
+      }
+      dst = b->data + b->len;
+      safe_end = b->data + b->cap - 128;
+    }
+  }
+  *dst++ = '}';
+  b->len = (Py_ssize_t)(dst - b->data);
+  return 0;
+}
+#endif
+
 static int json_buffer_append_dataclass_fast(JsonBuffer *b, PyObject *obj) {
 #ifndef Py_LIMITED_API
   PyObject **dptr = _PyObject_GetDictPtr(obj);
   if (dptr != NULL && *dptr != NULL && PyDict_CheckExact(*dptr)) {
     return encode_root_fast(b, *dptr);
   }
+#if PY_VERSION_HEX >= 0x030C0000
+  if (dptr == NULL) {
+    SlotDataclassCacheEntry *sce = get_slot_dataclass_cache(Py_TYPE(obj));
+    if (CJSON_LIKELY(sce != NULL)) {
+      int rc = encode_slot_dataclass_cached(b, obj, sce);
+      if (CJSON_LIKELY(rc <= 0)) return rc;
+    }
+  }
+#endif
 #endif
   PyObject *dict = PyObject_GenericGetDict(obj, NULL);
   if (dict != NULL) {
@@ -1293,13 +1502,24 @@ static char *encode_dict_array_cached(
   uint32_t kc_used = 0;
   char *safe_end = *safe_end_p;
 
-#if PY_VERSION_HEX >= 0x030C0000 && PY_VERSION_HEX < 0x030D0000 && \
+#if PY_VERSION_HEX >= 0x030C0000 && PY_VERSION_HEX < 0x030F0000 && \
     !defined(Py_GIL_DISABLED) && !defined(Py_LIMITED_API) && !defined(PYPY_VERSION)
+#if PY_VERSION_HEX >= 0x030D0000
+  typedef struct {
+    uint8_t capacity;
+    uint8_t size;
+    uint8_t embedded;
+    uint8_t valid;
+    PyObject *values[1];
+  } CJsonSerDictValues313;
+#endif
   PyDictKeysObject *split_dk = NULL;
   uint32_t split_n = 0;
+#if PY_VERSION_HEX < 0x030D0000
   uint8_t split_psize = 0;
   uint8_t split_prefix[32];
   uint8_t split_order[30];
+#endif
   uint16_t split_koff[30];
   uint16_t split_klen[30];
   char split_kbuf[1024];
@@ -1338,16 +1558,24 @@ static char *encode_dict_array_cached(
         return NULL;
       }
       b->depth++;
-#if PY_VERSION_HEX >= 0x030C0000 && PY_VERSION_HEX < 0x030D0000 && \
+#if PY_VERSION_HEX >= 0x030C0000 && PY_VERSION_HEX < 0x030F0000 && \
     !defined(Py_GIL_DISABLED) && !defined(Py_LIMITED_API) && !defined(PYPY_VERSION)
       PyDictObject *mp = (PyDictObject *)item;
       if (mp->ma_values != NULL && mp->ma_used > 0 && mp->ma_used <= 30) {
+#if PY_VERSION_HEX >= 0x030D0000
+        const CJsonSerDictValues313 *dv = (const CJsonSerDictValues313 *)mp->ma_values;
+        int split_hit = (mp->ma_keys == split_dk && (uint32_t)mp->ma_used == split_n &&
+                         dv->valid == 1 && dv->size == (uint8_t)split_n);
+        PyObject *const *svals = dv->values;
+#else
         const uint8_t *vraw = (const uint8_t *)mp->ma_values;
         uint8_t psize = vraw[-1];
-        if (CJSON_LIKELY(mp->ma_keys == split_dk && (uint32_t)mp->ma_used == split_n &&
+        int split_hit = (mp->ma_keys == split_dk && (uint32_t)mp->ma_used == split_n &&
                          psize == split_psize && psize <= 32 &&
-                         memcmp(vraw - psize, split_prefix, psize) == 0)) {
-          PyObject *const *svals = (PyObject *const *)mp->ma_values;
+                         memcmp(vraw - psize, split_prefix, psize) == 0);
+        PyObject *const *svals = (PyObject *const *)mp->ma_values;
+#endif
+        if (CJSON_LIKELY(split_hit)) {
           for (uint32_t j = 0; j < split_n; j++) {
             if (CJSON_UNLIKELY(dst > safe_end)) {
               b->len = (Py_ssize_t)(dst - b->data);
@@ -1368,7 +1596,11 @@ static char *encode_dict_array_cached(
               dst = b->data + b->len;
               safe_end = b->data + b->cap - 128;
             }
+#if PY_VERSION_HEX >= 0x030D0000
+            PyObject *dval = svals[j];
+#else
             PyObject *dval = svals[split_order[j]];
+#endif
             PyTypeObject *vtp = Py_TYPE(dval);
             if (vtp == &PyUnicode_Type) {
               dst = emit_str_inline(b, dst, &safe_end, dval);
@@ -1426,7 +1658,11 @@ static char *encode_dict_array_cached(
           continue;
         }
         /* Warm the 1-pointer split-table template on first sight */
+#if PY_VERSION_HEX >= 0x030D0000
+        if (dv->valid == 1 && dv->size == (uint8_t)mp->ma_used) {
+#else
         if (psize <= 32 && vraw[-2] == (uint8_t)mp->ma_used) {
+#endif
           uint32_t sn = (uint32_t)mp->ma_used;
           uint32_t kused = 0;
           int ok = 1;
@@ -1434,6 +1670,9 @@ static char *encode_dict_array_cached(
           Py_ssize_t tpos = 0;
           uint32_t tj = 0;
           while (PyDict_Next(item, &tpos, &tk, &tv) && tj < sn) {
+#if PY_VERSION_HEX >= 0x030D0000
+            if (CJSON_UNLIKELY(tv != dv->values[tj])) { ok = 0; break; }
+#endif
             if (!PyUnicode_IS_COMPACT_ASCII(tk)) { ok = 0; break; }
             Py_ssize_t tkl = PyUnicode_GET_LENGTH(tk);
             if (tkl > 60 || kused + (uint32_t)tkl + 4u > sizeof(split_kbuf)) { ok = 0; break; }
@@ -1447,15 +1686,19 @@ static char *encode_dict_array_cached(
             kdst[3 + tkl] = ':';
             split_koff[tj] = (uint16_t)kused;
             split_klen[tj] = (uint16_t)(tkl + 4);
+#if PY_VERSION_HEX < 0x030D0000
             split_order[tj] = vraw[-3 - (int)tj];
+#endif
             kused += (uint32_t)(tkl + 4);
             tj++;
           }
           if (ok && tj == sn) {
             split_dk = mp->ma_keys;
             split_n = sn;
+#if PY_VERSION_HEX < 0x030D0000
             split_psize = psize;
             memcpy(split_prefix, vraw - psize, psize);
+#endif
           }
         }
       }

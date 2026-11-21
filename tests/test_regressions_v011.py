@@ -305,6 +305,60 @@ print("|".join(digests))
     assert cxjson.dumps(many_uuids) == expected_many
 
 
+def test_slotted_dataclass_and_split_dict_dumps():
+    """Verify @dataclass(slots=True) fast path (nested, inherited, empty, deleted slot)
+    and split-table dict dumps() across mutations on Python 3.12/3.13/3.14."""
+    import dataclasses
+
+    @dataclasses.dataclass(slots=True)
+    class SlotUser:
+        id: int
+        name: str
+        score: float
+        active: bool
+        _secret: str = "hidden"
+
+    @dataclasses.dataclass(slots=True)
+    class SlotOrder:
+        order_id: int
+        user: SlotUser
+        tags: list
+
+    @dataclasses.dataclass(slots=True)
+    class ChildSlot(SlotUser):
+        extra: int = 99
+
+    @dataclasses.dataclass(slots=True)
+    class EmptySlot:
+        pass
+
+    users = [SlotUser(i, f"u{i}", i * 1.5, (i & 1) == 0) for i in range(1000)]
+    orders = [SlotOrder(i, users[i], ["x", "y"]) for i in range(500)]
+    assert json.loads(cxjson.dumps(users)) == [
+        {"id": i, "name": f"u{i}", "score": i * 1.5, "active": (i & 1) == 0} for i in range(1000)
+    ]
+    assert json.loads(cxjson.dumps(orders))[42] == {
+        "order_id": 42,
+        "user": {"id": 42, "name": "u42", "score": 63.0, "active": True},
+        "tags": ["x", "y"],
+    }
+    assert cxjson.dumps(ChildSlot(1, "a", 2.5, True)) == b'{"id":1,"name":"a","score":2.5,"active":true,"extra":99}'
+    assert cxjson.dumps(EmptySlot()) == b"{}"
+
+    # Deleted slot must fall back cleanly without crashing
+    u_del = SlotUser(1, "a", 2.5, True)
+    del u_del.name
+    assert cxjson.dumps(u_del) == b'{"id":1,"score":2.5,"active":true}'
+
+    # Split-table dict array dumps with mid-list mutations (del + insert)
+    raw = cxjson.dumps([{"id": i, "name": f"r{i}", "val": i * 0.5, "ok": True} for i in range(500)])
+    recs = cxjson.loads(raw)
+    assert cxjson.dumps(recs) == raw
+    del recs[250]["name"]
+    recs[251]["extra"] = 123
+    assert json.loads(cxjson.dumps(recs)) == recs
+
+
 if __name__ == "__main__":
     test_split_dict_gc_cycles_and_tracking()
     print("PASS: test_split_dict_gc_cycles_and_tracking")
@@ -318,4 +372,6 @@ if __name__ == "__main__":
     print("PASS: test_parallel_loads_numeric_arrays_and_errors")
     test_parallel_opts_sort_indent_and_deep_nesting()
     print("PASS: test_parallel_opts_sort_indent_and_deep_nesting")
+    test_slotted_dataclass_and_split_dict_dumps()
+    print("PASS: test_slotted_dataclass_and_split_dict_dumps")
     print("\nALL v0.1.1 REGRESSION TESTS PASSED!")
