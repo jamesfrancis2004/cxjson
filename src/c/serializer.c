@@ -460,9 +460,9 @@ static int json_buffer_append_str_escaped(JsonBuffer *b, const char *src, Py_ssi
     char *cap_limit = b->data + b->cap - 128;
     if (CJSON_UNLIKELY(dst > cap_limit)) {
       b->len = (Py_ssize_t)(dst - b->data);
-      if (json_buffer_grow(b, b->len + (Py_ssize_t)(end - p) + 256) < 0) return -1;
+      if (json_buffer_grow(b, b->len + (Py_ssize_t)(end - p) + 512) < 0) return -1;
       dst = b->data + b->len;
-      cap_limit = b->data + b->cap - 128;
+      cap_limit = b->data + b->cap - 400;
     }
     const unsigned char *next_p = cjson_escape_chunk_fn(p, end, &dst, cap_limit, ESCAPE_TABLE);
     if (next_p == p) break;

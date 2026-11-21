@@ -414,7 +414,7 @@ static const unsigned char *escape_chunk_sse2(
   return p;
 }
 
-#if defined(__AVX2__) || defined(__GNUC__) || defined(__clang__)
+#if defined(__AVX2__) || defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)
 
 #if !defined(__AVX2__)
 __attribute__((target("avx2")))
@@ -596,6 +596,173 @@ static int cpu_supports_avx2(void) {
 
 #endif /* AVX2 capable compiler */
 
+#if defined(__AVX512BW__) || defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER)
+
+#define AVX512_ESC_MASK(v, q22, q5c, q20) \
+  ((uint64_t)(_mm512_cmpeq_epi8_mask((v), (q22)) | \
+              _mm512_cmpeq_epi8_mask((v), (q5c)) | \
+              _mm512_cmplt_epu8_mask((v), (q20))))
+
+#define AVX512_STR_ASCII_MASK(v, q22, q5c, q20) \
+  ((uint64_t)(_mm512_cmpeq_epi8_mask((v), (q22)) | \
+              _mm512_cmpeq_epi8_mask((v), (q5c)) | \
+              _mm512_cmplt_epi8_mask((v), (q20))))
+
+#if !defined(__AVX512BW__) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("avx512f,avx512bw")))
+#endif
+static Py_ssize_t copy_clean_prefix_avx512(char *dst, const char *src, Py_ssize_t len) {
+  Py_ssize_t i = 0;
+  __m512i q_22 = _mm512_set1_epi8(0x22);
+  __m512i q_5c = _mm512_set1_epi8(0x5C);
+  __m512i q_20 = _mm512_set1_epi8(0x20);
+  for (; i + 256 <= len; i += 256) {
+    __m512i v0 = _mm512_loadu_si512((const void *)(src + i));
+    __m512i v1 = _mm512_loadu_si512((const void *)(src + i + 64));
+    __m512i v2 = _mm512_loadu_si512((const void *)(src + i + 128));
+    __m512i v3 = _mm512_loadu_si512((const void *)(src + i + 192));
+    _mm512_storeu_si512((void *)(dst + i), v0);
+    _mm512_storeu_si512((void *)(dst + i + 64), v1);
+    _mm512_storeu_si512((void *)(dst + i + 128), v2);
+    _mm512_storeu_si512((void *)(dst + i + 192), v3);
+    uint64_t m = AVX512_ESC_MASK(v0, q_22, q_5c, q_20) |
+                 AVX512_ESC_MASK(v1, q_22, q_5c, q_20) |
+                 AVX512_ESC_MASK(v2, q_22, q_5c, q_20) |
+                 AVX512_ESC_MASK(v3, q_22, q_5c, q_20);
+    if (CJSON_UNLIKELY(m != 0)) return i;
+  }
+  for (; i + 64 <= len; i += 64) {
+    __m512i v = _mm512_loadu_si512((const void *)(src + i));
+    _mm512_storeu_si512((void *)(dst + i), v);
+    if (CJSON_UNLIKELY(AVX512_ESC_MASK(v, q_22, q_5c, q_20) != 0)) return i;
+  }
+  if (i < len && len >= 64) {
+    __m512i v = _mm512_loadu_si512((const void *)(src + len - 64));
+    _mm512_storeu_si512((void *)(dst + len - 64), v);
+    if (CJSON_LIKELY(AVX512_ESC_MASK(v, q_22, q_5c, q_20) == 0)) return len;
+  }
+  return i;
+}
+
+#if !defined(__AVX512BW__) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("avx512f,avx512bw")))
+#endif
+static const char *find_str_special_avx512(const char *p, const char *end) {
+  __m512i v_q = _mm512_set1_epi8('"');
+  __m512i v_bs = _mm512_set1_epi8('\\');
+  __m512i v_20 = _mm512_set1_epi8(0x20);
+  while (p + 256 <= end) {
+    __m512i v0 = _mm512_loadu_si512((const void *)p);
+    __m512i v1 = _mm512_loadu_si512((const void *)(p + 64));
+    __m512i v2 = _mm512_loadu_si512((const void *)(p + 128));
+    __m512i v3 = _mm512_loadu_si512((const void *)(p + 192));
+    uint64_t m = AVX512_STR_ASCII_MASK(v0, v_q, v_bs, v_20) |
+                 AVX512_STR_ASCII_MASK(v1, v_q, v_bs, v_20) |
+                 AVX512_STR_ASCII_MASK(v2, v_q, v_bs, v_20) |
+                 AVX512_STR_ASCII_MASK(v3, v_q, v_bs, v_20);
+    if (m != 0) break;
+    p += 256;
+  }
+  while (p + 64 <= end) {
+    __m512i v = _mm512_loadu_si512((const void *)p);
+    uint64_t m = AVX512_STR_ASCII_MASK(v, v_q, v_bs, v_20);
+    if (m != 0) {
+      return p + (unsigned int)__builtin_ctzll(m);
+    }
+    p += 64;
+  }
+  return p;
+}
+
+#if !defined(__AVX512BW__) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("avx512f,avx512bw")))
+#endif
+static const unsigned char *escape_chunk_avx512(
+    const unsigned char *p, const unsigned char *end,
+    char **dst_io, char *cap_limit, const CJsonEscapeEntry *table) {
+  char *dst = *dst_io;
+  __m512i q_22 = _mm512_set1_epi8(0x22);
+  __m512i q_5c = _mm512_set1_epi8(0x5C);
+  __m512i q_20 = _mm512_set1_epi8(0x20);
+  while (p + 64 <= end && dst <= cap_limit) {
+    __m512i v = _mm512_loadu_si512((const void *)p);
+    _mm512_storeu_si512((void *)dst, v);
+    uint64_t mask = AVX512_ESC_MASK(v, q_22, q_5c, q_20);
+    if (CJSON_LIKELY(mask == 0)) {
+      dst += 64;
+      p += 64;
+      while (p + 256 <= end && dst + 256 <= cap_limit) {
+        __m512i v0 = _mm512_loadu_si512((const void *)p);
+        __m512i v1 = _mm512_loadu_si512((const void *)(p + 64));
+        __m512i v2 = _mm512_loadu_si512((const void *)(p + 128));
+        __m512i v3 = _mm512_loadu_si512((const void *)(p + 192));
+        _mm512_storeu_si512((void *)dst, v0);
+        _mm512_storeu_si512((void *)(dst + 64), v1);
+        _mm512_storeu_si512((void *)(dst + 128), v2);
+        _mm512_storeu_si512((void *)(dst + 192), v3);
+        uint64_t m = AVX512_ESC_MASK(v0, q_22, q_5c, q_20) |
+                     AVX512_ESC_MASK(v1, q_22, q_5c, q_20) |
+                     AVX512_ESC_MASK(v2, q_22, q_5c, q_20) |
+                     AVX512_ESC_MASK(v3, q_22, q_5c, q_20);
+        if (CJSON_UNLIKELY(m != 0)) break;
+        p += 256;
+        dst += 256;
+      }
+    } else {
+      unsigned int idx = (unsigned int)__builtin_ctzll(mask);
+      dst += idx;
+      p += idx;
+      const CJsonEscapeEntry *esc = &table[*p++];
+      memcpy(dst, esc->str, 8);
+      dst += esc->len;
+      mask &= mask - 1ULL;
+      if (CJSON_UNLIKELY(mask != 0)) {
+        unsigned int rem_k = 63 - idx;
+        for (unsigned int k = 0; k < rem_k; k++) {
+          uint8_t ch = *p++;
+          const CJsonEscapeEntry *e2 = &table[ch];
+          if (e2->len != 0) {
+            memcpy(dst, e2->str, 8);
+            dst += e2->len;
+          } else {
+            *dst++ = (char)ch;
+          }
+        }
+      }
+    }
+  }
+  *dst_io = dst;
+  return p;
+}
+
+static int cpu_supports_avx512bw(void) {
+#if defined(__AVX512BW__)
+  return 1;
+#elif defined(_MSC_VER)
+  int info[4] = {0};
+  __cpuid(info, 1);
+  if ((info[2] & ((1 << 27) | (1 << 28))) != ((1 << 27) | (1 << 28))) return 0;
+  /* Check OS enabled XMM + YMM + Opmask + ZMM_Hi256 + Hi16_ZMM (0xE6) */
+  if ((_xgetbv(0) & 0xE6ULL) != 0xE6ULL) return 0;
+  __cpuidex(info, 7, 0);
+  /* Check AVX512F (EBX bit 16) and AVX512BW (EBX bit 30) */
+  return (info[1] & ((1 << 16) | (1 << 30))) == ((1 << 16) | (1 << 30));
+#elif defined(__GNUC__) || defined(__clang__)
+  unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+  if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx)) return 0;
+  if ((ecx & ((1u << 27) | (1u << 28))) != ((1u << 27) | (1u << 28))) return 0;
+  unsigned int xcr0_lo = 0, xcr0_hi = 0;
+  __asm__ volatile("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
+  if ((xcr0_lo & 0xE6u) != 0xE6u) return 0;
+  if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) return 0;
+  return (ebx & ((1u << 16) | (1u << 30))) == ((1u << 16) | (1u << 30));
+#else
+  return 0;
+#endif
+}
+
+#endif /* AVX-512BW capable compiler */
+
 #endif /* arch selection */
 
 /* ========================================================================= */
@@ -618,8 +785,12 @@ cjson_escape_chunk_fn_t cjson_escape_chunk_fn = escape_chunk_swar;
 
 void cjson_simd_init(void) {
 #if !defined(CJSON_NO_SIMD) && (defined(__x86_64__) || defined(_M_X64)) && \
-    (defined(__AVX2__) || defined(__GNUC__) || defined(__clang__))
-  if (cpu_supports_avx2()) {
+    (defined(__AVX512BW__) || defined(__AVX2__) || defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER))
+  if (cpu_supports_avx512bw()) {
+    cjson_copy_clean_prefix_long_fn = copy_clean_prefix_avx512;
+    cjson_find_str_special_long_fn = find_str_special_avx512;
+    cjson_escape_chunk_fn = escape_chunk_avx512;
+  } else if (cpu_supports_avx2()) {
     cjson_copy_clean_prefix_long_fn = copy_clean_prefix_avx2;
     cjson_find_str_special_long_fn = find_str_special_avx2;
     cjson_escape_chunk_fn = escape_chunk_avx2;
