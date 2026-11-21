@@ -214,6 +214,28 @@ static char *raw_encode_array(RawSerBuf *rb, char *dst, char **safe_end_p, PyObj
     return dst + 2;
   }
   char *safe_end = *safe_end_p;
+  if (len == 2) {
+    PyObject **items2 = PySequence_Fast_ITEMS(obj);
+    if (Py_TYPE(items2[0]) == &PyFloat_Type && Py_TYPE(items2[1]) == &PyFloat_Type) {
+      if (CJSON_UNLIKELY(dst > safe_end)) {
+        size_t cur = (size_t)(dst - rb->data);
+        if (raw_buf_grow(rb, cur + 4096) < 0) return NULL;
+        dst = rb->data + cur;
+        safe_end = rb->data + rb->cap - 128;
+        *safe_end_p = safe_end;
+      }
+      *dst++ = '[';
+      double d0 = PyFloat_AS_DOUBLE(items2[0]);
+      if (CJSON_LIKELY(!isnan(d0) && !isinf(d0))) { dst = write_double_fast(d0, dst); }
+      else { memcpy(dst, "null", 4); dst += 4; }
+      *dst++ = ',';
+      double d1 = PyFloat_AS_DOUBLE(items2[1]);
+      if (CJSON_LIKELY(!isnan(d1) && !isinf(d1))) { dst = write_double_fast(d1, dst); }
+      else { memcpy(dst, "null", 4); dst += 4; }
+      *dst++ = ']';
+      return dst;
+    }
+  }
   *dst++ = '[';
   PyObject **items = PySequence_Fast_ITEMS(obj);
   PyTypeObject *tp0 = Py_TYPE(items[0]);
@@ -1050,6 +1072,10 @@ typedef struct {
   const ParDictPair *pairs;
   Py_ssize_t start;
   Py_ssize_t end;
+  const char *np_base;
+  Py_ssize_t np_row_stride;
+  Py_ssize_t np_cols;
+  int np_kind;
   RawSerBuf out;
   char *copy_dst;
   int failed;
@@ -1255,6 +1281,71 @@ static void par_run_task(ParTask *t) {
   rb->len = (size_t)(dst - rb->data);
 }
 
+static inline char *par_encode_numpy_1d_slice(char *dst, const char *base, Py_ssize_t count, int np_kind) {
+  if (np_kind == 0) {
+    const double *dp = (const double *)base;
+    for (Py_ssize_t i = 0; i < count; i++) {
+      double v = dp[i];
+      if (CJSON_UNLIKELY(!isfinite(v))) { memcpy(dst, "null", 4); dst += 4; }
+      else { dst = write_double_fast(v, dst); }
+      *dst++ = ',';
+    }
+  } else if (np_kind == 1) {
+    const float *fp = (const float *)base;
+    for (Py_ssize_t i = 0; i < count; i++) {
+      float vf = fp[i];
+      if (CJSON_UNLIKELY(!isfinite(vf))) { memcpy(dst, "null", 4); dst += 4; }
+      else { dst = write_float_fast(vf, dst); }
+      *dst++ = ',';
+    }
+  } else if (np_kind == 2) {
+    const int64_t *ip = (const int64_t *)base;
+    for (Py_ssize_t i = 0; i < count; i++) {
+      int64_t v = ip[i];
+      if (v < 0) { *dst++ = '-'; dst = jeaiii_to_text_u64(dst, (uint64_t)(-(v + 1)) + 1ULL); }
+      else { dst = jeaiii_to_text_u64(dst, (uint64_t)v); }
+      *dst++ = ',';
+    }
+  } else {
+    const int32_t *ip = (const int32_t *)base;
+    for (Py_ssize_t i = 0; i < count; i++) {
+      int32_t v = ip[i];
+      if (v < 0) { *dst++ = '-'; dst = jeaiii_to_text_u32(dst, (uint32_t)(-(v + 1)) + 1u); }
+      else { dst = jeaiii_to_text_u32(dst, (uint32_t)v); }
+      *dst++ = ',';
+    }
+  }
+  return dst;
+}
+
+static void par_run_numpy_task(ParTask *t) {
+  t->failed = 0;
+  RawSerBuf *rb = &t->out;
+  Py_ssize_t n_items = t->end - t->start;
+  size_t max_per = (t->np_kind <= 1) ? 35 : ((t->np_kind == 2) ? 22 : 12);
+  size_t need = (t->np_cols == 0)
+      ? ((size_t)n_items * max_per + 64)
+      : ((size_t)n_items * ((size_t)t->np_cols * max_per + 4) + 64);
+  if (rb->cap < need) {
+    if (raw_buf_grow(rb, need) < 0) { t->failed = 1; return; }
+  }
+  char *dst = rb->data;
+  if (t->np_cols == 0) {
+    size_t elem_sz = (t->np_kind == 0 || t->np_kind == 2) ? 8 : 4;
+    dst = par_encode_numpy_1d_slice(dst, t->np_base + (size_t)t->start * elem_sz, n_items, t->np_kind);
+  } else {
+    const char *row = t->np_base + t->start * t->np_row_stride;
+    for (Py_ssize_t r = 0; r < n_items; r++) {
+      *dst++ = '[';
+      dst = par_encode_numpy_1d_slice(dst, row, t->np_cols, t->np_kind);
+      dst[-1] = ']';
+      *dst++ = ',';
+      row += t->np_row_stride;
+    }
+  }
+  rb->len = (size_t)(dst - rb->data);
+}
+
 static void par_worker_loop(int wid) {
   uint64_t seen_gen = 0;
   for (;;) {
@@ -1270,6 +1361,8 @@ static void par_worker_loop(int wid) {
     if (run) {
       if (phase == 0) {
         par_run_task(&g_par_pool.tasks[wid]);
+      } else if (phase == 2) {
+        par_run_numpy_task(&g_par_pool.tasks[wid]);
       } else {
         ParTask *t = &g_par_pool.tasks[wid];
         if (t->out.len > 0) {
@@ -1591,6 +1684,99 @@ static int cjson_parallel_encode_slices_opts(
   } else {
     dst[-1] = close_ch;
   }
+  b->len = (Py_ssize_t)(dst - b->data);
+  return 1;
+}
+
+/* Lock-free multi-core serializer for contiguous 1D/2D NumPy numeric arrays.
+ * Returns 1 on success, 0 to fall back to 1T, -1 on OOM. */
+__attribute__((noinline))
+static int cjson_parallel_encode_numpy(
+    JsonBuffer *b, const char *base, Py_ssize_t count,
+    Py_ssize_t row_stride, Py_ssize_t cols, int np_kind) {
+  if (g_par_pool.max_threads <= 1) return 0;
+  if (!cjson_parallel_ensure_started()) return 0;
+
+  Py_ssize_t total_elems = (cols > 0) ? (count * cols) : count;
+  int desired = (total_elems < 65536) ? 4 : g_par_pool.max_threads;
+  int nthreads = (desired < g_par_pool.max_threads) ? desired : g_par_pool.max_threads;
+  if (nthreads <= 1 || count < nthreads * 2) return 0;
+
+  Py_ssize_t chunk = (count + nthreads - 1) / nthreads;
+  int actual = 0;
+  for (int t = 0; t < nthreads; t++) {
+    Py_ssize_t s = (Py_ssize_t)t * chunk;
+    if (s >= count) break;
+    Py_ssize_t e = s + chunk;
+    if (e > count) e = count;
+    g_par_pool.tasks[t].np_base = base;
+    g_par_pool.tasks[t].np_row_stride = row_stride;
+    g_par_pool.tasks[t].np_cols = cols;
+    g_par_pool.tasks[t].np_kind = np_kind;
+    g_par_pool.tasks[t].start = s;
+    g_par_pool.tasks[t].end = e;
+    g_par_pool.tasks[t].failed = 0;
+    actual++;
+  }
+  if (actual <= 1) return 0;
+
+  cjson_mutex_lock(&g_par_pool.mu);
+  g_par_pool.active_workers = actual - 1;
+  g_par_pool.done_count = 0;
+  g_par_pool.phase = 2;
+  g_par_pool.generation++;
+  cjson_cond_broadcast(&g_par_pool.cv_work);
+  cjson_mutex_unlock(&g_par_pool.mu);
+
+  par_run_numpy_task(&g_par_pool.tasks[0]);
+
+  cjson_mutex_lock(&g_par_pool.mu);
+  while (g_par_pool.done_count < g_par_pool.active_workers) {
+    cjson_cond_wait(&g_par_pool.cv_done, &g_par_pool.mu);
+  }
+  cjson_mutex_unlock(&g_par_pool.mu);
+
+  size_t total_bytes = 0;
+  for (int t = 0; t < actual; t++) {
+    if (g_par_pool.tasks[t].failed) return 0;
+    total_bytes += g_par_pool.tasks[t].out.len;
+  }
+  if (total_bytes == 0) return 0;
+
+  if (json_buffer_reserve(b, (Py_ssize_t)total_bytes + 2) < 0) return -1;
+  char *dst = b->data + b->len;
+  *dst++ = '[';
+  if (total_bytes >= 6 * 1024 * 1024 && actual >= 2) {
+    char *cur_dst = dst;
+    for (int t = 0; t < actual; t++) {
+      g_par_pool.tasks[t].copy_dst = cur_dst;
+      cur_dst += g_par_pool.tasks[t].out.len;
+    }
+    cjson_mutex_lock(&g_par_pool.mu);
+    g_par_pool.active_workers = actual - 1;
+    g_par_pool.done_count = 0;
+    g_par_pool.phase = 1;
+    g_par_pool.generation++;
+    cjson_cond_broadcast(&g_par_pool.cv_work);
+    cjson_mutex_unlock(&g_par_pool.mu);
+
+    if (g_par_pool.tasks[0].out.len > 0) {
+      memcpy(g_par_pool.tasks[0].copy_dst, g_par_pool.tasks[0].out.data, g_par_pool.tasks[0].out.len);
+    }
+
+    cjson_mutex_lock(&g_par_pool.mu);
+    while (g_par_pool.done_count < g_par_pool.active_workers) {
+      cjson_cond_wait(&g_par_pool.cv_done, &g_par_pool.mu);
+    }
+    cjson_mutex_unlock(&g_par_pool.mu);
+    dst = cur_dst;
+  } else {
+    for (int t = 0; t < actual; t++) {
+      memcpy(dst, g_par_pool.tasks[t].out.data, g_par_pool.tasks[t].out.len);
+      dst += g_par_pool.tasks[t].out.len;
+    }
+  }
+  dst[-1] = ']';
   b->len = (Py_ssize_t)(dst - b->data);
   return 1;
 }

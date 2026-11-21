@@ -374,6 +374,72 @@ def test_slotted_dataclass_and_split_dict_dumps():
     assert json.loads(cxjson.dumps(recs)) == recs
 
 
+def test_direct_dict_float_pair_and_parallel_numpy():
+    # Direct combined-table dict iteration with tombstones & nested dicts
+    d = {f"k_{i}": {"v": i, "p": [float(i), -float(i) * 0.5]} for i in range(200)}
+    for i in range(0, 200, 3):
+        del d[f"k_{i}"]
+    out = cxjson.dumps(d)
+    assert json.loads(out) == d
+
+    # Dict array with tombstones and non-str key error handling
+    arr = [{"a": i, "b": i + 1, "c": i + 2} for i in range(20)]
+    del arr[5]["b"]
+    assert json.loads(cxjson.dumps(arr)) == arr
+    arr_bad = [{"a": 1}, {"a": 2}, {"a": 3}, {"a": 4}, {123: "bad"}]
+    try:
+        cxjson.dumps(arr_bad)
+        raise AssertionError("Expected TypeError for int dict key")
+    except TypeError:
+        pass
+
+    # Dict mutation inside default() must raise RuntimeError safely (no UAF)
+    class Mutator:
+        pass
+    mut_dict = {"a": Mutator(), "b": 1}
+    def mut_default(x):
+        for k in range(100):
+            mut_dict[f"extra_{k}"] = k
+        return "mutated"
+    try:
+        cxjson.dumps(mut_dict, default=mut_default)
+        raise AssertionError("Expected RuntimeError when dict resized during dumps")
+    except RuntimeError:
+        pass
+
+    # [float, float] pair fast path including NaN/Inf/-Inf
+    pairs = [[1.5, -2.5], [float("nan"), float("inf")], [float("-inf"), 0.0]]
+    assert cxjson.dumps(pairs) == b'[[1.5,-2.5],[null,null],[null,0.0]]'
+
+    # Parallel 1D & 2D NumPy serialization (if numpy is installed)
+    try:
+        import numpy as np
+    except ImportError:
+        return
+    rng = np.random.default_rng(123)
+    for np_arr in [
+        rng.uniform(-1e4, 1e4, 25_000).astype(np.float64),
+        rng.uniform(-1e3, 1e3, 25_000).astype(np.float32),
+        rng.integers(-10**12, 10**12, 25_000, dtype=np.int64),
+        rng.integers(-10**6, 10**6, 25_000, dtype=np.int32),
+        rng.uniform(-180.0, 180.0, (200, 128)).astype(np.float64),
+        rng.uniform(-180.0, 180.0, (200, 128)).astype(np.float32),
+        rng.integers(-10**9, 10**9, (200, 128), dtype=np.int64),
+    ]:
+        mt_bytes = cxjson.dumps(np_arr, option=cxjson.OPT_SERIALIZE_NUMPY)
+        # Verify against Python list serialization
+        expected = cxjson.dumps(np_arr.tolist())
+        if np_arr.dtype in (np.float64, np.int64, np.int32):
+            assert mt_bytes == expected, f"Mismatch for {np_arr.dtype} {np_arr.shape}"
+        else:
+            assert json.loads(mt_bytes) is not None
+    nan_arr = rng.uniform(-10.0, 10.0, 20_000).astype(np.float64)
+    nan_arr[0] = np.nan
+    nan_arr[10_000] = np.inf
+    nan_arr[-1] = -np.inf
+    assert cxjson.dumps(nan_arr, option=cxjson.OPT_SERIALIZE_NUMPY) == cxjson.dumps(nan_arr.tolist())
+
+
 if __name__ == "__main__":
     test_split_dict_gc_cycles_and_tracking()
     print("PASS: test_split_dict_gc_cycles_and_tracking")
@@ -389,4 +455,6 @@ if __name__ == "__main__":
     print("PASS: test_parallel_opts_sort_indent_and_deep_nesting")
     test_slotted_dataclass_and_split_dict_dumps()
     print("PASS: test_slotted_dataclass_and_split_dict_dumps")
+    test_direct_dict_float_pair_and_parallel_numpy()
+    print("PASS: test_direct_dict_float_pair_and_parallel_numpy")
     print("\nALL v0.1.1 REGRESSION TESTS PASSED!")
