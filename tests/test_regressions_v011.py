@@ -407,6 +407,40 @@ def test_direct_dict_float_pair_and_parallel_numpy():
     except RuntimeError:
         pass
 
+    # Adversarial: clear() + reinsert int keys (dk_kind 1 -> 0) and clear() to empty
+    d_clear = {"a": Mutator(), "b": 2}
+    try:
+        cxjson.dumps(d_clear, default=lambda x: (d_clear.clear(), d_clear.__setitem__(1, 2), d_clear.__setitem__(3, 4), "ok")[-1])
+        raise AssertionError("Expected RuntimeError on clear+reinsert")
+    except RuntimeError:
+        pass
+
+    # Adversarial: split-table dict promoted/mutated inside default() in encode_dict_array_cached
+    split_recs = cxjson.loads(cxjson.dumps([{"a": i, "b": i + 1} for i in range(10)]))
+    split_recs[5]["a"] = Mutator()
+    try:
+        cxjson.dumps(split_recs, default=lambda x: (split_recs[5].__setitem__("extra", 99), "ok")[1])
+        raise AssertionError("Expected RuntimeError when split-table dict promoted during dumps")
+    except RuntimeError:
+        pass
+    split_recs2 = cxjson.loads(cxjson.dumps([{"a": i, "b": i + 1} for i in range(10)]))
+    split_recs2[5]["a"] = Mutator()
+    try:
+        cxjson.dumps(split_recs2, default=lambda x: (split_recs2[5].pop("b"), "ok")[1])
+        raise AssertionError("Expected RuntimeError when split-table dict key deleted during dumps")
+    except RuntimeError:
+        pass
+
+    # str subclass key + delete-remaining-key without resize + Unicode/escaped tombstones
+    class MyStr(str):
+        pass
+    assert cxjson.dumps({MyStr("hello"): 1, "world": 2}) == b'{"hello":1,"world":2}'
+    d_del = {"a": Mutator(), "b": 2}
+    assert cxjson.dumps(d_del, default=lambda x: (d_del.pop("b"), "ok")[1]) == b'{"a":"ok"}'
+    d_uni = {"héllo": 1, "🚀": 2, 'a"b\\c\n': 3, "bye": 4}
+    del d_uni["🚀"]
+    assert json.loads(cxjson.dumps(d_uni)) == d_uni
+
     # [float, float] pair fast path including NaN/Inf/-Inf
     pairs = [[1.5, -2.5], [float("nan"), float("inf")], [float("-inf"), 0.0]]
     assert cxjson.dumps(pairs) == b'[[1.5,-2.5],[null,null],[null,0.0]]'

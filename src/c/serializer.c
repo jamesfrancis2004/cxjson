@@ -1773,6 +1773,7 @@ static char *encode_dict_array_cached(
         PyObject *const *svals = (PyObject *const *)mp->ma_values;
 #endif
         if (CJSON_LIKELY(split_hit)) {
+          PyDictValues *orig_vals = mp->ma_values;
           for (uint32_t j = 0; j < split_n; j++) {
             if (CJSON_UNLIKELY(dst > safe_end)) {
               b->len = (Py_ssize_t)(dst - b->data);
@@ -1832,12 +1833,24 @@ static char *encode_dict_array_cached(
                 dst = encode_array_fast(b, dst, &safe_end, dval);
                 if (CJSON_UNLIKELY(dst == NULL)) { b->depth--; return NULL; }
               }
+              if (CJSON_UNLIKELY(mp->ma_values != orig_vals || mp->ma_keys != split_dk ||
+                                 (uint32_t)mp->ma_used != split_n)) {
+                b->depth--;
+                PyErr_SetString(PyExc_RuntimeError, "dictionary changed size during iteration");
+                return NULL;
+              }
             } else if (vtp == &PyDict_Type) {
               if (PyDict_GET_SIZE(dval) == 0) {
                 dst[0] = '{'; dst[1] = '}'; dst += 2;
               } else {
                 dst = encode_dict_fast(b, dst, &safe_end, dval);
                 if (CJSON_UNLIKELY(dst == NULL)) { b->depth--; return NULL; }
+              }
+              if (CJSON_UNLIKELY(mp->ma_values != orig_vals || mp->ma_keys != split_dk ||
+                                 (uint32_t)mp->ma_used != split_n)) {
+                b->depth--;
+                PyErr_SetString(PyExc_RuntimeError, "dictionary changed size during iteration");
+                return NULL;
               }
             } else {
               b->len = (Py_ssize_t)(dst - b->data);
@@ -1847,6 +1860,12 @@ static char *encode_dict_array_cached(
               }
               dst = b->data + b->len;
               safe_end = b->data + b->cap - 128;
+              if (CJSON_UNLIKELY(mp->ma_values != orig_vals || mp->ma_keys != split_dk ||
+                                 (uint32_t)mp->ma_used != split_n)) {
+                b->depth--;
+                PyErr_SetString(PyExc_RuntimeError, "dictionary changed size during iteration");
+                return NULL;
+              }
             }
           }
           *dst++ = '}';
@@ -1906,8 +1925,9 @@ static char *encode_dict_array_cached(
                        ((CJsonSerDictKeysObject *)mp->ma_keys)->dk_kind == 1)) {
         CJsonSerDictKeysObject *dk = (CJsonSerDictKeysObject *)mp->ma_keys;
         Py_ssize_t nentries = dk->dk_nentries;
+        uint8_t log2_idx = dk->dk_log2_index_bytes;
         CJsonSerDictUnicodeEntry *ep =
-            (CJsonSerDictUnicodeEntry *)(dk->dk_indices + ((size_t)1 << dk->dk_log2_index_bytes));
+            (CJsonSerDictUnicodeEntry *)(dk->dk_indices + ((size_t)1 << log2_idx));
         for (Py_ssize_t di = 0; di < nentries; di++) {
           PyObject *dval = ep[di].me_value;
           if (CJSON_UNLIKELY(dval == NULL)) continue;
@@ -1991,7 +2011,9 @@ static char *encode_dict_array_cached(
               if (CJSON_UNLIKELY(dst == NULL)) { b->depth--; return NULL; }
             }
             if (CJSON_UNLIKELY(mp->ma_keys != (PyDictKeysObject *)dk ||
-                               mp->ma_values != NULL || dk->dk_nentries != nentries)) {
+                               mp->ma_values != NULL || dk->dk_kind != 1 ||
+                               dk->dk_log2_index_bytes != log2_idx ||
+                               dk->dk_nentries != nentries)) {
               b->depth--;
               PyErr_SetString(PyExc_RuntimeError, "dictionary changed size during iteration");
               return NULL;
@@ -2012,7 +2034,9 @@ static char *encode_dict_array_cached(
               if (CJSON_UNLIKELY(dst == NULL)) { b->depth--; return NULL; }
             }
             if (CJSON_UNLIKELY(mp->ma_keys != (PyDictKeysObject *)dk ||
-                               mp->ma_values != NULL || dk->dk_nentries != nentries)) {
+                               mp->ma_values != NULL || dk->dk_kind != 1 ||
+                               dk->dk_log2_index_bytes != log2_idx ||
+                               dk->dk_nentries != nentries)) {
               b->depth--;
               PyErr_SetString(PyExc_RuntimeError, "dictionary changed size during iteration");
               return NULL;
@@ -2026,7 +2050,9 @@ static char *encode_dict_array_cached(
             dst = b->data + b->len;
             safe_end = b->data + b->cap - 128;
             if (CJSON_UNLIKELY(mp->ma_keys != (PyDictKeysObject *)dk ||
-                               mp->ma_values != NULL || dk->dk_nentries != nentries)) {
+                               mp->ma_values != NULL || dk->dk_kind != 1 ||
+                               dk->dk_log2_index_bytes != log2_idx ||
+                               dk->dk_nentries != nentries)) {
               b->depth--;
               PyErr_SetString(PyExc_RuntimeError, "dictionary changed size during iteration");
               return NULL;
@@ -2870,8 +2896,9 @@ static char *encode_dict_fast(JsonBuffer *b, char *dst, char **safe_end_p, PyObj
                      ((CJsonSerDictKeysObject *)mp->ma_keys)->dk_kind == 1)) {
       CJsonSerDictKeysObject *dk = (CJsonSerDictKeysObject *)mp->ma_keys;
       Py_ssize_t nentries = dk->dk_nentries;
+      uint8_t log2_idx = dk->dk_log2_index_bytes;
       CJsonSerDictUnicodeEntry *ep =
-          (CJsonSerDictUnicodeEntry *)(dk->dk_indices + ((size_t)1 << dk->dk_log2_index_bytes));
+          (CJsonSerDictUnicodeEntry *)(dk->dk_indices + ((size_t)1 << log2_idx));
       for (Py_ssize_t di = 0; di < nentries; di++) {
         PyObject *dval = ep[di].me_value;
         if (CJSON_UNLIKELY(dval == NULL)) continue;
@@ -2943,7 +2970,9 @@ static char *encode_dict_fast(JsonBuffer *b, char *dst, char **safe_end_p, PyObj
             if (CJSON_UNLIKELY(dst == NULL)) { b->depth--; return NULL; }
           }
           if (CJSON_UNLIKELY(mp->ma_keys != (PyDictKeysObject *)dk ||
-                             mp->ma_values != NULL || dk->dk_nentries != nentries)) {
+                             mp->ma_values != NULL || dk->dk_kind != 1 ||
+                             dk->dk_log2_index_bytes != log2_idx ||
+                             dk->dk_nentries != nentries)) {
             b->depth--;
             PyErr_SetString(PyExc_RuntimeError, "dictionary changed size during iteration");
             return NULL;
@@ -2964,7 +2993,9 @@ static char *encode_dict_fast(JsonBuffer *b, char *dst, char **safe_end_p, PyObj
             if (CJSON_UNLIKELY(dst == NULL)) { b->depth--; return NULL; }
           }
           if (CJSON_UNLIKELY(mp->ma_keys != (PyDictKeysObject *)dk ||
-                             mp->ma_values != NULL || dk->dk_nentries != nentries)) {
+                             mp->ma_values != NULL || dk->dk_kind != 1 ||
+                             dk->dk_log2_index_bytes != log2_idx ||
+                             dk->dk_nentries != nentries)) {
             b->depth--;
             PyErr_SetString(PyExc_RuntimeError, "dictionary changed size during iteration");
             return NULL;
@@ -2978,7 +3009,9 @@ static char *encode_dict_fast(JsonBuffer *b, char *dst, char **safe_end_p, PyObj
           dst = b->data + b->len;
           safe_end = b->data + b->cap - 128;
           if (CJSON_UNLIKELY(mp->ma_keys != (PyDictKeysObject *)dk ||
-                             mp->ma_values != NULL || dk->dk_nentries != nentries)) {
+                             mp->ma_values != NULL || dk->dk_kind != 1 ||
+                             dk->dk_log2_index_bytes != log2_idx ||
+                             dk->dk_nentries != nentries)) {
             b->depth--;
             PyErr_SetString(PyExc_RuntimeError, "dictionary changed size during iteration");
             return NULL;
