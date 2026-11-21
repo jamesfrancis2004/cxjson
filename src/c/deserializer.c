@@ -2270,15 +2270,18 @@ dispatch_item:;
       if (CJSON_UNLIKELY(depth + 1 >= CJSON_REC_PARSE_DEPTH)) {
         val = parse_document_iter(jp, &p, end, depth);
       } else {
-        /* Fast path for tiny 2..3 element numeric arrays ([lon, lat], [ 1.0, 2.0 ], [x, y, z]) */
+        /* Fast path for tiny 2..3 element numeric arrays ([lon, lat], [ 1.0, 2.0 ], pretty-printed) */
         const char *q = p + 1;
         if (q < end && *q == ' ') q++;
+        if (CJSON_UNLIKELY(q < end && (uint8_t)*q <= 0x20)) q = skip_ws_slow(q, end);
         if (q < end && (*q == '-' || (uint32_t)(*q - '0') < 10)) {
           PyObject *v0 = parse_number(jp, &q, end);
           if (CJSON_UNLIKELY(v0 == NULL)) return NULL;
+          if (CJSON_UNLIKELY(q < end && (uint8_t)*q <= 0x20)) q = skip_ws_slow(q, end);
           if (CJSON_LIKELY(q < end && *q == ',')) {
             q++;
             if (q < end && *q == ' ') q++;
+            if (CJSON_UNLIKELY(q < end && (uint8_t)*q <= 0x20)) q = skip_ws_slow(q, end);
             if (CJSON_LIKELY(q < end && (*q == '-' || (uint32_t)(*q - '0') < 10))) {
               PyObject *v1 = parse_number(jp, &q, end);
               if (CJSON_UNLIKELY(v1 == NULL)) {
@@ -2286,6 +2289,7 @@ dispatch_item:;
                 return NULL;
               }
               if (q < end && *q == ' ') q++;
+              if (CJSON_UNLIKELY(q < end && (uint8_t)*q <= 0x20)) q = skip_ws_slow(q, end);
               if (CJSON_LIKELY(q < end && *q == ']')) {
                 val = PyList_New(2);
                 if (CJSON_UNLIKELY(val == NULL)) {
@@ -2301,6 +2305,7 @@ dispatch_item:;
               if (q < end && *q == ',') {
                 q++;
                 if (q < end && *q == ' ') q++;
+                if (CJSON_UNLIKELY(q < end && (uint8_t)*q <= 0x20)) q = skip_ws_slow(q, end);
                 if (q < end && (*q == '-' || (uint32_t)(*q - '0') < 10)) {
                   PyObject *v2 = parse_number(jp, &q, end);
                   if (CJSON_UNLIKELY(v2 == NULL)) {
@@ -2309,6 +2314,7 @@ dispatch_item:;
                     return NULL;
                   }
                   if (q < end && *q == ' ') q++;
+                  if (CJSON_UNLIKELY(q < end && (uint8_t)*q <= 0x20)) q = skip_ws_slow(q, end);
                   if (q < end && *q == ']') {
                     val = PyList_New(3);
                     if (CJSON_UNLIKELY(val == NULL)) {
