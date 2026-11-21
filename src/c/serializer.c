@@ -1681,6 +1681,9 @@ try_default:
 
 static char *encode_array_fast(JsonBuffer *b, char *dst, char **safe_end_p, PyObject *obj);
 
+#include "jit_ser_arm64.h"
+#include "jit_ser_x86_64.h"
+
 /* Out-of-line homogeneous dict-array encoder with per-call pre-encoded key cache.
  * Kept noinline so its 3KB stack cache never bloats encode_array_fast's frame
  * (critical for deeply nested float arrays like canada.json). */
@@ -1720,9 +1723,30 @@ static char *encode_dict_array_cached(
   uint16_t split_koff[30];
   uint16_t split_klen[30];
   char split_kbuf[1024];
+#ifdef CJSON_SCHEMA_JIT
+  CJsonJitSplitLoopFn jit_fn = NULL;
+#endif
 #endif
 
   for (Py_ssize_t i = 0; i < len; i++) {
+#ifdef CJSON_SCHEMA_JIT
+    if (jit_fn != NULL && b->default_fn == NULL && b->depth < CJSON_REC_SER_DEPTH - 2) {
+      JitRunCtx jctx;
+      jctx.b = b;
+      jctx.safe_end_p = &safe_end;
+      jctx.dk = split_dk;
+#if PY_VERSION_HEX >= 0x030D0000
+      jctx.prefix = NULL;
+#else
+      jctx.prefix = split_prefix;
+#endif
+      b->depth++;
+      dst = jit_fn(items, len, &i, dst, &jctx);
+      b->depth--;
+      if (CJSON_UNLIKELY(dst == NULL)) return NULL;
+      if (i >= len) break;
+    }
+#endif
     PyObject *item = items[i];
     if (CJSON_UNLIKELY(Py_TYPE(item) != &PyDict_Type)) {
       *out_idx = i;
@@ -1882,6 +1906,10 @@ static char *encode_dict_array_cached(
           uint32_t sn = (uint32_t)mp->ma_used;
           uint32_t kused = 0;
           int ok = 1;
+#ifdef CJSON_SCHEMA_JIT
+          uint8_t jit_vtypes[30];
+          int jit_ok = (len >= 32 && sn <= 30 && b->default_fn == NULL);
+#endif
           PyObject *tk, *tv;
           Py_ssize_t tpos = 0;
           uint32_t tj = 0;
@@ -1905,6 +1933,19 @@ static char *encode_dict_array_cached(
 #if PY_VERSION_HEX < 0x030D0000
             split_order[tj] = vraw[-3 - (int)tj];
 #endif
+#ifdef CJSON_SCHEMA_JIT
+            if (jit_ok) {
+              PyTypeObject *tvtp = Py_TYPE(tv);
+              if (tvtp == &PyLong_Type) jit_vtypes[tj] = JIT_VT_INT;
+              else if (tvtp == &PyFloat_Type) jit_vtypes[tj] = JIT_VT_FLOAT;
+              else if (tvtp == &PyUnicode_Type) jit_vtypes[tj] = JIT_VT_STR;
+              else if (tvtp == &PyBool_Type) jit_vtypes[tj] = JIT_VT_BOOL;
+              else if (tv == Py_None) jit_vtypes[tj] = JIT_VT_NONE;
+              else if (tvtp == &PyDict_Type) jit_vtypes[tj] = JIT_VT_DICT;
+              else if (tvtp == &PyList_Type) jit_vtypes[tj] = JIT_VT_LIST;
+              else jit_vtypes[tj] = JIT_VT_ANY;
+            }
+#endif
             kused += (uint32_t)(tkl + 4);
             tj++;
           }
@@ -1914,6 +1955,18 @@ static char *encode_dict_array_cached(
 #if PY_VERSION_HEX < 0x030D0000
             split_psize = psize;
             memcpy(split_prefix, vraw - psize, psize);
+#endif
+#ifdef CJSON_SCHEMA_JIT
+            if (jit_ok) {
+#if PY_VERSION_HEX >= 0x030D0000
+              uint8_t id_order[30] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29};
+              jit_fn = cjson_jit_get_or_compile(sn, split_kbuf, kused, split_koff, split_klen,
+                                                jit_vtypes, id_order, 0, NULL);
+#else
+              jit_fn = cjson_jit_get_or_compile(sn, split_kbuf, kused, split_koff, split_klen,
+                                                jit_vtypes, split_order, split_psize, split_prefix);
+#endif
+            }
 #endif
           }
         }
