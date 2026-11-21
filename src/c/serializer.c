@@ -1082,7 +1082,7 @@ static int json_buffer_append_datetime_fast(JsonBuffer *b, PyObject *obj) {
 }
 
 #if !defined(Py_LIMITED_API) && PY_VERSION_HEX >= 0x030C0000
-#define CJSON_SLOT_DC_CACHE_SIZE 16
+#define CJSON_SLOT_DC_CACHE_SIZE 64
 #define CJSON_SLOT_DC_MAX_FIELDS 32
 
 typedef struct {
@@ -1154,6 +1154,8 @@ static SlotDataclassCacheEntry *get_slot_dataclass_cache(PyTypeObject *tp) {
 }
 
 static int encode_slot_dataclass_cached(JsonBuffer *b, PyObject *obj, SlotDataclassCacheEntry *e) {
+  PyTypeObject *obj_tp = Py_TYPE(obj);
+  unsigned int obj_ver = e->tp_version;
   uint8_t nf = e->nfields;
   if (CJSON_UNLIKELY(nf == 0)) {
     return json_buffer_append(b, "{}", 2);
@@ -1221,6 +1223,14 @@ static int encode_slot_dataclass_cached(JsonBuffer *b, PyObject *obj, SlotDatacl
       }
       dst = b->data + b->len;
       safe_end = b->data + b->cap - 128;
+      /* Re-validate slot in case a nested slotted dataclass evicted e */
+      if (CJSON_UNLIKELY(e->tp != obj_tp || e->tp_version != obj_ver)) {
+        e = get_slot_dataclass_cache(obj_tp);
+        if (CJSON_UNLIKELY(e == NULL || e->nfields != nf)) {
+          b->len = saved_len;
+          return 1;
+        }
+      }
     }
   }
   *dst++ = '}';

@@ -350,6 +350,21 @@ def test_slotted_dataclass_and_split_dict_dumps():
     del u_del.name
     assert cxjson.dumps(u_del) == b'{"id":1,"score":2.5,"active":true}'
 
+    # Force cache-slot collisions across 80 distinct nested slotted dataclass types
+    inner_types = [
+        dataclasses.make_dataclass(f"InnerDC{k}", [("a", int), ("b", str), ("c", float), ("d", bool)], slots=True)
+        for k in range(80)
+    ]
+    outer_types = [
+        dataclasses.make_dataclass(f"OuterDC{k}", [("x", int), ("inner", object), ("tail", str)], slots=True)
+        for k in range(80)
+    ]
+    for k in range(80):
+        inst = outer_types[k](k, inner_types[k](k, "hi", 1.5, True), "ok")
+        assert json.loads(cxjson.dumps(inst)) == {
+            "x": k, "inner": {"a": k, "b": "hi", "c": 1.5, "d": True}, "tail": "ok"
+        }
+
     # Split-table dict array dumps with mid-list mutations (del + insert)
     raw = cxjson.dumps([{"id": i, "name": f"r{i}", "val": i * 0.5, "ok": True} for i in range(500)])
     recs = cxjson.loads(raw)
