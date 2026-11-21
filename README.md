@@ -2,6 +2,7 @@
 
 > **I tasked Gemini with building a JSON library in C to beat `orjson` — the fastest JSON library in Python. It didn't just beat `orjson`; it swept 56/56 benchmarks across 28 real-world datasets and used 4.7×–10.6× less RAM.**
 
+[![CI](https://github.com/jamesfrancis2004/cxjson/actions/workflows/ci.yml/badge.svg)](https://github.com/jamesfrancis2004/cxjson/actions/workflows/ci.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%20|%203.13%20|%203.14-blue.svg)](#)
 [![Pure C](https://img.shields.io/badge/implementation-pure%20C%20%2B%20SIMD-orange.svg)](#)
 [![RFC 8259](https://img.shields.io/badge/RFC%208259-strict%20conformance-brightgreen.svg)](#)
@@ -91,6 +92,23 @@ Speed is only half the story—when parsing large API payloads in production, me
 | `gsoc-2018.json` | **4.43 MB** | 42.96 MB | **9.7× less** |
 | `canada.json` | **6.94 MB** | 32.57 MB | **4.7× less** |
 | `semanticscholar-corpus.json` | **17.41 MB** | 121.45 MB | **7.0× less** |
+
+---
+
+## NumPy Serialization (`OPT_SERIALIZE_NUMPY`)
+
+`cxjson` serializes NumPy arrays directly from their raw C memory via Python's PEP 3118 buffer protocol—**zero NumPy build dependency** (works across NumPy 1.x and 2.x) and supports `int16`/`uint16` plus non-contiguous strided/transposed views.
+
+| NumPy Array (Apple M2, NumPy 2.1.2) | **`cxjson`** | `orjson` | Speedup |
+|---|---:|---:|---:|
+| `float64` (100K 1D) | **2,061 MB/s** | 822 MB/s | **2.51×** |
+| `float64` (500×200 2D) | **2,060 MB/s** | 804 MB/s | **2.56×** |
+| `float32` (100K 1D) | **1,407 MB/s** | 446 MB/s | **3.16×** |
+| `int64` (100K 1D) | **1,747 MB/s** | 1,476 MB/s | **1.18×** |
+| `int32` (100K 1D) | **1,410 MB/s** | 1,262 MB/s | **1.12×** |
+| `uint8` (200K 1D) | **7,551 MB/s** | 968 MB/s | **7.80×** |
+| `bool` (200K 1D) | **8,631 MB/s** | 4,130 MB/s | **2.09×** |
+| **Geo-Mean** | — | — | **2.38×** |
 
 ---
 
