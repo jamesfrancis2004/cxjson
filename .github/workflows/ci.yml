@@ -38,6 +38,7 @@ jobs:
         run: python tests/test_serializer.py
 
       - name: Run conformance, fork, and fuzz tests
+        shell: bash
         env:
           PYTHONPATH: src
         run: |

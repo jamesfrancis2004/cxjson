@@ -881,6 +881,33 @@ static inline PyObject *parse_string_fast(JsonParser *jp, const char **p_io, con
       return NULL;
     }
     p += 16;
+    if (CJSON_LIKELY(p + 16 <= end)) {
+      __m128i v2 = _mm_loadu_si128((const __m128i *)p);
+      uint32_t mask2 = (uint32_t)_mm_movemask_epi8(sse2_str_ascii_mask(v2, v_q, v_bs, v_20));
+      if (mask2 != 0) {
+        unsigned int idx = (unsigned int)__builtin_ctz(mask2);
+        const char *hit = p + idx;
+        uint8_t ch = (uint8_t)*hit;
+        if (CJSON_LIKELY(ch == '"')) {
+          *p_io = hit + 1;
+          uint32_t slen = 16u + idx;
+#if !defined(Py_GIL_DISABLED) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+          return lookup_or_create_long_ascii_val(start, slen);
+#else
+          return make_ascii_str(start, (Py_ssize_t)slen);
+#endif
+        }
+        if (ch == '\\') {
+          return parse_string_escaped(jp, p_io, start, (size_t)(16u + idx), 1);
+        }
+        if (ch >= 0x80) {
+          return parse_string_utf8(jp, p_io, start, hit, end);
+        }
+        raise_decode_error(jp, "invalid control character in string", hit);
+        return NULL;
+      }
+      p += 16;
+    }
   }
 #else
   /* Hybrid SWAR-first (ARM64 + scalar): 2x8B in GPRs avoids NEON->GPR crossing

@@ -1513,7 +1513,7 @@ static char *encode_array_fast(JsonBuffer *b, char *dst, char **safe_end_p, PyOb
     Py_ssize_t e2 = estimate_elem_bytes_o1(pitems[len - 1], 3);
     Py_ssize_t elem_b = (e0 + e1 + e2) / 3;
     Py_ssize_t est_bytes = (elem_b > (PY_SSIZE_T_MAX / len)) ? (16 * 1024 * 1024) : (len * elem_b);
-    if (est_bytes >= 512 * 1024) {
+    if (est_bytes >= 1024 * 1024) {
       b->len = (Py_ssize_t)(dst - b->data);
       int prc = cjson_parallel_encode_slices(b, 0, pitems, NULL, len, est_bytes);
       if (prc < 0) return NULL;
@@ -1880,7 +1880,7 @@ static char *encode_dict_fast(JsonBuffer *b, char *dst, char **safe_end_p, PyObj
     }
     Py_ssize_t avg_est = (sampled > 0) ? (sum_est / sampled) : 0;
     Py_ssize_t dict_est = (avg_est > (PY_SSIZE_T_MAX / dict_size)) ? (16 * 1024 * 1024) : (dict_size * avg_est);
-    if (dict_est >= 512 * 1024) {
+    if (dict_est >= 1024 * 1024) {
       ParDictPair *pairs = (ParDictPair *)malloc((size_t)dict_size * sizeof(ParDictPair));
       if (pairs != NULL) {
         Py_ssize_t pos = 0, cnt = 0;
