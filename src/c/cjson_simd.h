@@ -23,7 +23,7 @@
 #elif defined(__AVX2__)
 #define CJSON_SIMD_AVX2 1
 #include <immintrin.h>
-#elif defined(__SSE2__)
+#elif defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 #define CJSON_SIMD_SSE2 1
 #include <emmintrin.h>
 #endif
