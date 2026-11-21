@@ -2543,7 +2543,7 @@ static inline void sort_entries_insertion(DictSortEntry *e, Py_ssize_t n) {
   }
 }
 
-static CJSON_NOINLINE void sort_entries_large(DictSortEntry *e, Py_ssize_t n) {
+static CJSON_NOINLINE void sort_entries_qsort_inline(DictSortEntry *e, Py_ssize_t n) {
   /* Iterative quicksort with median-of-3 pivot, insertion sort for <=24,
    * and qsort fallback if recursion depth exceeds 2*log2(n). */
   struct { Py_ssize_t lo; Py_ssize_t hi; int depth; } stack[64];
@@ -2611,6 +2611,134 @@ static CJSON_NOINLINE void sort_entries_large(DictSortEntry *e, Py_ssize_t n) {
       sort_entries_insertion(e + lo, hi - lo + 1);
     }
   }
+}
+
+static void sort_entries_radix(DictSortEntry *e, DictSortEntry *tmp, Py_ssize_t n, uint32_t depth) {
+  if (n <= 24) {
+    sort_entries_insertion(e, n);
+    return;
+  }
+  if (n < 128 || depth >= 64) {
+    sort_entries_qsort_inline(e, n);
+    return;
+  }
+
+  /* Find first differing byte offset d >= depth */
+  uint32_t d = depth;
+  if (d < 8) {
+    uint64_t p0 = e[0].prefix;
+    uint64_t diff = 0;
+    for (Py_ssize_t i = 1; i < n; i++) {
+      diff |= (p0 ^ e[i].prefix);
+    }
+    if (diff != 0) {
+      uint32_t first_diff = (uint32_t)(cjson_clz64(diff) >> 3);
+      if (first_diff > d) d = first_diff;
+    } else {
+      d = 8;
+    }
+  }
+  if (d >= 8) {
+    while (d < 64) {
+      if (e[0].key_len <= d) break;
+      unsigned char c0 = (unsigned char)e[0].key_utf8[d];
+      int all_same = 1;
+      for (Py_ssize_t i = 1; i < n; i++) {
+        if (e[i].key_len <= d || (unsigned char)e[i].key_utf8[d] != c0) {
+          all_same = 0;
+          break;
+        }
+      }
+      if (!all_same) break;
+      d++;
+    }
+    if (d >= 64) {
+      sort_entries_qsort_inline(e, n);
+      return;
+    }
+  }
+
+  Py_ssize_t counts[256];
+  memset(counts, 0, sizeof(counts));
+  if (d < 8) {
+    unsigned int shift = (7u - d) * 8u;
+    for (Py_ssize_t i = 0; i < n; i++) {
+      counts[(e[i].prefix >> shift) & 0xFFu]++;
+    }
+    Py_ssize_t offsets[256];
+    Py_ssize_t sum = 0;
+    for (int b = 0; b < 256; b++) {
+      offsets[b] = sum;
+      sum += counts[b];
+    }
+    for (Py_ssize_t i = 0; i < n; i++) {
+      unsigned int bk = (unsigned int)((e[i].prefix >> shift) & 0xFFu);
+      tmp[offsets[bk]++] = e[i];
+    }
+  } else {
+    for (Py_ssize_t i = 0; i < n; i++) {
+      unsigned int bk = (e[i].key_len > d) ? (unsigned char)e[i].key_utf8[d] : 0u;
+      counts[bk]++;
+    }
+    Py_ssize_t offsets[256];
+    Py_ssize_t sum = 0;
+    for (int b = 0; b < 256; b++) {
+      offsets[b] = sum;
+      sum += counts[b];
+    }
+    for (Py_ssize_t i = 0; i < n; i++) {
+      unsigned int bk = (e[i].key_len > d) ? (unsigned char)e[i].key_utf8[d] : 0u;
+      tmp[offsets[bk]++] = e[i];
+    }
+  }
+  memcpy(e, tmp, (size_t)n * sizeof(DictSortEntry));
+
+  Py_ssize_t off = 0;
+  for (int b = 0; b < 256; b++) {
+    Py_ssize_t cnt = counts[b];
+    if (cnt > 1) {
+      if (CJSON_UNLIKELY(cnt == n)) {
+        sort_entries_qsort_inline(e + off, cnt);
+      } else if (cnt <= 24) {
+        sort_entries_insertion(e + off, cnt);
+      } else if (cnt < 128) {
+        sort_entries_qsort_inline(e + off, cnt);
+      } else {
+        sort_entries_radix(e + off, tmp + off, cnt, d + 1);
+      }
+    }
+    off += cnt;
+  }
+}
+
+static CJSON_NOINLINE void sort_entries_large(DictSortEntry *e, Py_ssize_t n) {
+  /* O(N) check for already-sorted or reverse-sorted keys (common in JSON) */
+  int asc = 1, desc = 1;
+  for (Py_ssize_t i = 1; i < n; i++) {
+    int cmp = compare_dict_sort_entries_inline(&e[i - 1], &e[i]);
+    if (cmp > 0) asc = 0;
+    if (cmp < 0) desc = 0;
+    if (!asc && !desc) break;
+  }
+  if (asc) return;
+  if (desc) {
+    Py_ssize_t lo = 0, hi = n - 1;
+    while (lo < hi) {
+      DictSortEntry t = e[lo]; e[lo] = e[hi]; e[hi] = t;
+      lo++; hi--;
+    }
+    return;
+  }
+
+  if (n >= 256) {
+    DictSortEntry *tmp = (DictSortEntry *)PyMem_Malloc((size_t)n * sizeof(DictSortEntry));
+    if (CJSON_LIKELY(tmp != NULL)) {
+      sort_entries_radix(e, tmp, n, 0);
+      PyMem_Free(tmp);
+      return;
+    }
+  }
+  sort_entries_qsort_inline(e, n);
 }
 
 static inline void sort_dict_entries(DictSortEntry *e, Py_ssize_t n) {
