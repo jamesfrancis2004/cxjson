@@ -9,6 +9,15 @@
 #define CJSON_NOINLINE      __declspec(noinline)
 #define CJSON_ALIGNED(n)    __declspec(align(n))
 #define CJSON_LITTLE_ENDIAN 1
+#ifndef __BYTE_ORDER__
+#define __BYTE_ORDER__ 1234
+#endif
+#ifndef __ORDER_LITTLE_ENDIAN__
+#define __ORDER_LITTLE_ENDIAN__ 1234
+#endif
+#ifndef __attribute__
+#define __attribute__(x)
+#endif
 
 static inline unsigned int cjson_ctz32(uint32_t x) {
   unsigned long idx = 0;
@@ -27,6 +36,10 @@ static inline int cjson_clz64(uint64_t x) {
   _BitScanReverse64(&idx, x);
   return 63 - (int)idx;
 }
+
+#define __builtin_ctz(x)   cjson_ctz32(x)
+#define __builtin_ctzll(x) cjson_ctz64(x)
+#define __builtin_clzll(x) cjson_clz64(x)
 
 static inline uint64_t cjson_umul128(uint64_t a, uint64_t b, uint64_t *hi) {
   return _umul128(a, b, hi);

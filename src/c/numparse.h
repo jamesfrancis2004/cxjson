@@ -20,8 +20,8 @@ static inline int eisel_lemire_double(uint64_t mant, int exp10, int is_neg, doub
   int lz = __builtin_clzll(mant);
   uint64_t w = mant << lz;
 
-  __uint128_t p1 = (__uint128_t)w * (__uint128_t)entry->hi;
-  uint64_t hi = (uint64_t)(p1 >> 64);
+  uint64_t hi = 0;
+  uint64_t lo = cjson_umul128(w, entry->hi, &hi);
   int upper = (int)(hi >> 63);
   int shift = upper + 9;
   uint64_t mask = (1ULL << (shift + 1)) - 1;
@@ -29,10 +29,11 @@ static inline int eisel_lemire_double(uint64_t mant, int exp10, int is_neg, doub
   uint64_t half = 1ULL << shift;
 
   if (CJSON_UNLIKELY(rem == half || rem == half - 1 || rem == mask)) {
-    __uint128_t p2 = (__uint128_t)w * (__uint128_t)entry->lo;
-    __uint128_t p = p1 + (p2 >> 64);
-    hi = (uint64_t)(p >> 64);
-    uint64_t lo = (uint64_t)p;
+    uint64_t p2_hi = 0;
+    (void)cjson_umul128(w, entry->lo, &p2_hi);
+    uint64_t new_lo = lo + p2_hi;
+    if (new_lo < lo) hi += 1;
+    lo = new_lo;
     upper = (int)(hi >> 63);
     shift = upper + 9;
     mask = (1ULL << (shift + 1)) - 1;
