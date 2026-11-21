@@ -22,9 +22,122 @@ typedef struct {
   uint64_t hash64;
 } GlobalLongKeySlot;
 
-static FastKeySlot g_fast_key_cache[CJSON_KEY_CACHE_SIZE] __attribute__((aligned(64)));
-static GlobalLongKeySlot g_long_key_cache[256] __attribute__((aligned(64)));
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <unistd.h>
+#elif defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
+#define CJSON_FAST_KEY_MAX_SLOTS 4096
+#define CJSON_LONG_KEY_MAX_SLOTS 256
+#define CJSON_VAL_STR_MAX_SLOTS  512
+#define CJSON_LONG_VAL_MAX_SLOTS 512
+
+static FastKeySlot g_fast_key_cache[CJSON_FAST_KEY_MAX_SLOTS] __attribute__((aligned(64)));
+static GlobalLongKeySlot g_long_key_cache[CJSON_LONG_KEY_MAX_SLOTS] __attribute__((aligned(64)));
 static uint32_t g_key_evict_toggle = 0;
+
+/* Runtime L1D-adaptive index masks (configured once at module import). */
+static uint64_t g_key_cache_mask = 510u;       /* 512 slots (16 KB) default for 32 KB L1D */
+static uint32_t g_val_cache_mask = 127u;       /* 128 slots (4 KB) */
+static uint32_t g_long_val_cache_mask = 127u;  /* 128 slots (2 KB) */
+static uint32_t g_long_key_cache_mask = 62u;   /* 64 slots (1.5 KB) */
+static size_t g_detected_l1d_bytes = 32768;
+
+static size_t cjson_detect_l1d_cache_bytes(void) {
+  const char *env = getenv("CXJSON_L1D_KB");
+  if (env != NULL && env[0] != '\0') {
+    long kb = atol(env);
+    if (kb >= 16 && kb <= 4096) return (size_t)kb * 1024u;
+  }
+#if defined(__APPLE__)
+  size_t l1d = 0;
+  size_t len = sizeof(l1d);
+  if (sysctlbyname("hw.l1dcachesize", &l1d, &len, NULL, 0) == 0 && l1d >= 16384) {
+    return l1d;
+  }
+#elif defined(__linux__)
+#if defined(_SC_LEVEL1_DCACHE_SIZE)
+  long l1d = sysconf(_SC_LEVEL1_DCACHE_SIZE);
+  if (l1d >= 16384) return (size_t)l1d;
+#endif
+  /* Fallback for Linux VMs/containers (AMD/ARM/musl) where sysconf returns 0/-1 */
+  FILE *fp = fopen("/sys/devices/system/cpu/cpu0/cache/index0/size", "r");
+  if (fp != NULL) {
+    unsigned long val = 0;
+    char unit = 0;
+    int matched = fscanf(fp, "%lu%c", &val, &unit);
+    fclose(fp);
+    if (matched >= 1 && val > 0) {
+      size_t bytes = (unit == 'K' || unit == 'k') ? (val * 1024u)
+                   : ((unit == 'M' || unit == 'm') ? (val * 1024u * 1024u) : val);
+      if (bytes >= 16384 && bytes <= 4u * 1024u * 1024u) return bytes;
+    }
+  }
+#elif defined(_WIN32)
+  DWORD buf_len = 0;
+  GetLogicalProcessorInformationEx(RelationCache, NULL, &buf_len);
+  if (buf_len > 0 && buf_len < 65536) {
+    char *buf = (char *)malloc(buf_len);
+    if (buf != NULL) {
+      size_t found = 0;
+      if (GetLogicalProcessorInformationEx(RelationCache, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf, &buf_len)) {
+        DWORD off = 0;
+        while (off < buf_len) {
+          PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX info =
+              (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buf + off);
+          if (info->Relationship == RelationCache && info->Cache.Level == 1 &&
+              (info->Cache.Type == CacheData || info->Cache.Type == CacheUnified) &&
+              info->Cache.CacheSize >= 16384) {
+            found = (size_t)info->Cache.CacheSize;
+            break;
+          }
+          if (info->Size == 0) break;
+          off += info->Size;
+        }
+      }
+      free(buf);
+      if (found > 0) return found;
+    }
+  }
+#endif
+  return 32768;
+}
+
+static void cjson_init_cache_sizing(void) {
+  size_t l1d = cjson_detect_l1d_cache_bytes();
+  g_detected_l1d_bytes = l1d;
+  if (l1d >= 262144) {
+    /* Future >= 256 KB L1D CPUs */
+    g_key_cache_mask = 4096u - 2u;      /* 128 KB */
+    g_val_cache_mask = 512u - 1u;       /* 16 KB */
+    g_long_val_cache_mask = 512u - 1u;  /* 8 KB */
+    g_long_key_cache_mask = 256u - 2u;  /* 6 KB */
+  } else if (l1d >= 131072) {
+    /* 128 KB L1D CPUs (Apple M1/M2/M3/M4, etc.) */
+    g_key_cache_mask = 2048u - 2u;      /* 64 KB */
+    g_val_cache_mask = 256u - 1u;       /* 8 KB */
+    g_long_val_cache_mask = 256u - 1u;  /* 4 KB */
+    g_long_key_cache_mask = 256u - 2u;  /* 6 KB */
+  } else if (l1d >= 49152) {
+    /* 48-64 KB L1D CPUs (Ice Lake/Sapphire Rapids/Zen 5/Graviton) */
+    g_key_cache_mask = 1024u - 2u;      /* 32 KB */
+    g_val_cache_mask = 256u - 1u;       /* 8 KB */
+    g_long_val_cache_mask = 256u - 1u;  /* 4 KB */
+    g_long_key_cache_mask = 128u - 2u;  /* 3 KB */
+  } else {
+    /* 32 KB L1D CPUs (Skylake/Cascade Lake/Zen 2-4) */
+    g_key_cache_mask = 512u - 2u;       /* 16 KB */
+    g_val_cache_mask = 128u - 1u;       /* 4 KB */
+    g_long_val_cache_mask = 128u - 1u;  /* 2 KB */
+    g_long_key_cache_mask = 64u - 2u;   /* 1.5 KB */
+  }
+}
 
 static inline uint64_t wymix64_parts(uint64_t a, uint64_t b, uint32_t len) {
   a ^= 0xA0761D6478BD642FULL;
@@ -85,8 +198,8 @@ static inline PyObject *lookup_or_create_fast_ascii_key15(
     const char *start, uint32_t klen, uint64_t raw_lo, uint64_t raw_hi, Py_hash_t *out_hash) {
   uint64_t k_lo = raw_lo & CJSON_KEY_MASK_LO[klen];
   uint64_t k_hi = (raw_hi & CJSON_KEY_MASK_HI[klen]) | ((uint64_t)klen << 56);
-  uint32_t slot0 = (uint32_t)((((k_lo ^ (k_hi * 0x9E3779B97F4A7C15ULL)) * 0xBF58476D1CE4E5B9ULL) >> 53) &
-                              (uint64_t)(CJSON_KEY_CACHE_SIZE - 2));
+  uint32_t slot0 = (uint32_t)((((k_lo ^ (k_hi * 0x9E3779B97F4A7C15ULL)) * 0xBF58476D1CE4E5B9ULL) >> 52) &
+                              g_key_cache_mask);
   FastKeySlot *s0 = &g_fast_key_cache[slot0];
   FastKeySlot *s1 = s0 + 1;
 
@@ -128,7 +241,7 @@ typedef struct {
   uint64_t _pad;
 } ValStrSlot;
 
-static ValStrSlot g_val_str_cache[CJSON_VAL_STR_CACHE_SIZE] __attribute__((aligned(64)));
+static ValStrSlot g_val_str_cache[CJSON_VAL_STR_MAX_SLOTS] __attribute__((aligned(64)));
 
 /* Caller guarantees 0 <= slen <= 7, pure ASCII, and raw_lo holds bytes 0..7. */
 static inline PyObject *lookup_or_create_fast_ascii_val7(
@@ -144,7 +257,7 @@ static inline PyObject *lookup_or_create_fast_ascii_val7(
   }
   uint64_t k_lo = raw_lo & CJSON_KEY_MASK_LO[slen];
   uint64_t k_hi = (uint64_t)slen << 56;
-  uint32_t slot = (uint32_t)((((k_lo ^ (k_hi * 0x9E3779B97F4A7C15ULL)) * 0xBF58476D1CE4E5B9ULL) >> 56));
+  uint32_t slot = (uint32_t)((((k_lo ^ (k_hi * 0x9E3779B97F4A7C15ULL)) * 0xBF58476D1CE4E5B9ULL) >> 55) & g_val_cache_mask);
   ValStrSlot *s = &g_val_str_cache[slot];
   if (CJSON_LIKELY(s->k_lo == k_lo && s->k_hi == k_hi)) {
     Py_INCREF(s->str);
@@ -166,7 +279,7 @@ static inline PyObject *lookup_or_create_fast_ascii_val15(
     const char *start, uint32_t slen, uint64_t raw_lo, uint64_t raw_hi) {
   uint64_t k_lo = raw_lo;
   uint64_t k_hi = (raw_hi & CJSON_KEY_MASK_HI[slen]) | ((uint64_t)slen << 56);
-  uint32_t slot = (uint32_t)((((k_lo ^ (k_hi * 0x9E3779B97F4A7C15ULL)) * 0xBF58476D1CE4E5B9ULL) >> 56));
+  uint32_t slot = (uint32_t)((((k_lo ^ (k_hi * 0x9E3779B97F4A7C15ULL)) * 0xBF58476D1CE4E5B9ULL) >> 55) & g_val_cache_mask);
   ValStrSlot *s = &g_val_str_cache[slot];
   if (CJSON_LIKELY(s->k_lo == k_lo && s->k_hi == k_hi)) {
     Py_INCREF(s->str);
@@ -183,19 +296,17 @@ static inline PyObject *lookup_or_create_fast_ascii_val15(
   return u;
 }
 
-#define CJSON_LONG_VAL_CACHE_SIZE 256
-
 typedef struct {
   PyObject *str;
   uint64_t hash64;
 } LongValStrSlot;
 
-static LongValStrSlot g_long_val_str_cache[CJSON_LONG_VAL_CACHE_SIZE] __attribute__((aligned(64)));
+static LongValStrSlot g_long_val_str_cache[CJSON_LONG_VAL_MAX_SLOTS] __attribute__((aligned(64)));
 
 /* Direct-mapped cache for repeated 16..48B ASCII string values (URLs, schema types, timestamps). */
 static inline PyObject *lookup_or_create_long_ascii_val(const char *start, uint32_t slen) {
   uint64_t h64 = hash_key_bytes64(start, slen);
-  LongValStrSlot *s = &g_long_val_str_cache[h64 & (CJSON_LONG_VAL_CACHE_SIZE - 1u)];
+  LongValStrSlot *s = &g_long_val_str_cache[h64 & g_long_val_cache_mask];
   if (CJSON_LIKELY(s->str != NULL && s->hash64 == h64 &&
                    (uint32_t)PyUnicode_GET_LENGTH(s->str) == slen &&
                    memcmp(PyUnicode_1BYTE_DATA(s->str), start, slen) == 0)) {
@@ -218,7 +329,7 @@ __attribute__((noinline))
 static PyObject *lookup_or_create_long_ascii_key(
     const char *start, uint32_t klen, Py_hash_t *out_hash) {
   uint64_t h64 = hash_key_bytes64(start, klen);
-  uint32_t slot0 = (uint32_t)(h64 & 254u);
+  uint32_t slot0 = (uint32_t)(h64 & g_long_key_cache_mask);
   GlobalLongKeySlot *s0 = &g_long_key_cache[slot0];
   GlobalLongKeySlot *s1 = s0 + 1;
 

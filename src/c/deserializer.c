@@ -17,12 +17,24 @@ static int g_split_dict_enabled = 1;
 
 #define CJSON_REC_PARSE_DEPTH 64
 
-/* Tiny inline fast-path + noinline GPR SWAR whitespace skipper */
+/* Tiny inline fast-path + noinline SSE2 (x86_64) / GPR SWAR (ARM64) whitespace skipper */
 __attribute__((noinline))
 static const char *skip_ws_slow(const char *p, const char *end) {
   for (;;) {
     if (p < end && *p == '\n') p++;
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#if defined(CJSON_SIMD_SSE2) || defined(CJSON_SIMD_AVX2)
+    const __m128i v_sp = _mm_set1_epi8(' ');
+    while (p + 16 <= end) {
+      __m128i v = _mm_loadu_si128((const __m128i *)p);
+      uint32_t m = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(v, v_sp)) ^ 0xFFFFu;
+      if (m != 0) {
+        p += (unsigned int)cjson_ctz32(m);
+        if (CJSON_LIKELY((uint8_t)*p > 0x20)) return p;
+        break;
+      }
+      p += 16;
+    }
+#elif defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     while (p + 8 <= end) {
       uint64_t w;
       memcpy(&w, p, 8);
@@ -49,6 +61,7 @@ static const char *skip_ws_slow(const char *p, const char *end) {
 
 static inline const char *skip_ws(const char *p, const char *end) {
   if (CJSON_LIKELY(p < end && (uint8_t)*p > 0x20)) return p;
+  if (CJSON_LIKELY(p + 1 < end && *p == ' ' && (uint8_t)p[1] > 0x20)) return p + 1;
   return skip_ws_slow(p, end);
 }
 
@@ -2641,6 +2654,7 @@ int init_deserializer_types(void) {
   verify_split_dict_selfcheck();
 #endif
 #if !defined(Py_GIL_DISABLED)
+  cjson_init_cache_sizing();
   cjson_par_loads_init();
 #endif
   return 0;
