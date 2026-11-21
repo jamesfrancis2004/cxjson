@@ -120,53 +120,35 @@ static inline int parse_up_to_8_digits_swar(const char *p, int max_digits,
   return n;
 }
 
-#if !defined(Py_GIL_DISABLED)
-typedef struct {
-  PyObject *obj;
-  int64_t val;
-} ValIntSlot;
-
-static ValIntSlot g_val_int_cache[256] __attribute__((aligned(64)));
-static uint32_t g_val_int_skip = 0;
-static uint32_t g_val_int_misses = 0;
-
-__attribute__((noinline)) static PyObject *val_int_cache_miss(ValIntSlot *s,
-                                                              int64_t v) {
-  if (++g_val_int_misses >= 16) {
-    g_val_int_skip = 256;
-    g_val_int_misses = 0;
-    return PyLong_FromLongLong((long long)v);
+/* Fast inline 1-digit & 2-digit PyLongObject constructor (avoids PyLong_FromLongLong@PLT). */
+static inline PyObject *cjson_new_pylong_u64(uint64_t mag, int is_neg) {
+#if PY_VERSION_HEX >= 0x030C0000 && PY_VERSION_HEX < 0x030F0000 && \
+    PYLONG_BITS_IN_DIGIT == 30 && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_LIMITED_API) && !defined(PYPY_VERSION)
+  if (CJSON_LIKELY(mag < (1ULL << 30))) {
+    PyLongObject *lo = (PyLongObject *)PyObject_Malloc(
+        offsetof(PyLongObject, long_value.ob_digit) + sizeof(digit));
+    if (CJSON_UNLIKELY(lo == NULL)) return PyErr_NoMemory();
+    Py_SET_REFCNT((PyObject *)lo, 1);
+    Py_SET_TYPE((PyObject *)lo, &PyLong_Type);
+    lo->long_value.lv_tag = ((uintptr_t)1 << _PyLong_NON_SIZE_BITS) | (is_neg ? 2u : 0u);
+    lo->long_value.ob_digit[0] = (digit)mag;
+    return (PyObject *)lo;
   }
-  PyObject *o = PyLong_FromLongLong((long long)v);
-  if (CJSON_UNLIKELY(o == NULL))
-    return NULL;
-  PyObject *prev = s->obj;
-  Py_INCREF(o);
-  s->obj = o;
-  s->val = v;
-  Py_XDECREF(prev);
-  return o;
-}
-
-static inline PyObject *lookup_or_create_val_int(int64_t v) {
-  if (CJSON_UNLIKELY(g_val_int_skip > 0)) {
-    g_val_int_skip--;
-    return PyLong_FromLongLong((long long)v);
+  if (CJSON_LIKELY(mag < (1ULL << 60))) {
+    PyLongObject *lo = (PyLongObject *)PyObject_Malloc(
+        offsetof(PyLongObject, long_value.ob_digit) + 2 * sizeof(digit));
+    if (CJSON_UNLIKELY(lo == NULL)) return PyErr_NoMemory();
+    Py_SET_REFCNT((PyObject *)lo, 1);
+    Py_SET_TYPE((PyObject *)lo, &PyLong_Type);
+    lo->long_value.lv_tag = ((uintptr_t)2 << _PyLong_NON_SIZE_BITS) | (is_neg ? 2u : 0u);
+    lo->long_value.ob_digit[0] = (digit)(mag & PyLong_MASK);
+    lo->long_value.ob_digit[1] = (digit)(mag >> PyLong_SHIFT);
+    return (PyObject *)lo;
   }
-  uint32_t slot = (uint32_t)(((uint64_t)v * 0x9E3779B97F4A7C15ULL) >> 56);
-  ValIntSlot *s = &g_val_int_cache[slot];
-  if (CJSON_LIKELY(s->obj != NULL && s->val == v)) {
-    g_val_int_misses = 0;
-    Py_INCREF(s->obj);
-    return s->obj;
-  }
-  return val_int_cache_miss(s, v);
-}
-#else
-static inline PyObject *lookup_or_create_val_int(int64_t v) {
-  return PyLong_FromLongLong((long long)v);
-}
 #endif
+  return PyLong_FromLongLong(is_neg ? -(long long)mag : (long long)mag);
+}
 
 __attribute__((noinline)) static PyObject *parse_number_slow(JsonParser *jp,
                                                              const char **p_io,
@@ -404,14 +386,14 @@ parse_number(JsonParser *jp, const char **p_io, const char *end) {
         Py_INCREF(v);
         return v;
       }
-      return lookup_or_create_val_int((int64_t)mant);
+      return cjson_new_pylong_u64(mant, 0);
     }
     if (CJSON_LIKELY(mant <= 5)) {
       PyObject *v = g_small_ints[5 - mant];
       Py_INCREF(v);
       return v;
     }
-    return lookup_or_create_val_int(-(int64_t)mant);
+    return cjson_new_pylong_u64(mant, 1);
   }
 
   /* Fast fixed-decimal float path (<= 19 total digits, no exponent) */

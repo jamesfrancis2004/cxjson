@@ -13,6 +13,29 @@ static inline PyObject *make_ascii_str(const char *start, Py_ssize_t len) {
     Py_INCREF(ch);
     return ch;
   }
+#if PY_VERSION_HEX >= 0x030C0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED) && !defined(Py_LIMITED_API) && !defined(PYPY_VERSION)
+  if (CJSON_LIKELY(len <= 4096)) {
+    PyASCIIObject *ascii = (PyASCIIObject *)PyObject_Malloc(sizeof(PyASCIIObject) + (size_t)len + 1u);
+    if (CJSON_UNLIKELY(ascii == NULL)) return PyErr_NoMemory();
+    Py_SET_REFCNT((PyObject *)ascii, 1);
+    Py_SET_TYPE((PyObject *)ascii, &PyUnicode_Type);
+    ascii->length = len;
+    ascii->hash = -1;
+    memset(&ascii->state, 0, sizeof(ascii->state));
+    ascii->state.kind = PyUnicode_1BYTE_KIND;
+    ascii->state.compact = 1;
+    ascii->state.ascii = 1;
+    char *dst = (char *)(ascii + 1);
+    if (CJSON_LIKELY(len <= 16)) {
+      copy_short_ascii(dst, start, (size_t)len);
+    } else {
+      memcpy(dst, start, (size_t)len);
+    }
+    dst[len] = '\0';
+    return (PyObject *)ascii;
+  }
+#endif
   PyObject *u = PyUnicode_New(len, 127);
   if (CJSON_LIKELY(u != NULL)) {
     if (CJSON_LIKELY(len <= 16)) {
