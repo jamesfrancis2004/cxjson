@@ -2678,7 +2678,7 @@ int init_deserializer_types(void) {
       g_ascii_chars[i] = PyUnicode_FromStringAndSize(&c, 1);
       if (g_ascii_chars[i] == NULL) return -1;
     }
-    for (int i = -5; i <= 256; i++) {
+    for (int i = -5; i <= CJSON_SMALL_INT_MAX; i++) {
       g_small_ints[i + 5] = PyLong_FromLong(i);
       if (g_small_ints[i + 5] == NULL) return -1;
     }

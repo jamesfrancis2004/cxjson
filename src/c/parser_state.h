@@ -13,7 +13,8 @@
 static PyObject *g_empty_str = NULL;
 static Py_hash_t g_empty_str_hash = 0;
 static PyObject *g_ascii_chars[128] = {NULL};
-static PyObject *g_small_ints[262] = {NULL};
+#define CJSON_SMALL_INT_MAX 2100
+static PyObject *g_small_ints[CJSON_SMALL_INT_MAX + 6] = {NULL};
 
 #define CJSON_MAX_PARSE_DEPTH 1024
 

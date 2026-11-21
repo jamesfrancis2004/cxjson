@@ -427,7 +427,7 @@ static CJSON_NOINLINE PyObject *cjson_parallel_parse_num_array(const char **p_io
         v = PyFloat_FromDouble(vals[k].d);
       } else {
         int64_t iv = vals[k].i;
-        if (iv >= -5 && iv <= 256) {
+        if (iv >= -5 && iv <= CJSON_SMALL_INT_MAX) {
           v = g_small_ints[iv + 5];
           Py_INCREF(v);
         } else {
