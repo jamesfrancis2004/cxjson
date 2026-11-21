@@ -2269,66 +2269,68 @@ dispatch_item:;
     } else if (c == '[') {
       if (CJSON_UNLIKELY(depth + 1 >= CJSON_REC_PARSE_DEPTH)) {
         val = parse_document_iter(jp, &p, end, depth);
-      } else if (p + 2 < end && (p[1] == '-' || (uint32_t)(p[1] - '0') < 10)) {
-        /* Fast path for tiny 2..4 element numeric arrays ([lon, lat], [x, y, z], etc.) */
+      } else {
+        /* Fast path for tiny 2..3 element numeric arrays ([lon, lat], [ 1.0, 2.0 ], [x, y, z]) */
         const char *q = p + 1;
-        PyObject *v0 = parse_number(jp, &q, end);
-        if (CJSON_UNLIKELY(v0 == NULL)) return NULL;
-        if (CJSON_LIKELY(q < end && *q == ',')) {
-          q++;
-          if (q < end && *q == ' ') q++;
-          if (CJSON_LIKELY(q < end && (*q == '-' || (uint32_t)(*q - '0') < 10))) {
-            PyObject *v1 = parse_number(jp, &q, end);
-            if (CJSON_UNLIKELY(v1 == NULL)) {
-              Py_DECREF(v0);
-              return NULL;
-            }
-            if (CJSON_LIKELY(q < end && *q == ']')) {
-              val = PyList_New(2);
-              if (CJSON_UNLIKELY(val == NULL)) {
+        if (q < end && *q == ' ') q++;
+        if (q < end && (*q == '-' || (uint32_t)(*q - '0') < 10)) {
+          PyObject *v0 = parse_number(jp, &q, end);
+          if (CJSON_UNLIKELY(v0 == NULL)) return NULL;
+          if (CJSON_LIKELY(q < end && *q == ',')) {
+            q++;
+            if (q < end && *q == ' ') q++;
+            if (CJSON_LIKELY(q < end && (*q == '-' || (uint32_t)(*q - '0') < 10))) {
+              PyObject *v1 = parse_number(jp, &q, end);
+              if (CJSON_UNLIKELY(v1 == NULL)) {
                 Py_DECREF(v0);
-                Py_DECREF(v1);
                 return NULL;
               }
-              PyList_SET_ITEM(val, 0, v0);
-              PyList_SET_ITEM(val, 1, v1);
-              p = q + 1;
-              goto push_val;
-            }
-            if (q < end && *q == ',') {
-              q++;
               if (q < end && *q == ' ') q++;
-              if (q < end && (*q == '-' || (uint32_t)(*q - '0') < 10)) {
-                PyObject *v2 = parse_number(jp, &q, end);
-                if (CJSON_UNLIKELY(v2 == NULL)) {
+              if (CJSON_LIKELY(q < end && *q == ']')) {
+                val = PyList_New(2);
+                if (CJSON_UNLIKELY(val == NULL)) {
                   Py_DECREF(v0);
                   Py_DECREF(v1);
                   return NULL;
                 }
-                if (q < end && *q == ']') {
-                  val = PyList_New(3);
-                  if (CJSON_UNLIKELY(val == NULL)) {
+                PyList_SET_ITEM(val, 0, v0);
+                PyList_SET_ITEM(val, 1, v1);
+                p = q + 1;
+                goto push_val;
+              }
+              if (q < end && *q == ',') {
+                q++;
+                if (q < end && *q == ' ') q++;
+                if (q < end && (*q == '-' || (uint32_t)(*q - '0') < 10)) {
+                  PyObject *v2 = parse_number(jp, &q, end);
+                  if (CJSON_UNLIKELY(v2 == NULL)) {
                     Py_DECREF(v0);
                     Py_DECREF(v1);
-                    Py_DECREF(v2);
                     return NULL;
                   }
-                  PyList_SET_ITEM(val, 0, v0);
-                  PyList_SET_ITEM(val, 1, v1);
-                  PyList_SET_ITEM(val, 2, v2);
-                  p = q + 1;
-                  goto push_val;
+                  if (q < end && *q == ' ') q++;
+                  if (q < end && *q == ']') {
+                    val = PyList_New(3);
+                    if (CJSON_UNLIKELY(val == NULL)) {
+                      Py_DECREF(v0);
+                      Py_DECREF(v1);
+                      Py_DECREF(v2);
+                      return NULL;
+                    }
+                    PyList_SET_ITEM(val, 0, v0);
+                    PyList_SET_ITEM(val, 1, v1);
+                    PyList_SET_ITEM(val, 2, v2);
+                    p = q + 1;
+                    goto push_val;
+                  }
+                  Py_DECREF(v2);
                 }
-                Py_DECREF(v2);
               }
+              Py_DECREF(v1);
             }
-            Py_DECREF(v1);
           }
+          Py_DECREF(v0);
         }
-        Py_DECREF(v0);
-        p++;
-        val = parse_array_rec(jp, &p, end, depth + 1, schema_slot);
-      } else {
         p++;
         val = parse_array_rec(jp, &p, end, depth + 1, schema_slot);
       }
