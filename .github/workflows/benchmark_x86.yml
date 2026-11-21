@@ -106,3 +106,44 @@ jobs:
           print("-" * 88)
           print(f"{'GEO-MEAN (MB/s)':<28} {gm(0,de_res):>8.0f} {gm(1,de_res):>8.0f} {gm(2,de_res):>8.0f} {gm(3,de_res):>8.0f} {gm(4,de_res):>8.0f} | {gm(0,de_res)/gm(1,de_res):>8.2f}x")
           EOF
+
+      - name: Run x86_64 1T synthetic benchmark (strings, floats, OPT_SORT_KEYS, OPT_INDENT_2)
+        env:
+          PYTHONPATH: src
+          CXJSON_MAX_THREADS: "1"
+        run: |
+          python - <<'EOF'
+          import random, statistics, string, time
+          import cxjson, orjson
+
+          rng = random.Random(42)
+          rstr = lambda n: "".join(rng.choices(string.ascii_letters + string.digits + " ", k=n))
+          strings_200k = [rstr(rng.randint(5, 50)) for _ in range(200_000)]
+          floats_500k = [rng.random() * 1e6 for _ in range(500_000)]
+          recs_100 = [{
+              "id": i, "name": rstr(12), "email": rstr(8) + "@example.com",
+              "active": rng.random() > 0.5, "score": rng.random() * 1000,
+              "tags": [rstr(5) for _ in range(5)],
+              "address": {"street": rstr(20), "city": rstr(10), "zip": str(rng.randint(10000, 99999))},
+              "notes": None, "balance": rng.randint(-10**9, 10**9),
+          } for i in range(100)]
+
+          def med(fn, rounds=11):
+              fn()
+              ts = []
+              for _ in range(rounds):
+                  t0 = time.perf_counter(); fn(); ts.append(time.perf_counter() - t0)
+              return statistics.median(ts)
+
+          cases = [
+              ("strings array (200k)", lambda: cxjson.dumps(strings_200k), lambda: orjson.dumps(strings_200k)),
+              ("floats array (500k)", lambda: cxjson.dumps(floats_500k), lambda: orjson.dumps(floats_500k)),
+              ("OPT_SORT_KEYS (100 recs)", lambda: cxjson.dumps(recs_100, option=cxjson.OPT_SORT_KEYS), lambda: orjson.dumps(recs_100, option=orjson.OPT_SORT_KEYS)),
+              ("OPT_INDENT_2 (100 recs)", lambda: cxjson.dumps(recs_100, option=cxjson.OPT_INDENT_2), lambda: orjson.dumps(recs_100, option=orjson.OPT_INDENT_2)),
+          ]
+          print("\n=== x86_64 1T SYNTHETIC DUMPS (lower is better) ===")
+          for name, f_cx, f_or in cases:
+              assert f_cx() == f_or(), f"Mismatch on {name}"
+              tc, to = med(f_cx), med(f_or)
+              print(f"{name:<26} cxjson {tc*1e3:7.3f}ms | orjson {to*1e3:7.3f}ms | {to/tc:.2f}x")
+          EOF

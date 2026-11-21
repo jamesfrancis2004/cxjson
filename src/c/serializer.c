@@ -1662,6 +1662,45 @@ static char *encode_array_fast(JsonBuffer *b, char *dst, char **safe_end_p, PyOb
       return dst;
     }
     if (tp0 == &PyUnicode_Type || PyType_FastSubclass(tp0, Py_TPFLAGS_UNICODE_SUBCLASS)) {
+#if !defined(CJSON_NO_SIMD) && defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER)
+      if (len >= 32 && tp0 == &PyUnicode_Type && CJSON_LIKELY(cjson_cpu_has_avx2)) {
+        while (i < len) {
+          if (CJSON_UNLIKELY(dst > safe_end)) {
+            b->len = (Py_ssize_t)(dst - b->data);
+            Py_ssize_t rem = len - i;
+            Py_ssize_t add = (rem < 256) ? (rem * 16 + 128) : 4096;
+            if (json_buffer_grow(b, b->len + add) < 0) {
+              b->depth--;
+              return NULL;
+            }
+            dst = b->data + b->len;
+            safe_end = b->data + b->cap - 128;
+          }
+          dst = cjson_encode_str_array_avx2(items, len, &i, dst, safe_end);
+          if (i >= len) break;
+          if (dst > safe_end) continue;
+          PyObject *item = items[i];
+          if (CJSON_UNLIKELY(Py_TYPE(item) != &PyUnicode_Type)) goto general_loop;
+          dst = emit_str_inline(b, dst, &safe_end, item);
+          if (CJSON_UNLIKELY(dst == NULL)) {
+            b->depth--;
+            return NULL;
+          }
+          *dst++ = ',';
+          i++;
+        }
+        dst[-1] = ']';
+        b->depth--;
+        if (CJSON_UNLIKELY(dst > safe_end)) {
+          b->len = (Py_ssize_t)(dst - b->data);
+          if (json_buffer_grow(b, b->len + 128) < 0) return NULL;
+          dst = b->data + b->len;
+          safe_end = b->data + b->cap - 128;
+        }
+        *safe_end_p = safe_end;
+        return dst;
+      }
+#endif
       for (; i < len; i++) {
         PyObject *item = items[i];
         if (CJSON_UNLIKELY(Py_TYPE(item) != tp0)) goto general_loop;

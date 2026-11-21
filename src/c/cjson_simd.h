@@ -592,7 +592,12 @@ extern cjson_copy_clean_prefix_fn_t cjson_copy_clean_prefix_long_fn;
 extern cjson_find_str_special_fn_t cjson_find_str_special_long_fn;
 extern cjson_escape_chunk_fn_t cjson_escape_chunk_fn;
 extern int cjson_cpu_has_sse41;
+extern int cjson_cpu_has_avx2;
 void cjson_simd_init(void);
+
+#if !defined(CJSON_NO_SIMD) && defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER)
+char *cjson_encode_str_array_avx2(PyObject **items, Py_ssize_t len, Py_ssize_t *i_io, char *dst, char *safe_end);
+#endif
 
 /* Copy clean prefix of src into dst and return clean byte count copied. */
 static inline Py_ssize_t copy_clean_prefix(char *dst, const char *src, Py_ssize_t len) {

@@ -796,6 +796,101 @@ cjson_escape_chunk_fn_t cjson_escape_chunk_fn = escape_chunk_swar;
 #endif
 
 int cjson_cpu_has_sse41 = 0;
+int cjson_cpu_has_avx2 = 0;
+
+#if !defined(CJSON_NO_SIMD) && defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER)
+__attribute__((target("avx2")))
+char *cjson_encode_str_array_avx2(PyObject **items, Py_ssize_t len, Py_ssize_t *i_io, char *dst, char *safe_end) {
+  const __m256i q_22 = _mm256_set1_epi8(0x22);
+  const __m256i q_5c = _mm256_set1_epi8(0x5C);
+  const __m256i q_1f = _mm256_set1_epi8(0x1F);
+  const __m256i zero256 = _mm256_setzero_si256();
+  const __m128i q_22_128 = _mm_set1_epi8(0x22);
+  const __m128i q_5c_128 = _mm_set1_epi8(0x5C);
+  const __m128i q_1f_128 = _mm_set1_epi8(0x1F);
+  const __m128i zero128 = _mm_setzero_si128();
+
+  Py_ssize_t i = *i_io;
+  for (; i < len && dst <= safe_end; i++) {
+    PyObject *item = items[i];
+    if (CJSON_UNLIKELY(Py_TYPE(item) != &PyUnicode_Type || !PyUnicode_IS_COMPACT_ASCII(item))) {
+      break;
+    }
+    Py_ssize_t slen = PyUnicode_GET_LENGTH(item);
+    const char *src = (const char *)PyUnicode_1BYTE_DATA(item);
+    if (CJSON_UNLIKELY(slen == 0)) {
+      dst[0] = '"';
+      dst[1] = '"';
+      dst[2] = ',';
+      dst += 3;
+      continue;
+    }
+    if (slen < 16) {
+      if (slen >= 8) {
+        uint64_t a, b;
+        memcpy(&a, src, 8);
+        memcpy(&b, src + slen - 8, 8);
+        if (CJSON_UNLIKELY((swar_esc(a) | swar_esc(b)) != 0)) break;
+        dst[0] = '"';
+        memcpy(dst + 1, &a, 8);
+        memcpy(dst + 1 + slen - 8, &b, 8);
+        dst[slen + 1] = '"';
+        dst[slen + 2] = ',';
+        dst += slen + 3;
+      } else if (slen >= 4) {
+        uint32_t a, b;
+        memcpy(&a, src, 4);
+        memcpy(&b, src + slen - 4, 4);
+        if (CJSON_UNLIKELY(swar_esc((uint64_t)a | ((uint64_t)b << 32)) != 0)) break;
+        dst[0] = '"';
+        memcpy(dst + 1, &a, 4);
+        memcpy(dst + 1 + slen - 4, &b, 4);
+        dst[slen + 1] = '"';
+        dst[slen + 2] = ',';
+        dst += slen + 3;
+      } else {
+        if (!copy_if_clean_short(dst + 1, src, slen)) break;
+        dst[0] = '"';
+        dst[slen + 1] = '"';
+        dst[slen + 2] = ',';
+        dst += slen + 3;
+      }
+    } else if (slen <= 32) {
+      __m128i v0 = _mm_loadu_si128((const __m128i *)src);
+      __m128i v1 = _mm_loadu_si128((const __m128i *)(src + slen - 16));
+      __m128i m0 = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v0, q_22_128), _mm_cmpeq_epi8(v0, q_5c_128)),
+                                _mm_cmpeq_epi8(_mm_subs_epu8(v0, q_1f_128), zero128));
+      __m128i m1 = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v1, q_22_128), _mm_cmpeq_epi8(v1, q_5c_128)),
+                                _mm_cmpeq_epi8(_mm_subs_epu8(v1, q_1f_128), zero128));
+      if (CJSON_UNLIKELY(_mm_movemask_epi8(_mm_or_si128(m0, m1)) != 0)) break;
+      dst[0] = '"';
+      _mm_storeu_si128((__m128i *)(dst + 1), v0);
+      _mm_storeu_si128((__m128i *)(dst + 1 + slen - 16), v1);
+      dst[slen + 1] = '"';
+      dst[slen + 2] = ',';
+      dst += slen + 3;
+    } else if (slen <= 64) {
+      __m256i v0 = _mm256_loadu_si256((const __m256i *)src);
+      __m256i v1 = _mm256_loadu_si256((const __m256i *)(src + slen - 32));
+      __m256i m0 = _mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi8(v0, q_22), _mm256_cmpeq_epi8(v0, q_5c)),
+                                   _mm256_cmpeq_epi8(_mm256_subs_epu8(v0, q_1f), zero256));
+      __m256i m1 = _mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi8(v1, q_22), _mm256_cmpeq_epi8(v1, q_5c)),
+                                   _mm256_cmpeq_epi8(_mm256_subs_epu8(v1, q_1f), zero256));
+      if (CJSON_UNLIKELY(_mm256_movemask_epi8(_mm256_or_si256(m0, m1)) != 0)) break;
+      dst[0] = '"';
+      _mm256_storeu_si256((__m256i *)(dst + 1), v0);
+      _mm256_storeu_si256((__m256i *)(dst + 1 + slen - 32), v1);
+      dst[slen + 1] = '"';
+      dst[slen + 2] = ',';
+      dst += slen + 3;
+    } else {
+      break;
+    }
+  }
+  *i_io = i;
+  return dst;
+}
+#endif
 
 static int cpu_supports_sse41(void) {
 #if defined(__SSE4_1__)
@@ -818,16 +913,19 @@ void cjson_simd_init(void) {
 #if !defined(CJSON_NO_SIMD) && (defined(__x86_64__) || defined(_M_X64)) && \
     (defined(__AVX512BW__) || defined(__AVX2__) || defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER))
   if (cpu_supports_avx512bw()) {
+    cjson_cpu_has_avx2 = 1;
     /* Use 64B AVX-512BW for read-only scanning, and 32B AVX2 for serialization
      * stores to avoid ZMM turbo-frequency downclocking on cloud Xeon CPUs. */
     cjson_copy_clean_prefix_long_fn = copy_clean_prefix_avx2;
     cjson_find_str_special_long_fn = find_str_special_avx512;
     cjson_escape_chunk_fn = escape_chunk_avx2;
   } else if (cpu_supports_avx2()) {
+    cjson_cpu_has_avx2 = 1;
     cjson_copy_clean_prefix_long_fn = copy_clean_prefix_avx2;
     cjson_find_str_special_long_fn = find_str_special_avx2;
     cjson_escape_chunk_fn = escape_chunk_avx2;
   } else {
+    cjson_cpu_has_avx2 = 0;
     cjson_copy_clean_prefix_long_fn = copy_clean_prefix_sse2;
     cjson_find_str_special_long_fn = find_str_special_sse2;
     cjson_escape_chunk_fn = escape_chunk_sse2;
