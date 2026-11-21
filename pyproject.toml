@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cxjson"
+version = "0.1.0"
+description = "Ultra-fast pure-C JSON library for Python with SIMD, CPython split-table dicts, and adaptive parallelism"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [
+    { name = "James Francis" },
+]
+keywords = ["json", "fast", "simd", "c-extension", "parser", "serializer", "orjson"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: C",
+    "Operating System :: OS Independent",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/jamesfrancis2004/cxjson"
+Repository = "https://github.com/jamesfrancis2004/cxjson"
+Issues = "https://github.com/jamesfrancis2004/cxjson/issues"

@@ -1,0 +1,27 @@
+# Build & compiled artifacts
+build/
+dist/
+*.egg-info/
+*.so
+*.dylib
+*.pyd
+*.o
+*.profraw
+*.profdata
+
+# Python caches & virtualenvs
+__pycache__/
+*.py[cod]
+.venv*/
+venv/
+
+# Editor / IDE files
+.vscode/
+.clangd
+.DS_Store
+
+# Benchmark datasets (73MB) & temporary outputs
+data/
+benchmark_20_datasets.png
+benchmark_speed_and_memory.png
+benchmark_expanded_results.json
