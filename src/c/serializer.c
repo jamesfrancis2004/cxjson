@@ -1081,7 +1081,7 @@ static int json_buffer_append_datetime_fast(JsonBuffer *b, PyObject *obj) {
   return 0;
 }
 
-#if !defined(Py_LIMITED_API) && PY_VERSION_HEX >= 0x030C0000
+#if !defined(Py_LIMITED_API) && !defined(Py_GIL_DISABLED) && PY_VERSION_HEX >= 0x030C0000
 #define CJSON_SLOT_DC_CACHE_SIZE 64
 #define CJSON_SLOT_DC_MAX_FIELDS 32
 
@@ -1245,7 +1245,7 @@ static int json_buffer_append_dataclass_fast(JsonBuffer *b, PyObject *obj) {
   if (dptr != NULL && *dptr != NULL && PyDict_CheckExact(*dptr)) {
     return encode_root_fast(b, *dptr);
   }
-#if PY_VERSION_HEX >= 0x030C0000
+#if !defined(Py_GIL_DISABLED) && PY_VERSION_HEX >= 0x030C0000
   if (dptr == NULL) {
     SlotDataclassCacheEntry *sce = get_slot_dataclass_cache(Py_TYPE(obj));
     if (CJSON_LIKELY(sce != NULL)) {
