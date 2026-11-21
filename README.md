@@ -20,11 +20,11 @@ The result is **`cxjson`**.
 
 ### Headline Results (Apple M2, Python 3.12.3, `orjson 3.13.0`, GC On)
 
-- **1.84× faster `dumps`** and **1.50× faster `loads`** (geo-mean vs `orjson 3.13.0`, interleaved median of 9 runs with Python GC enabled across 8 real-world datasets)
+- **1.92× faster `dumps`** and **1.51× faster `loads`** (geo-mean vs `orjson 3.13.0`, interleaved median of 9 runs with Python GC enabled across 8 real-world datasets)
 - **Up to 25% less retained memory** after `loads()` on repeated-schema JSON payloads (`tracemalloc`, via CPython split-table dicts)
-- **5+ GB/s** adaptive multi-threaded `dumps` on large payloads and **~0.9–1.7 GB/s** `loads`
+- **5+ GB/s** adaptive multi-threaded `dumps` on large payloads and **1.69× faster `loads`** on large flat numeric arrays via two-phase parallel parsing
 - **2.46× faster NumPy serialization** (`OPT_SERIALIZE_NUMPY`, geo-mean across 7 dtypes/shapes on Apple M2; **~1.9×** on single-core x86_64)
-- **1.45× faster `OPT_SORT_KEYS`** than `orjson` via 64-bit prefix-keyed inline sorting
+- **1.70×–1.95× faster `OPT_SORT_KEYS`** than `orjson` via 64-bit prefix-keyed sorting and stack-local zero-sort dict-array caching
 
 ---
 
@@ -32,7 +32,7 @@ The result is **`cxjson`**.
 
 Measured locally on an **Apple M2 (ARM64)** with **Python 3.12.3** and **`orjson 3.13.0`** (interleaved order, GC enabled, median of 9 rounds) across 8 representative real-world JSON datasets (`twitter.json`, `citm_catalog.json`, `canada.json`, `gsoc-2018.json`, `usgs_earthquakes_week.json`, `pypi_numpy.json`, `semanticscholar-corpus.json`, `npm_typescript.json`).
 
-> **Note on x86_64 & single-core environments:** `cxjson` includes runtime-dispatched SSE2, SSE4.1 (`zmij` float formatting), AVX2, and AVX-512BW kernels for x86_64. On single-core x86_64 containers (where adaptive multi-threaded `dumps` does not activate), `cxjson` is typically ~1.0×–1.2× vs `orjson` on `loads` and ~1.0× on `dumps` (and ~1.9× on NumPy). Multi-core machines see the full adaptive `dumps` speedup (configurable via `CXJSON_MAX_THREADS`).
+> **Note on x86_64:** `cxjson` includes runtime-dispatched SSE2, SSE4.1 (`zmij` float formatting), AVX2 (including homogeneous string-array `dumps`), and AVX-512BW kernels for x86_64. On Linux x86_64 (`AMD EPYC 7763`, Python 3.12), `cxjson` measures **1.42× `dumps`** and **1.55× `loads`** vs `orjson` across 6 real-world datasets, and single-threaded (`CXJSON_MAX_THREADS=1`) **1.49×** on 200k string arrays, **1.55×** on 500k float arrays, **1.24×** on `OPT_SORT_KEYS`, and **1.07×** on `OPT_INDENT_2`. Multi-core machines also benefit from adaptive parallel `dumps` and parallel numeric-array `loads` (configurable via `CXJSON_MAX_THREADS`).
 
 #### Serialization (`dumps`) — MB/s (higher is better, Apple M2, Python 3.12.3, GC On)
 
