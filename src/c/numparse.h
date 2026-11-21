@@ -124,13 +124,16 @@ static inline int parse_up_to_8_digits_swar(const char *p, int max_digits,
 static inline PyObject *cjson_new_pylong_u64(uint64_t mag, int is_neg) {
 #if PY_VERSION_HEX >= 0x030C0000 && PY_VERSION_HEX < 0x030F0000 && \
     PYLONG_BITS_IN_DIGIT == 30 && !defined(Py_GIL_DISABLED) && \
-    !defined(Py_LIMITED_API) && !defined(PYPY_VERSION)
+    !defined(Py_LIMITED_API) && !defined(PYPY_VERSION) && \
+    !defined(Py_TRACE_REFS) && !defined(Py_REF_DEBUG)
   if (CJSON_LIKELY(mag < (1ULL << 30))) {
     PyLongObject *lo = (PyLongObject *)PyObject_Malloc(
         offsetof(PyLongObject, long_value.ob_digit) + sizeof(digit));
     if (CJSON_UNLIKELY(lo == NULL)) return PyErr_NoMemory();
-    Py_SET_REFCNT((PyObject *)lo, 1);
-    Py_SET_TYPE((PyObject *)lo, &PyLong_Type);
+    /* Must assign ob_refcnt directly (NOT Py_SET_REFCNT, which skips writes
+     * if uninitialized memory happens to look immortal!). */
+    ((PyObject *)lo)->ob_refcnt = 1;
+    ((PyObject *)lo)->ob_type = &PyLong_Type;
     lo->long_value.lv_tag = ((uintptr_t)1 << _PyLong_NON_SIZE_BITS) | (is_neg ? 2u : 0u);
     lo->long_value.ob_digit[0] = (digit)mag;
     return (PyObject *)lo;
@@ -139,8 +142,8 @@ static inline PyObject *cjson_new_pylong_u64(uint64_t mag, int is_neg) {
     PyLongObject *lo = (PyLongObject *)PyObject_Malloc(
         offsetof(PyLongObject, long_value.ob_digit) + 2 * sizeof(digit));
     if (CJSON_UNLIKELY(lo == NULL)) return PyErr_NoMemory();
-    Py_SET_REFCNT((PyObject *)lo, 1);
-    Py_SET_TYPE((PyObject *)lo, &PyLong_Type);
+    ((PyObject *)lo)->ob_refcnt = 1;
+    ((PyObject *)lo)->ob_type = &PyLong_Type;
     lo->long_value.lv_tag = ((uintptr_t)2 << _PyLong_NON_SIZE_BITS) | (is_neg ? 2u : 0u);
     lo->long_value.ob_digit[0] = (digit)(mag & PyLong_MASK);
     lo->long_value.ob_digit[1] = (digit)(mag >> PyLong_SHIFT);

@@ -14,12 +14,13 @@ static inline PyObject *make_ascii_str(const char *start, Py_ssize_t len) {
     return ch;
   }
 #if PY_VERSION_HEX >= 0x030C0000 && PY_VERSION_HEX < 0x030F0000 && \
-    !defined(Py_GIL_DISABLED) && !defined(Py_LIMITED_API) && !defined(PYPY_VERSION)
+    !defined(Py_GIL_DISABLED) && !defined(Py_LIMITED_API) && !defined(PYPY_VERSION) && \
+    !defined(Py_TRACE_REFS) && !defined(Py_REF_DEBUG)
   if (CJSON_LIKELY(len <= 4096)) {
     PyASCIIObject *ascii = (PyASCIIObject *)PyObject_Malloc(sizeof(PyASCIIObject) + (size_t)len + 1u);
     if (CJSON_UNLIKELY(ascii == NULL)) return PyErr_NoMemory();
-    Py_SET_REFCNT((PyObject *)ascii, 1);
-    Py_SET_TYPE((PyObject *)ascii, &PyUnicode_Type);
+    ((PyObject *)ascii)->ob_refcnt = 1;
+    ((PyObject *)ascii)->ob_type = &PyUnicode_Type;
     ascii->length = len;
     ascii->hash = -1;
     memset(&ascii->state, 0, sizeof(ascii->state));
