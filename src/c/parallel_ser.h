@@ -379,6 +379,7 @@ typedef struct {
   Py_ssize_t start;
   Py_ssize_t end;
   RawSerBuf out;
+  char *copy_dst;
   int failed;
 } ParTask;
 
@@ -390,6 +391,7 @@ typedef struct {
   int pool_started;
   int active_workers;
   int done_count;
+  int phase;
   uint64_t generation;
   ParTask tasks[CJSON_MAX_WORKERS];
 } ParPool;
@@ -460,10 +462,18 @@ static void par_worker_loop(int wid) {
     }
     seen_gen = g_par_pool.generation;
     int run = (wid <= g_par_pool.active_workers);
+    int phase = g_par_pool.phase;
     cjson_mutex_unlock(&g_par_pool.mu);
 
     if (run) {
-      par_run_task(&g_par_pool.tasks[wid]);
+      if (phase == 0) {
+        par_run_task(&g_par_pool.tasks[wid]);
+      } else {
+        ParTask *t = &g_par_pool.tasks[wid];
+        if (t->out.len > 0) {
+          memcpy(t->copy_dst, t->out.data, t->out.len);
+        }
+      }
       cjson_mutex_lock(&g_par_pool.mu);
       g_par_pool.done_count++;
       if (g_par_pool.done_count == g_par_pool.active_workers) {
@@ -604,10 +614,11 @@ static int cjson_parallel_encode_slices(
   }
   if (actual <= 1) return 0;
 
-  /* Dispatch workers 1..actual-1 */
+  /* Dispatch workers 1..actual-1 (phase 0: encode) */
   cjson_mutex_lock(&g_par_pool.mu);
   g_par_pool.active_workers = actual - 1;
   g_par_pool.done_count = 0;
+  g_par_pool.phase = 0;
   g_par_pool.generation++;
   cjson_cond_broadcast(&g_par_pool.cv_work);
   cjson_mutex_unlock(&g_par_pool.mu);
@@ -633,9 +644,36 @@ static int cjson_parallel_encode_slices(
   if (json_buffer_reserve(b, (Py_ssize_t)total_bytes + 2) < 0) return -1;
   char *dst = b->data + b->len;
   *dst++ = is_dict ? '{' : '[';
-  for (int t = 0; t < actual; t++) {
-    memcpy(dst, g_par_pool.tasks[t].out.data, g_par_pool.tasks[t].out.len);
-    dst += g_par_pool.tasks[t].out.len;
+  if (total_bytes >= 6 * 1024 * 1024 && actual >= 2) {
+    /* Parallel stitch directly into PyBytesObject for >= 6MB payloads */
+    char *cur_dst = dst;
+    for (int t = 0; t < actual; t++) {
+      g_par_pool.tasks[t].copy_dst = cur_dst;
+      cur_dst += g_par_pool.tasks[t].out.len;
+    }
+    cjson_mutex_lock(&g_par_pool.mu);
+    g_par_pool.active_workers = actual - 1;
+    g_par_pool.done_count = 0;
+    g_par_pool.phase = 1;
+    g_par_pool.generation++;
+    cjson_cond_broadcast(&g_par_pool.cv_work);
+    cjson_mutex_unlock(&g_par_pool.mu);
+
+    if (g_par_pool.tasks[0].out.len > 0) {
+      memcpy(g_par_pool.tasks[0].copy_dst, g_par_pool.tasks[0].out.data, g_par_pool.tasks[0].out.len);
+    }
+
+    cjson_mutex_lock(&g_par_pool.mu);
+    while (g_par_pool.done_count < g_par_pool.active_workers) {
+      cjson_cond_wait(&g_par_pool.cv_done, &g_par_pool.mu);
+    }
+    cjson_mutex_unlock(&g_par_pool.mu);
+    dst = cur_dst;
+  } else {
+    for (int t = 0; t < actual; t++) {
+      memcpy(dst, g_par_pool.tasks[t].out.data, g_par_pool.tasks[t].out.len);
+      dst += g_par_pool.tasks[t].out.len;
+    }
   }
   dst[-1] = is_dict ? '}' : ']';
   b->len = (Py_ssize_t)(dst - b->data);
