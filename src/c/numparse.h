@@ -392,7 +392,7 @@ static inline PyObject *parse_number(JsonParser *jp, const char **p_io, const ch
 
   /* Clinger's fast path: mant < 2^53 and -22 <= exp10 <= 22 is guaranteed
    * bit-exact under IEEE-754 round-to-nearest-even in one FP op. */
-  if (CJSON_LIKELY(mant < (1ULL << 53) && exp10 >= -22 && exp10 <= 22)) {
+  if (mant < (1ULL << 53) && exp10 >= -22 && exp10 <= 22) {
     double d = (exp10 < 0) ? ((double)mant / POW10_DBL[-exp10])
                            : ((double)mant * POW10_DBL[exp10]);
     if (is_neg) d = -d;

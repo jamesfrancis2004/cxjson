@@ -2334,6 +2334,7 @@ dispatch_item:;
   after_item:;
     if (CJSON_LIKELY(p < end && *p == ',')) {
       p++;
+      if (p < end && *p == ' ') p++;
       if (p < end && (uint8_t)*p > 0x20 && *p != ']') {
         continue;
       }

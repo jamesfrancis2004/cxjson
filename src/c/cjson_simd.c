@@ -799,9 +799,11 @@ void cjson_simd_init(void) {
 #if !defined(CJSON_NO_SIMD) && (defined(__x86_64__) || defined(_M_X64)) && \
     (defined(__AVX512BW__) || defined(__AVX2__) || defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER))
   if (cpu_supports_avx512bw()) {
-    cjson_copy_clean_prefix_long_fn = copy_clean_prefix_avx512;
+    /* Use 64B AVX-512BW for read-only scanning, and 32B AVX2 for serialization
+     * stores to avoid ZMM turbo-frequency downclocking on cloud Xeon CPUs. */
+    cjson_copy_clean_prefix_long_fn = copy_clean_prefix_avx2;
     cjson_find_str_special_long_fn = find_str_special_avx512;
-    cjson_escape_chunk_fn = escape_chunk_avx512;
+    cjson_escape_chunk_fn = escape_chunk_avx2;
   } else if (cpu_supports_avx2()) {
     cjson_copy_clean_prefix_long_fn = copy_clean_prefix_avx2;
     cjson_find_str_special_long_fn = find_str_special_avx2;
