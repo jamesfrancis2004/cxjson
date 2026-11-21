@@ -188,6 +188,59 @@ print("|".join(digests))
     assert out_mt == out_st, f"Parallel vs 1T mismatch:\nMT={out_mt}\nST={out_st}"
 
 
+def test_parallel_loads_numeric_arrays_and_errors():
+    script = """
+import hashlib, random, cxjson
+rng = random.Random(77)
+payloads = [
+    cxjson.dumps([rng.uniform(-1e6, 1e6) for _ in range(100_000)]),
+    cxjson.dumps([rng.randint(-10**12, 10**12) for _ in range(100_000)]),
+    cxjson.dumps([i if i % 2 == 0 else i + 0.25 for i in range(100_000)]),
+]
+digests = [hashlib.sha256(cxjson.dumps(cxjson.loads(p))).hexdigest() for p in payloads]
+# Also verify bytearray and memoryview inputs
+assert cxjson.loads(bytearray(payloads[0])) == cxjson.loads(payloads[0])
+assert cxjson.loads(memoryview(payloads[1])) == cxjson.loads(payloads[1])
+print("|".join(digests))
+"""
+    env_mt = os.environ.copy()
+    env_mt.pop("CXJSON_MAX_THREADS", None)
+    env_st = os.environ.copy()
+    env_st["CXJSON_MAX_THREADS"] = "1"
+
+    out_mt = subprocess.check_output([sys.executable, "-c", script], env=env_mt, text=True).strip()
+    out_st = subprocess.check_output([sys.executable, "-c", script], env=env_st, text=True).strip()
+    assert out_mt == out_st, f"Parallel loads vs 1T mismatch:\nMT={out_mt}\nST={out_st}"
+
+    # Malformed >256KB numeric arrays must cleanly fall back and raise JSONDecodeError
+    big_valid = b"[" + b",".join(b"123456" for _ in range(60_000))
+    for bad in (
+        big_valid + b",]",
+        big_valid + b",01]",
+        big_valid + b",NaN]",
+    ):
+        try:
+            cxjson.loads(bad)
+            raise AssertionError("Expected JSONDecodeError for malformed large numeric array")
+        except cxjson.JSONDecodeError:
+            pass
+
+    # Verify fork() safety after parallel loads
+    if hasattr(os, "fork"):
+        big_arr = big_valid + b"]"
+        assert len(cxjson.loads(big_arr)) == 60_000
+        pid = os.fork()
+        if pid == 0:
+            try:
+                res = cxjson.loads(big_arr)
+                os._exit(0 if len(res) == 60_000 and res[-1] == 123456 else 1)
+            except Exception:
+                os._exit(2)
+        else:
+            _, status = os.waitpid(pid, 0)
+            assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, f"Child failed: {status}"
+
+
 if __name__ == "__main__":
     test_split_dict_gc_cycles_and_tracking()
     print("PASS: test_split_dict_gc_cycles_and_tracking")
@@ -197,4 +250,6 @@ if __name__ == "__main__":
     print("PASS: test_float_fuzz_exactness")
     test_parallel_vs_single_threaded_identical()
     print("PASS: test_parallel_vs_single_threaded_identical")
+    test_parallel_loads_numeric_arrays_and_errors()
+    print("PASS: test_parallel_loads_numeric_arrays_and_errors")
     print("\nALL v0.1.1 REGRESSION TESTS PASSED!")

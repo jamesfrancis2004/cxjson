@@ -52,6 +52,10 @@ static inline const char *skip_ws(const char *p, const char *end) {
   return skip_ws_slow(p, end);
 }
 
+#if !defined(Py_GIL_DISABLED)
+#include "parallel_loads.h"
+#endif
+
 static const int8_t HEX_LUT[256] = {
     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
@@ -2165,6 +2169,16 @@ dispatch_item:;
 
     /* Tight homogeneous inner loop for number arrays */
     if (c == '-' || (uint32_t)(c - '0') < 10) {
+#if !defined(Py_GIL_DISABLED)
+      if (CJSON_UNLIKELY(jp->item_sp == base && (end - p) >= 256 * 1024)) {
+        PyObject *par_list = cjson_parallel_parse_num_array(&p, end);
+        if (par_list != NULL) {
+          *p_io = p;
+          return par_list;
+        }
+        if (CJSON_UNLIKELY(PyErr_Occurred())) return NULL;
+      }
+#endif
       size_t sp = jp->item_sp;
       size_t cap = jp->item_cap;
       PyObject **items = jp->items;
@@ -2617,6 +2631,9 @@ int init_deserializer_types(void) {
   if (JSONDecodeError == NULL) return -1;
 #if defined(CJSON_SPLIT_DICT_FAST)
   verify_split_dict_selfcheck();
+#endif
+#if !defined(Py_GIL_DISABLED)
+  cjson_par_loads_init();
 #endif
   return 0;
 }
