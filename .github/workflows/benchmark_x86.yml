@@ -1,0 +1,108 @@
+name: Benchmark x86_64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bench-x86:
+    name: Linux x86_64 Benchmark
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: System & CPU info
+        run: |
+          lscpu | grep -E "Model name|CPU\(s\)|Flags" | head -n 5
+          python --version
+
+      - name: Install dependencies & build cxjson
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install orjson msgspec ujson
+          python setup.py build_ext --inplace
+
+      - name: Download real-world benchmark datasets
+        run: |
+          mkdir -p data
+          curl -sSL -o data/twitter.json https://raw.githubusercontent.com/simdjson/simdjson-data/master/jsonexamples/twitter.json
+          curl -sSL -o data/citm_catalog.json https://raw.githubusercontent.com/simdjson/simdjson-data/master/jsonexamples/citm_catalog.json
+          curl -sSL -o data/canada.json https://raw.githubusercontent.com/simdjson/simdjson-data/master/jsonexamples/canada.json
+          curl -sSL -o data/gsoc-2018.json https://raw.githubusercontent.com/simdjson/simdjson-data/master/jsonexamples/gsoc-2018.json
+          curl -sSL -o data/usgs_earthquakes_week.json https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_week.geojson
+          curl -sSL -o data/pypi_numpy.json https://pypi.org/pypi/numpy/json
+          ls -lh data/
+
+      - name: Run x86_64 benchmark (cxjson vs orjson vs msgspec vs ujson vs stdlib)
+        env:
+          PYTHONPATH: src
+        run: |
+          python - <<'EOF'
+          import gc, json, math, os, statistics, time
+          import cxjson, orjson, msgspec, ujson
+
+          FILES = [
+              "twitter.json",
+              "citm_catalog.json",
+              "canada.json",
+              "gsoc-2018.json",
+              "usgs_earthquakes_week.json",
+              "pypi_numpy.json",
+          ]
+
+          def bench(fn, nbytes, iters=15):
+              fn()
+              ts = []
+              for _ in range(iters):
+                  t0 = time.perf_counter()
+                  fn()
+                  ts.append(time.perf_counter() - t0)
+              return (nbytes / 1048576.0) / statistics.median(ts)
+
+          enc_msg = msgspec.json.Encoder()
+          dec_msg = msgspec.json.Decoder()
+          ser_res, de_res = [], []
+
+          print("\n=== x86_64 SERIALIZE (dumps) — MB/s (higher is better) ===")
+          print(f"{'Dataset':<28} {'cxjson':>8} {'orjson':>8} {'msgspec':>8} {'ujson':>8} {'stdlib':>8} | {'vs orjson':>9}")
+          print("-" * 88)
+          for name in FILES:
+              raw = open(f"data/{name}", "rb").read()
+              obj = cxjson.loads(raw)
+              assert obj == orjson.loads(raw), f"mismatch on {name}"
+              out_len = len(cxjson.dumps(obj))
+              gc.collect()
+              cx = bench(lambda: cxjson.dumps(obj), out_len)
+              oj = bench(lambda: orjson.dumps(obj), out_len)
+              ms = bench(lambda: enc_msg.encode(obj), out_len)
+              uj = bench(lambda: ujson.dumps(obj), out_len)
+              py = bench(lambda: json.dumps(obj), out_len, iters=5)
+              ser_res.append((cx, oj, ms, uj, py))
+              print(f"{name:<28} {cx:>8.0f} {oj:>8.0f} {ms:>8.0f} {uj:>8.0f} {py:>8.0f} | {cx/oj:>8.2f}x")
+
+          gm = lambda idx, rows: math.exp(sum(math.log(r[idx]) for r in rows) / len(rows))
+          print("-" * 88)
+          print(f"{'GEO-MEAN (MB/s)':<28} {gm(0,ser_res):>8.0f} {gm(1,ser_res):>8.0f} {gm(2,ser_res):>8.0f} {gm(3,ser_res):>8.0f} {gm(4,ser_res):>8.0f} | {gm(0,ser_res)/gm(1,ser_res):>8.2f}x")
+
+          print("\n=== x86_64 DESERIALIZE (loads) — MB/s (higher is better) ===")
+          print(f"{'Dataset':<28} {'cxjson':>8} {'orjson':>8} {'msgspec':>8} {'ujson':>8} {'stdlib':>8} | {'vs orjson':>9}")
+          print("-" * 88)
+          for name in FILES:
+              raw = open(f"data/{name}", "rb").read()
+              gc.collect()
+              cx = bench(lambda: cxjson.loads(raw), len(raw))
+              oj = bench(lambda: orjson.loads(raw), len(raw))
+              ms = bench(lambda: dec_msg.decode(raw), len(raw))
+              uj = bench(lambda: ujson.loads(raw), len(raw))
+              py = bench(lambda: json.loads(raw), len(raw), iters=7)
+              de_res.append((cx, oj, ms, uj, py))
+              print(f"{name:<28} {cx:>8.0f} {oj:>8.0f} {ms:>8.0f} {uj:>8.0f} {py:>8.0f} | {cx/oj:>8.2f}x")
+
+          print("-" * 88)
+          print(f"{'GEO-MEAN (MB/s)':<28} {gm(0,de_res):>8.0f} {gm(1,de_res):>8.0f} {gm(2,de_res):>8.0f} {gm(3,de_res):>8.0f} {gm(4,de_res):>8.0f} | {gm(0,de_res)/gm(1,de_res):>8.2f}x")
+          EOF
