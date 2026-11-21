@@ -674,6 +674,81 @@ static int verify_serializer_selfcheck(void) {
   return 0;
 }
 
+/* Pure read-only exact datetime/date serializer (no tz.utcoffset() calls, thread-safe).
+ * Returns pointer after closing quote, or NULL if fallback is needed. */
+static inline char *write_datetime_exact_fast(char *dst, PyObject *obj) {
+  if (PyDateTime_CheckExact(obj)) {
+    PyObject *tz = PyDateTime_DATE_GET_TZINFO(obj);
+    if (CJSON_UNLIKELY(tz != NULL && tz != Py_None && tz != PyDateTime_TimeZone_UTC)) {
+      return NULL;
+    }
+    int year = PyDateTime_GET_YEAR(obj);
+    int month = PyDateTime_GET_MONTH(obj);
+    int day = PyDateTime_GET_DAY(obj);
+    *dst++ = '"';
+    if (CJSON_LIKELY(year >= 1000 && year <= 9999)) {
+      memcpy(dst, &DIGIT_PAIRS[(year / 100) * 2], 2);
+      memcpy(dst + 2, &DIGIT_PAIRS[(year % 100) * 2], 2);
+      dst += 4;
+    } else {
+      dst += write_u32(dst, (uint32_t)year);
+    }
+    *dst++ = '-';
+    memcpy(dst, &DIGIT_PAIRS[month * 2], 2);
+    dst[2] = '-';
+    memcpy(dst + 3, &DIGIT_PAIRS[day * 2], 2);
+    dst[5] = 'T';
+    dst += 6;
+    int hour = PyDateTime_DATE_GET_HOUR(obj);
+    int minute = PyDateTime_DATE_GET_MINUTE(obj);
+    int second = PyDateTime_DATE_GET_SECOND(obj);
+    int microsecond = PyDateTime_DATE_GET_MICROSECOND(obj);
+    memcpy(dst, &DIGIT_PAIRS[hour * 2], 2);
+    dst[2] = ':';
+    memcpy(dst + 3, &DIGIT_PAIRS[minute * 2], 2);
+    dst[5] = ':';
+    memcpy(dst + 6, &DIGIT_PAIRS[second * 2], 2);
+    dst += 8;
+    if (microsecond > 0) {
+      *dst++ = '.';
+      uint32_t a = (uint32_t)microsecond / 10000;
+      uint32_t rem = (uint32_t)microsecond - a * 10000;
+      uint32_t b_part = rem / 100;
+      uint32_t c = rem - b_part * 100;
+      memcpy(dst, &DIGIT_PAIRS[a * 2], 2);
+      memcpy(dst + 2, &DIGIT_PAIRS[b_part * 2], 2);
+      memcpy(dst + 4, &DIGIT_PAIRS[c * 2], 2);
+      dst += 6;
+    }
+    if (tz == PyDateTime_TimeZone_UTC) {
+      memcpy(dst, "+00:00", 6);
+      dst += 6;
+    }
+    *dst++ = '"';
+    return dst;
+  }
+  if (PyDate_CheckExact(obj)) {
+    int year = PyDateTime_GET_YEAR(obj);
+    int month = PyDateTime_GET_MONTH(obj);
+    int day = PyDateTime_GET_DAY(obj);
+    *dst++ = '"';
+    if (CJSON_LIKELY(year >= 1000 && year <= 9999)) {
+      memcpy(dst, &DIGIT_PAIRS[(year / 100) * 2], 2);
+      memcpy(dst + 2, &DIGIT_PAIRS[(year % 100) * 2], 2);
+      dst += 4;
+    } else {
+      dst += write_u32(dst, (uint32_t)year);
+    }
+    *dst++ = '-';
+    memcpy(dst, &DIGIT_PAIRS[month * 2], 2);
+    dst[2] = '-';
+    memcpy(dst + 3, &DIGIT_PAIRS[day * 2], 2);
+    dst[5] = '"';
+    return dst + 6;
+  }
+  return NULL;
+}
+
 #include "parallel_ser.h"
 
 static inline const char *cjson_get_str_utf8(PyObject *obj, Py_ssize_t *out_len) {
@@ -1854,6 +1929,8 @@ static Py_ssize_t estimate_elem_bytes_o1(PyObject *obj, int depth_left) {
   if (tp == &PyUnicode_Type) return PyUnicode_GET_LENGTH(obj) + 4;
   if (tp == &PyBool_Type || obj == Py_None) return 6;
   if ((PyObject *)tp == g_uuid_type) return 38;
+  if (PyDateTime_CheckExact(obj)) return 34;
+  if (PyDate_CheckExact(obj)) return 14;
   if (tp == &PyList_Type || tp == &PyTuple_Type) {
     Py_ssize_t n = PySequence_Fast_GET_SIZE(obj);
     if (n == 0) return 2;
@@ -2112,6 +2189,34 @@ static char *encode_array_fast(JsonBuffer *b, char *dst, char **safe_end_p, PyOb
           PyObject *item = items[i];
           if (CJSON_UNLIKELY((PyObject *)Py_TYPE(item) != g_uuid_type)) goto general_loop;
           char *next = write_uuid_exact_fast(dst, item);
+          if (CJSON_UNLIKELY(next == NULL)) goto general_loop;
+          dst = next;
+          *dst++ = ',';
+        }
+      }
+      dst[-1] = ']';
+      b->depth--;
+      *safe_end_p = safe_end;
+      return dst;
+    }
+    if (PyDate_CheckExact(items[0]) || PyDateTime_CheckExact(items[0])) {
+      while (i < len) {
+        Py_ssize_t rem = len - i;
+        Py_ssize_t chunk = (rem > 64) ? 64 : rem;
+        if (CJSON_UNLIKELY(dst + chunk * 40 + 128 > b->data + b->cap)) {
+          b->len = (Py_ssize_t)(dst - b->data);
+          if (json_buffer_grow(b, b->len + chunk * 40 + 256) < 0) {
+            b->depth--;
+            return NULL;
+          }
+          dst = b->data + b->len;
+          safe_end = b->data + b->cap - 128;
+        }
+        Py_ssize_t end_i = i + chunk;
+        for (; i < end_i; i++) {
+          PyObject *item = items[i];
+          if (CJSON_UNLIKELY(Py_TYPE(item) != tp0)) goto general_loop;
+          char *next = write_datetime_exact_fast(dst, item);
           if (CJSON_UNLIKELY(next == NULL)) goto general_loop;
           dst = next;
           *dst++ = ',';

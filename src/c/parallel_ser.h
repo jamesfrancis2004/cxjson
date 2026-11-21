@@ -361,6 +361,7 @@ static char *raw_encode_val(RawSerBuf *rb, char *dst, char **safe_end_p, PyObjec
   if (tp == &PyDict_Type) return raw_encode_dict(rb, dst, safe_end_p, obj, depth, kc);
   if (tp == &PyList_Type || tp == &PyTuple_Type) return raw_encode_array(rb, dst, safe_end_p, obj, depth, kc);
   if ((PyObject *)tp == g_uuid_type) return write_uuid_exact_fast(dst, obj);
+  if (PyDateTime_CheckExact(obj) || PyDate_CheckExact(obj)) return write_datetime_exact_fast(dst, obj);
   return NULL;
 }
 
@@ -1028,6 +1029,7 @@ static char *raw_encode_val_opts(RawSerBuf *rb, char *dst, char **safe_end_p,
   if (tp == &PyDict_Type) return raw_encode_dict_opts(rb, dst, safe_end_p, obj, depth, opts, indent_level, kc, sc);
   if (tp == &PyList_Type || tp == &PyTuple_Type) return raw_encode_array_opts(rb, dst, safe_end_p, obj, depth, opts, indent_level, kc, sc);
   if ((PyObject *)tp == g_uuid_type) return write_uuid_exact_fast(dst, obj);
+  if (PyDateTime_CheckExact(obj) || PyDate_CheckExact(obj)) return write_datetime_exact_fast(dst, obj);
   return NULL;
 }
 
