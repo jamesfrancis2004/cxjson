@@ -23,6 +23,7 @@ wheel:
 # Run the test suite
 test: build
 	PYTHONPATH=src $(PYTHON) tests/test_serializer.py
+	PYTHONPATH=src $(PYTHON) tests/test_memory_leaks.py
 	PYTHONPATH=src $(PYTHON) tests/test_orjson_compatibility.py
 	PYTHONPATH=src $(PYTHON) tests/test_conformance_fuzz.py
 
