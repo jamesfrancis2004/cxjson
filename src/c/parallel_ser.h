@@ -373,6 +373,32 @@ static const char RAW_INDENT_SEP[66] =
 static const char RAW_INDENT_NL[65] =
     "\n                                                                ";
 
+static inline char *raw_emit_indent_sep(char *dst, size_t sep_len) {
+  if (CJSON_LIKELY(sep_len <= 16)) {
+    memcpy(dst, RAW_INDENT_SEP, 16);
+    return dst + sep_len;
+  }
+  if (CJSON_LIKELY(sep_len <= 32)) {
+    memcpy(dst, RAW_INDENT_SEP, 32);
+    return dst + sep_len;
+  }
+  memcpy(dst, RAW_INDENT_SEP, sep_len);
+  return dst + sep_len;
+}
+
+static inline char *raw_emit_indent_nl(char *dst, size_t nl_len) {
+  if (CJSON_LIKELY(nl_len <= 16)) {
+    memcpy(dst, RAW_INDENT_NL, 16);
+    return dst + nl_len;
+  }
+  if (CJSON_LIKELY(nl_len <= 32)) {
+    memcpy(dst, RAW_INDENT_NL, 32);
+    return dst + nl_len;
+  }
+  memcpy(dst, RAW_INDENT_NL, nl_len);
+  return dst + nl_len;
+}
+
 typedef struct {
   uint64_t prefix;
   const char *utf8;
@@ -497,8 +523,7 @@ static char *raw_encode_array_opts(RawSerBuf *rb, char *dst, char **safe_end_p,
       safe_end = rb->data + rb->cap - 128;
     }
     *dst++ = '[';
-    memcpy(dst, RAW_INDENT_NL, sep_len - 1);
-    dst += sep_len - 1;
+    dst = raw_emit_indent_nl(dst, sep_len - 1);
   } else {
     *dst++ = '[';
   }
@@ -519,8 +544,7 @@ static char *raw_encode_array_opts(RawSerBuf *rb, char *dst, char **safe_end_p,
       }
       if (i > 0) {
         if (indent) {
-          memcpy(dst, RAW_INDENT_SEP, sep_len);
-          dst += sep_len;
+          dst = raw_emit_indent_sep(dst, sep_len);
         } else {
           *dst++ = ',';
         }
@@ -547,8 +571,7 @@ static char *raw_encode_array_opts(RawSerBuf *rb, char *dst, char **safe_end_p,
       }
       if (i > 0) {
         if (indent) {
-          memcpy(dst, RAW_INDENT_SEP, sep_len);
-          dst += sep_len;
+          dst = raw_emit_indent_sep(dst, sep_len);
         } else {
           *dst++ = ',';
         }
@@ -569,8 +592,7 @@ gen:;
     }
     if (i > 0) {
       if (indent) {
-        memcpy(dst, RAW_INDENT_SEP, sep_len);
-        dst += sep_len;
+        dst = raw_emit_indent_sep(dst, sep_len);
         if (CJSON_UNLIKELY(dst > safe_end)) {
           size_t cur = (size_t)(dst - rb->data);
           if (raw_buf_grow(rb, cur + 4096) < 0) return NULL;
@@ -593,9 +615,7 @@ close_arr:;
     safe_end = rb->data + rb->cap - 128;
   }
   if (indent) {
-    size_t close_len = (size_t)(1 + indent_level * 2);
-    memcpy(dst, RAW_INDENT_NL, close_len);
-    dst += close_len;
+    dst = raw_emit_indent_nl(dst, (size_t)(1 + indent_level * 2));
   }
   *dst++ = ']';
   *safe_end_p = safe_end;
@@ -628,8 +648,7 @@ static char *raw_encode_dict_opts(RawSerBuf *rb, char *dst, char **safe_end_p,
       safe_end = rb->data + rb->cap - 128;
     }
     *dst++ = '{';
-    memcpy(dst, RAW_INDENT_NL, sep_len - 1);
-    dst += sep_len - 1;
+    dst = raw_emit_indent_nl(dst, sep_len - 1);
 
     PyObject *key, *dval;
     Py_ssize_t pos = 0;
@@ -642,8 +661,7 @@ static char *raw_encode_dict_opts(RawSerBuf *rb, char *dst, char **safe_end_p,
         safe_end = rb->data + rb->cap - 128;
       }
       if (idx++ > 0) {
-        memcpy(dst, RAW_INDENT_SEP, sep_len);
-        dst += sep_len;
+        dst = raw_emit_indent_sep(dst, sep_len);
         if (CJSON_UNLIKELY(dst > safe_end)) {
           size_t cur = (size_t)(dst - rb->data);
           if (raw_buf_grow(rb, cur + 1024) < 0) return NULL;
@@ -692,9 +710,7 @@ static char *raw_encode_dict_opts(RawSerBuf *rb, char *dst, char **safe_end_p,
       dst = rb->data + cur;
       safe_end = rb->data + rb->cap - 128;
     }
-    size_t close_len = (size_t)(1 + indent_level * 2);
-    memcpy(dst, RAW_INDENT_NL, close_len);
-    dst += close_len;
+    dst = raw_emit_indent_nl(dst, (size_t)(1 + indent_level * 2));
     *dst++ = '}';
     *safe_end_p = safe_end;
     return dst;
@@ -884,8 +900,7 @@ static char *raw_encode_dict_opts(RawSerBuf *rb, char *dst, char **safe_end_p,
   }
   *dst++ = '{';
   if (indent) {
-    memcpy(dst, RAW_INDENT_NL, sep_len - 1);
-    dst += sep_len - 1;
+    dst = raw_emit_indent_nl(dst, sep_len - 1);
   }
 
   for (Py_ssize_t i = 0; i < cnt; i++) {
@@ -900,8 +915,7 @@ static char *raw_encode_dict_opts(RawSerBuf *rb, char *dst, char **safe_end_p,
     }
     if (i > 0) {
       if (indent) {
-        memcpy(dst, RAW_INDENT_SEP, sep_len);
-        dst += sep_len;
+        dst = raw_emit_indent_sep(dst, sep_len);
         if (CJSON_UNLIKELY(dst > safe_end)) {
           size_t cur = (size_t)(dst - rb->data);
           if (raw_buf_grow(rb, cur + 1024) < 0) {
@@ -980,9 +994,7 @@ static char *raw_encode_dict_opts(RawSerBuf *rb, char *dst, char **safe_end_p,
     safe_end = rb->data + rb->cap - 128;
   }
   if (indent) {
-    size_t close_len = (size_t)(1 + indent_level * 2);
-    memcpy(dst, RAW_INDENT_NL, close_len);
-    dst += close_len;
+    dst = raw_emit_indent_nl(dst, (size_t)(1 + indent_level * 2));
   }
   *dst++ = '}';
   *safe_end_p = safe_end;
@@ -1101,8 +1113,7 @@ static void par_run_task_opts(ParTask *t) {
           dst = rb->data + cur;
           safe_end = rb->data + rb->cap - 128;
         }
-        memcpy(dst, RAW_INDENT_SEP, sep_len);
-        dst += sep_len;
+        dst = raw_emit_indent_sep(dst, sep_len);
         if (CJSON_UNLIKELY(dst > safe_end)) {
           size_t cur = (size_t)(dst - rb->data);
           if (raw_buf_grow(rb, cur + 4096) < 0) { t->failed = 1; return; }
@@ -1135,8 +1146,7 @@ static void par_run_task_opts(ParTask *t) {
           dst = rb->data + cur;
           safe_end = rb->data + rb->cap - 128;
         }
-        memcpy(dst, RAW_INDENT_SEP, sep_len);
-        dst += sep_len;
+        dst = raw_emit_indent_sep(dst, sep_len);
         if (CJSON_UNLIKELY(dst > safe_end)) {
           size_t cur = (size_t)(dst - rb->data);
           if (raw_buf_grow(rb, cur + 4096) < 0) { t->failed = 1; return; }

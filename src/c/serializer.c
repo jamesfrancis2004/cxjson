@@ -3866,6 +3866,16 @@ static const char CJSON_INDENT_NL[65] =
 static inline char *emit_indent_open_fast(
     JsonBuffer *b, char *dst, char **safe_end_p, char open_ch, int level) {
   Py_ssize_t spaces = (Py_ssize_t)level * 2;
+  if (CJSON_LIKELY(level <= 7)) {
+    *dst++ = open_ch;
+    memcpy(dst, CJSON_INDENT_NL, 16);
+    return dst + 1 + spaces;
+  }
+  if (CJSON_LIKELY(level <= 15)) {
+    *dst++ = open_ch;
+    memcpy(dst, CJSON_INDENT_NL, 32);
+    return dst + 1 + spaces;
+  }
   if (CJSON_LIKELY(level <= 32)) {
     *dst++ = open_ch;
     memcpy(dst, CJSON_INDENT_NL, (size_t)(1 + spaces));
@@ -3887,6 +3897,14 @@ static inline char *emit_indent_open_fast(
 static inline char *emit_indent_sep_fast(
     JsonBuffer *b, char *dst, char **safe_end_p, int level) {
   Py_ssize_t spaces = (Py_ssize_t)level * 2;
+  if (CJSON_LIKELY(level <= 7)) {
+    memcpy(dst, CJSON_INDENT_SEP, 16);
+    return dst + 2 + spaces;
+  }
+  if (CJSON_LIKELY(level <= 15)) {
+    memcpy(dst, CJSON_INDENT_SEP, 32);
+    return dst + 2 + spaces;
+  }
   if (CJSON_LIKELY(level <= 32)) {
     memcpy(dst, CJSON_INDENT_SEP, (size_t)(2 + spaces));
     return dst + 2 + spaces;
@@ -3907,6 +3925,16 @@ static inline char *emit_indent_sep_fast(
 static inline char *emit_indent_close_fast(
     JsonBuffer *b, char *dst, char **safe_end_p, char close_ch, int level) {
   Py_ssize_t spaces = (Py_ssize_t)level * 2;
+  if (CJSON_LIKELY(level <= 7)) {
+    memcpy(dst, CJSON_INDENT_NL, 16);
+    dst[1 + spaces] = close_ch;
+    return dst + 2 + spaces;
+  }
+  if (CJSON_LIKELY(level <= 15)) {
+    memcpy(dst, CJSON_INDENT_NL, 32);
+    dst[1 + spaces] = close_ch;
+    return dst + 2 + spaces;
+  }
   if (CJSON_LIKELY(level <= 32)) {
     memcpy(dst, CJSON_INDENT_NL, (size_t)(1 + spaces));
     dst += 1 + spaces;
@@ -5185,6 +5213,23 @@ static int encode_root_opts_fast(SerializeContext *ctx, PyObject *obj) {
   return json_encode_opts(ctx, obj);
 }
 
+/* Keep 12KB SortSchemaCache off c_json_dumps()'s stack frame */
+static CJSON_NOINLINE int encode_root_opts_entry(JsonBuffer *b, PyObject *obj, PyObject *default_fn, int opts) {
+  SerializeContext ctx = {b, default_fn, opts, 0, NULL};
+  if ((opts & OPT_SORT_KEYS) && default_fn == NULL) {
+    PyTypeObject *rtp = Py_TYPE(obj);
+    if ((rtp == &PyList_Type && PyList_GET_SIZE(obj) >= 4) ||
+        (rtp == &PyTuple_Type && PyTuple_GET_SIZE(obj) >= 4) ||
+        (rtp == &PyDict_Type && PyDict_GET_SIZE(obj) >= 16)) {
+      SortSchemaCache sort_cache;
+      sort_schema_cache_init(&sort_cache);
+      ctx.sort_cache = &sort_cache;
+      return encode_root_opts_fast(&ctx, obj);
+    }
+  }
+  return encode_root_opts_fast(&ctx, obj);
+}
+
 /* ========================================================================= */
 /* Public Module Entry Point                                                 */
 /* ========================================================================= */
@@ -5320,18 +5365,7 @@ PyObject *c_json_dumps(PyObject *self, PyObject *const *args, Py_ssize_t nargs, 
         return NULL;
       }
     } else {
-      SortSchemaCache sort_cache;
-      SerializeContext ctx = {&b, default_fn, opts, 0, NULL};
-      if ((opts & OPT_SORT_KEYS) && default_fn == NULL) {
-        PyTypeObject *rtp = Py_TYPE(obj);
-        if ((rtp == &PyList_Type && PyList_GET_SIZE(obj) >= 4) ||
-            (rtp == &PyTuple_Type && PyTuple_GET_SIZE(obj) >= 4) ||
-            (rtp == &PyDict_Type && PyDict_GET_SIZE(obj) >= 16)) {
-          sort_schema_cache_init(&sort_cache);
-          ctx.sort_cache = &sort_cache;
-        }
-      }
-      if (encode_root_opts_fast(&ctx, obj) < 0) {
+      if (encode_root_opts_entry(&b, obj, default_fn, opts) < 0) {
         json_buffer_free(&b);
         return NULL;
       }

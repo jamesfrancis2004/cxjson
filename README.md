@@ -20,11 +20,11 @@ The result is **`cxjson`**.
 
 ### Headline Results (Apple M2, Python 3.12.3, `orjson 3.13.0`, GC On)
 
-- **1.92× faster `dumps`** and **1.51× faster `loads`** (geo-mean vs `orjson 3.13.0`, interleaved median of 9 runs with Python GC enabled across 8 real-world datasets)
+- **1.99× faster `dumps`** and **1.53× faster `loads`** (geo-mean vs `orjson 3.13.0`, interleaved median of 9 runs with Python GC enabled across 8 real-world datasets)
 - **Up to 25% less retained memory** after `loads()` on repeated-schema JSON payloads (`tracemalloc`, via CPython split-table dicts)
-- **5+ GB/s** adaptive multi-threaded `dumps` on large payloads and **1.69× faster `loads`** on large flat numeric arrays via two-phase parallel parsing
-- **2.46× faster NumPy serialization** (`OPT_SERIALIZE_NUMPY`, geo-mean across 7 dtypes/shapes on Apple M2; **~1.9×** on single-core x86_64)
-- **1.70×–1.95× faster `OPT_SORT_KEYS`** than `orjson` via 64-bit prefix-keyed sorting and stack-local zero-sort dict-array caching
+- **5+ GB/s** adaptive multi-threaded `dumps` (including `OPT_SORT_KEYS` and `OPT_INDENT_2`) on large payloads and **1.69× faster `loads`** on large flat numeric arrays via two-phase parallel parsing
+- **2.40× faster NumPy serialization** (`OPT_SERIALIZE_NUMPY`, geo-mean across 7 dtypes/shapes on Apple M2; **~2.0×** on single-core x86_64)
+- **1.4×–4.2× faster `OPT_SORT_KEYS` & `OPT_INDENT_2`** and **4.4×–5.5× faster `UUID` serialization** on Apple M2
 
 ---
 
@@ -32,35 +32,35 @@ The result is **`cxjson`**.
 
 Measured locally on an **Apple M2 (ARM64)** with **Python 3.12.3** and **`orjson 3.13.0`** (interleaved order, GC enabled, median of 9 rounds) across 8 representative real-world JSON datasets (`twitter.json`, `citm_catalog.json`, `canada.json`, `gsoc-2018.json`, `usgs_earthquakes_week.json`, `pypi_numpy.json`, `semanticscholar-corpus.json`, `npm_typescript.json`).
 
-> **Note on x86_64:** `cxjson` includes runtime-dispatched SSE2, SSE4.1 (`zmij` float formatting), AVX2 (including homogeneous string-array `dumps`), and AVX-512BW kernels for x86_64. On Linux x86_64 (`AMD EPYC 7763`, Python 3.12), `cxjson` measures **1.42× `dumps`** and **1.55× `loads`** vs `orjson` across 6 real-world datasets, and single-threaded (`CXJSON_MAX_THREADS=1`) **1.49×** on 200k string arrays, **1.55×** on 500k float arrays, **1.24×** on `OPT_SORT_KEYS`, and **1.07×** on `OPT_INDENT_2`. Multi-core machines also benefit from adaptive parallel `dumps` and parallel numeric-array `loads` (configurable via `CXJSON_MAX_THREADS`).
+> **Note on x86_64:** `cxjson` includes runtime-dispatched SSE2, SSE4.1 (`zmij` float formatting), AVX2 (including homogeneous string-array `dumps`), and AVX-512BW kernels for x86_64. On **single-core** Linux x86_64, `cxjson` is roughly at parity with `orjson` on typical JSON (~1.0–1.05×), while winning clearly on repeated-schema `loads` (1.1–1.2×), `OPT_SORT_KEYS` (~1.35×), NumPy (~2.0×), and retained memory (~1.3–1.5× lower). Multi-core x86_64 machines (`AMD EPYC 7763`) additionally benefit from adaptive parallel `dumps` and parallel numeric-array `loads` (~1.42× `dumps` / ~1.55× `loads`, configurable via `CXJSON_MAX_THREADS`).
 
 #### Serialization (`dumps`) — MB/s (higher is better, Apple M2, Python 3.12.3, GC On)
 
 | Dataset | Size | **`cxjson`** | `orjson 3.13.0` | Speedup |
 |---|---:|---:|---:|---:|
-| `twitter.json` | 0.45 MB | **2,829** | 2,231 | **1.27×** |
-| `citm_catalog.json` | 0.48 MB | **1,805** | 1,299 | **1.39×** |
-| `canada.json` | 1.99 MB | **2,147** | 1,097 | **1.96×** |
-| `gsoc-2018.json` | 2.93 MB | **3,190** | 2,973 | **1.07×** |
-| `usgs_earthquakes_week.json` | 1.28 MB | **3,477** | 1,192 | **2.92×** |
-| `pypi_numpy.json` | 3.61 MB | **2,487** | 2,107 | **1.18×** |
-| `semanticscholar-corpus.json` | 8.19 MB | **5,332** | 1,752 | **3.04×** |
-| `npm_typescript.json` | 15.22 MB | **5,179** | 1,506 | **3.44×** |
-| **Geo-Mean** | — | — | — | **1.84×** |
+| `twitter.json` | 0.47 MB | **3,205** | 2,428 | **1.32×** |
+| `citm_catalog.json` | 0.50 MB | **1,637** | 1,288 | **1.27×** |
+| `canada.json` | 2.09 MB | **1,954** | 1,070 | **1.83×** |
+| `gsoc-2018.json` | 3.07 MB | **4,245** | 3,702 | **1.15×** |
+| `usgs_earthquakes_week.json` | 1.34 MB | **4,646** | 1,287 | **3.61×** |
+| `pypi_numpy.json` | 3.79 MB | **3,699** | 2,214 | **1.67×** |
+| `semanticscholar-corpus.json` | 8.59 MB | **5,861** | 1,799 | **3.26×** |
+| `npm_typescript.json` | 15.96 MB | **5,003** | 1,420 | **3.52×** |
+| **Geo-Mean** | — | — | — | **1.99×** |
 
 #### Deserialization (`loads`) — MB/s (higher is better, Apple M2, Python 3.12.3, GC On)
 
 | Dataset | Size | **`cxjson`** | `orjson 3.13.0` | Speedup |
 |---|---:|---:|---:|---:|
-| `twitter.json` | 0.60 MB | **889** | 694 | **1.28×** |
-| `citm_catalog.json` | 1.65 MB | **839** | 704 | **1.19×** |
-| `canada.json` | 2.15 MB | **388** | 348 | **1.12×** |
-| `gsoc-2018.json` | 3.17 MB | **1,669** | 1,108 | **1.51×** |
-| `usgs_earthquakes_week.json` | 1.28 MB | **737** | 350 | **2.11×** |
-| `pypi_numpy.json` | 3.61 MB | **1,202** | 658 | **1.83×** |
-| `semanticscholar-corpus.json` | 8.20 MB | **673** | 410 | **1.64×** |
-| `npm_typescript.json` | 15.22 MB | **622** | 388 | **1.60×** |
-| **Geo-Mean** | — | — | — | **1.50×** |
+| `twitter.json` | 0.63 MB | **815** | 586 | **1.39×** |
+| `citm_catalog.json` | 1.73 MB | **894** | 710 | **1.26×** |
+| `canada.json` | 2.25 MB | **386** | 357 | **1.08×** |
+| `gsoc-2018.json` | 3.33 MB | **1,794** | 1,093 | **1.64×** |
+| `usgs_earthquakes_week.json` | 1.34 MB | **816** | 448 | **1.82×** |
+| `pypi_numpy.json` | 3.79 MB | **1,376** | 665 | **2.07×** |
+| `semanticscholar-corpus.json` | 8.59 MB | **742** | 471 | **1.57×** |
+| `npm_typescript.json` | 15.96 MB | **663** | 415 | **1.59×** |
+| **Geo-Mean** | — | — | — | **1.53×** |
 
 ---
 
