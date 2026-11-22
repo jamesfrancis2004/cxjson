@@ -228,6 +228,9 @@ static inline uint32_t a64_ldrh_idx_lsl1(int rt, int rn, int rm) {
 static inline uint32_t a64_ldur_x(int rt, int rn, int32_t simm9) {
   return 0xF8400000u | (((uint32_t)simm9 & 0x1FFu) << 12) | ((uint32_t)rn << 5) | (uint32_t)rt;
 }
+static inline uint32_t a64_ldur_w(int rt, int rn, int32_t simm9) {
+  return 0xB8400000u | (((uint32_t)simm9 & 0x1FFu) << 12) | ((uint32_t)rn << 5) | (uint32_t)rt;
+}
 static inline uint32_t a64_ldurh(int rt, int rn, int32_t simm9) {
   return 0x78400000u | (((uint32_t)simm9 & 0x1FFu) << 12) | ((uint32_t)rn << 5) | (uint32_t)rt;
 }
@@ -957,8 +960,8 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
   }
   int single_row_check = (total_row_need <= 1024u);
 
-  uint32_t tmp_code[2048];
-  Arm64Asm a = {tmp_code, 0, 2048};
+  uint32_t tmp_code[3072];
+  Arm64Asm a = {tmp_code, 0, 3072};
 
   /* Prologue */
   a64_emit(&a, 0xA9800000u | (0x74u << 15) | (30u << 10) | (31u << 5) | 29u);
@@ -1111,13 +1114,87 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
     a64_emit(&a, a64_add_imm(22, 13, (uint16_t)offsetof(CJsonSerDictKeysObject, dk_indices)));
     a64_emit(&a, a64_add_reg(22, 22, 11));
 
-    /* Verify every key pointer matches expected_keys[j] (guarantees exact order & zero tombstones since ma_used == dk_nentries) */
+    /* Verify every key matches expected_keys[j]:
+     * Fast path: 1-cycle pointer equality (ep[j].me_key == expected_keys[j]).
+     * Fallback (for non-interned keys from DB drivers / separate json.loads() calls):
+     *   inline compact-ASCII + length + compile-time byte comparison for keys <= 16B.
+     * (dk_kind == 1 guarantees every me_key is exact PyUnicode_Type.) */
+    uint32_t ascii_st = cjson_jit_get_ascii_state();
     for (uint32_t j = 0; j < n; j++) {
-      a64_emit(&a, a64_ldr_uoff(10, 22, j * 16u)); /* ep[j].me_key */
+      a64_emit(&a, a64_ldr_uoff(10, 22, j * 16u)); /* X10 = ep[j].me_key */
       a64_load_u64(&a, 11, (uint64_t)(uintptr_t)expected_keys[j]);
       a64_emit(&a, a64_cmp_reg(10, 11));
-      done_patches[n_done++] = a.len;
-      a64_emit(&a, a64_b_cond(1, 0));
+      uint32_t raw_klen = (klen[j] >= 4u) ? (uint32_t)(klen[j] - 4u) : 0u;
+      if (ascii_st != 0 && raw_klen >= 1u && raw_klen <= 16u) {
+        const char *rk = kbuf + koff[j] + 2u;
+        size_t br_key_ok = a.len;
+        a64_emit(&a, a64_b_cond(0, 0)); /* B.EQ key_ok */
+        /* Inline byte-equality fallback */
+        a64_emit(&a, a64_ldr_w_uoff(11, 10, (uint32_t)offsetof(PyASCIIObject, state)));
+        a64_emit(&a, a64_bic_w_imm3(11, 11));
+        a64_emit(&a, a64_cmp_w_imm(11, (uint16_t)ascii_st));
+        done_patches[n_done++] = a.len;
+        a64_emit(&a, a64_b_cond(1, 0)); /* B.NE done */
+        a64_emit(&a, a64_ldr_uoff(11, 10, (uint32_t)offsetof(PyASCIIObject, length)));
+        a64_emit(&a, a64_cmp_x_imm(11, (uint16_t)raw_klen));
+        done_patches[n_done++] = a.len;
+        a64_emit(&a, a64_b_cond(1, 0)); /* B.NE done */
+        int32_t dbase = (int32_t)sizeof(PyASCIIObject);
+        if (raw_klen >= 8u) {
+          uint64_t w0, w1;
+          memcpy(&w0, rk, 8);
+          a64_emit(&a, a64_ldur_x(11, 10, dbase));
+          a64_load_u64(&a, 12, w0);
+          a64_emit(&a, a64_cmp_reg(11, 12));
+          done_patches[n_done++] = a.len;
+          a64_emit(&a, a64_b_cond(1, 0));
+          if (raw_klen > 8u) {
+            memcpy(&w1, rk + raw_klen - 8u, 8);
+            a64_emit(&a, a64_ldur_x(11, 10, dbase + (int32_t)(raw_klen - 8u)));
+            a64_load_u64(&a, 12, w1);
+            a64_emit(&a, a64_cmp_reg(11, 12));
+            done_patches[n_done++] = a.len;
+            a64_emit(&a, a64_b_cond(1, 0));
+          }
+        } else if (raw_klen >= 4u) {
+          uint32_t w0, w1;
+          memcpy(&w0, rk, 4);
+          a64_emit(&a, a64_ldur_w(11, 10, dbase));
+          a64_load_u64(&a, 12, (uint64_t)w0);
+          a64_emit(&a, a64_cmp_w_reg(11, 12));
+          done_patches[n_done++] = a.len;
+          a64_emit(&a, a64_b_cond(1, 0));
+          if (raw_klen > 4u) {
+            memcpy(&w1, rk + raw_klen - 4u, 4);
+            a64_emit(&a, a64_ldur_w(11, 10, dbase + (int32_t)(raw_klen - 4u)));
+            a64_load_u64(&a, 12, (uint64_t)w1);
+            a64_emit(&a, a64_cmp_w_reg(11, 12));
+            done_patches[n_done++] = a.len;
+            a64_emit(&a, a64_b_cond(1, 0));
+          }
+        } else {
+          if (raw_klen >= 2u) {
+            uint16_t w0;
+            memcpy(&w0, rk, 2);
+            a64_emit(&a, a64_ldurh(11, 10, dbase));
+            a64_emit(&a, a64_movz(12, w0, 0));
+            a64_emit(&a, a64_cmp_w_reg(11, 12));
+            done_patches[n_done++] = a.len;
+            a64_emit(&a, a64_b_cond(1, 0));
+          }
+          if (raw_klen & 1u) {
+            uint32_t boff = raw_klen - 1u;
+            a64_emit(&a, a64_ldurb(11, 10, dbase + (int32_t)boff));
+            a64_emit(&a, a64_cmp_w_imm(11, (uint8_t)rk[boff]));
+            done_patches[n_done++] = a.len;
+            a64_emit(&a, a64_b_cond(1, 0));
+          }
+        }
+        a.buf[br_key_ok] = a64_b_cond(0, (int32_t)(a.len - br_key_ok));
+      } else {
+        done_patches[n_done++] = a.len;
+        a64_emit(&a, a64_b_cond(1, 0));
+      }
     }
   }
 

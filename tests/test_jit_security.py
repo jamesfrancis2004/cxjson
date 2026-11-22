@@ -144,8 +144,33 @@ def test_concurrent_compile_and_execute():
     print("PASS: test_concurrent_compile_and_execute (8 threads, 120 schemas)")
 
 
+def test_non_interned_combined_keys():
+    # Force distinct (non-interned) PyUnicodeObject key pointers on every row across lengths 1..17
+    base_keys = ["a", "ab", "abc", "abcd", "abcde", "abcdefg", "abcdefgh", "abcdefghi", "0123456789abcdef", "0123456789abcdefg"]
+    rows = []
+    for i in range(60):
+        # Fresh str allocation per row via decode("ascii") so pointers differ from row 0
+        d = {k.encode("ascii").decode("ascii") + "": (i if idx % 3 == 0 else (f"val_{i:04d}_padding_long_enough_for_simd" if idx % 3 == 1 else (i & 1) == 0))
+             for idx, k in enumerate(base_keys)}
+        rows.append(d)
+    # Verify keys actually have distinct pointers for len >= 2
+    assert len({id(list(r.keys())[3]) for r in rows}) > 10
+    expected = json.dumps(rows, separators=(",", ":")).encode("utf-8")
+    assert cxjson.dumps(rows) == expected
+
+    # Adversarial: row 35 has a same-length key with 1 differing byte ("abce" instead of "abcd")
+    rows_mut = [dict(r) for r in rows]
+    bad = {}
+    for k, v in rows_mut[35].items():
+        bad["abce" if k == "abcd" else k] = v
+    rows_mut[35] = bad
+    assert cxjson.dumps(rows_mut) == json.dumps(rows_mut, separators=(",", ":")).encode("utf-8")
+    print("PASS: test_non_interned_combined_keys (distinct ptrs len 1..17 + 1-byte diff guard)")
+
+
 if __name__ == "__main__":
     test_buffer_boundaries_and_edge_values()
     test_differential_fuzz_vs_no_jit()
     test_concurrent_compile_and_execute()
+    test_non_interned_combined_keys()
     print("\nALL JIT SECURITY & CONCURRENCY TESTS PASSED!")
