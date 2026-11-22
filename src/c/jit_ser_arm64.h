@@ -88,7 +88,12 @@ static char *cjson_jit_emit_str(JsonBuffer *b, char *dst, char **safe_end_p, PyO
     dst = cjson_jit_grow_min(b, dst, safe_end_p, 4096);
     if (dst == NULL) return NULL;
   }
-  return emit_str_inline(b, dst, safe_end_p, val);
+  dst = emit_str_inline(b, dst, safe_end_p, val);
+  if (CJSON_UNLIKELY(dst == NULL)) return NULL;
+  if (CJSON_UNLIKELY(dst + 1024 > *safe_end_p)) {
+    dst = cjson_jit_grow_min(b, dst, safe_end_p, 4096);
+  }
+  return dst;
 }
 
 __attribute__((noinline))
@@ -100,13 +105,18 @@ static char *cjson_jit_encode_dict(JsonBuffer *b, char *dst, char **safe_end_p, 
   if (CJSON_UNLIKELY(b->depth >= CJSON_REC_SER_DEPTH)) {
     b->len = (Py_ssize_t)(dst - b->data);
     if (encode_fast_iter(b, dval) < 0) return NULL;
-    if (CJSON_UNLIKELY(b->len + 128 > b->cap)) {
-      if (json_buffer_grow(b, b->len + 256) < 0) return NULL;
+    if (CJSON_UNLIKELY(b->len + 1280 > b->cap)) {
+      if (json_buffer_grow(b, b->len + 4096) < 0) return NULL;
     }
     *safe_end_p = b->data + b->cap - 128;
     return b->data + b->len;
   }
-  return encode_dict_fast(b, dst, safe_end_p, dval);
+  dst = encode_dict_fast(b, dst, safe_end_p, dval);
+  if (CJSON_UNLIKELY(dst == NULL)) return NULL;
+  if (CJSON_UNLIKELY(dst + 1024 > *safe_end_p)) {
+    dst = cjson_jit_grow_min(b, dst, safe_end_p, 4096);
+  }
+  return dst;
 }
 
 __attribute__((noinline))
@@ -118,13 +128,18 @@ static char *cjson_jit_encode_array(JsonBuffer *b, char *dst, char **safe_end_p,
   if (CJSON_UNLIKELY(b->depth >= CJSON_REC_SER_DEPTH)) {
     b->len = (Py_ssize_t)(dst - b->data);
     if (encode_fast_iter(b, dval) < 0) return NULL;
-    if (CJSON_UNLIKELY(b->len + 128 > b->cap)) {
-      if (json_buffer_grow(b, b->len + 256) < 0) return NULL;
+    if (CJSON_UNLIKELY(b->len + 1280 > b->cap)) {
+      if (json_buffer_grow(b, b->len + 4096) < 0) return NULL;
     }
     *safe_end_p = b->data + b->cap - 128;
     return b->data + b->len;
   }
-  return encode_array_fast(b, dst, safe_end_p, dval);
+  dst = encode_array_fast(b, dst, safe_end_p, dval);
+  if (CJSON_UNLIKELY(dst == NULL)) return NULL;
+  if (CJSON_UNLIKELY(dst + 1024 > *safe_end_p)) {
+    dst = cjson_jit_grow_min(b, dst, safe_end_p, 4096);
+  }
+  return dst;
 }
 
 __attribute__((noinline))
@@ -134,9 +149,18 @@ static char *cjson_jit_encode_any(JsonBuffer *b, char *dst, char **safe_end_p, P
     if (dst == NULL) return NULL;
   }
   PyTypeObject *vtp = Py_TYPE(dval);
-  if (vtp == &PyUnicode_Type) return emit_str_inline(b, dst, safe_end_p, dval);
-  if (vtp == &PyLong_Type) return write_py_long(dst, dval);
-  if (vtp == &PyFloat_Type) return cjson_jit_write_double(PyFloat_AS_DOUBLE(dval), dst);
+  if (vtp == &PyUnicode_Type) return cjson_jit_emit_str(b, dst, safe_end_p, dval);
+  if (vtp == &PyLong_Type) {
+    dst = write_py_long(dst, dval);
+    if (CJSON_UNLIKELY(dst == NULL)) return NULL;
+    if (CJSON_UNLIKELY(dst + 1024 > *safe_end_p)) dst = cjson_jit_grow_min(b, dst, safe_end_p, 4096);
+    return dst;
+  }
+  if (vtp == &PyFloat_Type) {
+    dst = cjson_jit_write_double(PyFloat_AS_DOUBLE(dval), dst);
+    if (CJSON_UNLIKELY(dst + 1024 > *safe_end_p)) dst = cjson_jit_grow_min(b, dst, safe_end_p, 4096);
+    return dst;
+  }
   if (dval == Py_None) { memcpy(dst, "null", 4); return dst + 4; }
   if (vtp == &PyBool_Type) {
     if (dval == Py_True) { memcpy(dst, "true", 4); return dst + 4; }
@@ -152,8 +176,8 @@ static char *cjson_jit_encode_any(JsonBuffer *b, char *dst, char **safe_end_p, P
   }
   b->len = (Py_ssize_t)(dst - b->data);
   if (json_encode_slow(b, dval) < 0) return NULL;
-  if (CJSON_UNLIKELY(b->len + 128 > b->cap)) {
-    if (json_buffer_grow(b, b->len + 256) < 0) return NULL;
+  if (CJSON_UNLIKELY(b->len + 1280 > b->cap)) {
+    if (json_buffer_grow(b, b->len + 4096) < 0) return NULL;
   }
   *safe_end_p = b->data + b->cap - 128;
   return b->data + b->len;
@@ -269,8 +293,26 @@ static inline uint32_t a64_cbz(int rt, int32_t rel_insns) {
 static inline uint32_t a64_cbnz(int rt, int32_t rel_insns) {
   return 0xB5000000u | (((uint32_t)rel_insns & 0x7FFFFu) << 5) | (uint32_t)rt;
 }
+static inline uint32_t a64_cbnz_w(int rt, int32_t rel_insns) {
+  return 0x35000000u | (((uint32_t)rel_insns & 0x7FFFFu) << 5) | (uint32_t)rt;
+}
+static inline uint32_t a64_tbz_w(int rt, uint32_t bit, int32_t rel_insns) {
+  return 0x36000000u | ((bit & 31u) << 19) | (((uint32_t)rel_insns & 0x3FFFu) << 5) | (uint32_t)rt;
+}
+static inline uint32_t a64_bl(int32_t rel_insns) {
+  return 0x94000000u | ((uint32_t)rel_insns & 0x3FFFFFFu);
+}
 static inline uint32_t a64_blr(int rn) {
   return 0xD63F0000u | ((uint32_t)rn << 5);
+}
+static inline uint32_t a64_udiv_w(int rd, int rn, int rm) {
+  return 0x1AC00800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd;
+}
+static inline uint32_t a64_msub_w(int rd, int rn, int rm, int ra) {
+  return 0x1B008000u | ((uint32_t)rm << 16) | ((uint32_t)ra << 10) | ((uint32_t)rn << 5) | (uint32_t)rd;
+}
+static inline uint32_t a64_cmp_w_reg(int rn, int rm) {
+  return 0x6B00001Fu | ((uint32_t)rm << 16) | ((uint32_t)rn << 5);
 }
 
 static void a64_emit_literal(Arm64Asm *a, const char *s, size_t len) {
@@ -361,8 +403,9 @@ static pthread_mutex_t g_jit_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t *g_jit_mem = NULL;
 static size_t g_jit_used = 0;
 #endif
+static void *g_jit_stub_str_neon = NULL;
+static void *g_jit_stub_u32_long = NULL;
 static JitSchemaEntry g_jit_cache[CJSON_JIT_CACHE_SLOTS];
-static uint32_t g_jit_next_slot = 0;
 static uint32_t g_jit_compiled_pages = 0;
 static uint32_t g_jit_ascii_state_val = 0;
 static int g_jit_ascii_state_inited = 0;
@@ -379,6 +422,432 @@ static inline uint32_t cjson_jit_get_ascii_state(void) {
     g_jit_ascii_state_inited = 1;
   }
   return g_jit_ascii_state_val;
+}
+
+/* Emit a call to a shared JIT stub (uses 1-insn PC-relative BL when in range). */
+static void a64_emit_call_stub(Arm64Asm *a, void *stub_addr, uint8_t *code_dest) {
+  if (code_dest != NULL && stub_addr != NULL) {
+    intptr_t diff = (intptr_t)stub_addr - (intptr_t)(code_dest + a->len * 4u);
+    if (diff >= -(120 * 1024 * 1024) && diff <= (120 * 1024 * 1024) && (diff & 3) == 0) {
+      a64_emit(a, a64_bl((int32_t)(diff >> 2)));
+      return;
+    }
+  }
+  a64_load_u64(a, 12, (uint64_t)(uintptr_t)stub_addr);
+  a64_emit(a, a64_blr(12));
+}
+
+/* Compile the two shared leaf JIT stubs ONCE under g_jit_mu:
+ * 1) g_jit_stub_str_neon: 16-byte NEON SIMD clean ASCII emitter (0..112B)
+ *    In:  X9 = str, X20 = dst, X21 = safe_end, X25 = b, X28 = safe_end_p
+ *    Out: X0 = new_dst (or NULL on OOM), X20 = new_dst, X21 = *safe_end_p
+ * 2) g_jit_stub_u32_long: zero-frame inline emitter for -99,999,999..+99,999,999
+ *    In:  X9 = long, X20 = dst
+ *    Out: X0 = new_dst (or NULL on error), X20 = new_dst */
+static void cjson_jit_init_stubs_locked(void) {
+  if (g_jit_stub_str_neon != NULL) return;
+  uint32_t ascii_state_exp = cjson_jit_get_ascii_state();
+  if (ascii_state_exp == 0) return;
+
+  uint32_t buf[512];
+  Arm64Asm a = {buf, 0, 512};
+
+  /* ---- Stub 1: g_jit_stub_str_neon (offset 0) ---- */
+  size_t str_off = a.len;
+  size_t slow_patches[16];
+  size_t n_slow = 0;
+
+  /* Check dst <= safe_end (128B slack covers len <= 112 + 2 quotes = 114B) */
+  a64_emit(&a, a64_cmp_reg(20, 21));
+  slow_patches[n_slow++] = a.len;
+  a64_emit(&a, a64_b_cond(8, 0)); /* B.HI slow */
+
+  /* Check compact ASCII */
+  a64_emit(&a, a64_ldr_w_uoff(10, 9, (uint32_t)offsetof(PyASCIIObject, state)));
+  a64_emit(&a, a64_bic_w_imm3(10, 10));
+  a64_emit(&a, a64_cmp_w_imm(10, (uint16_t)ascii_state_exp));
+  slow_patches[n_slow++] = a.len;
+  a64_emit(&a, a64_b_cond(1, 0)); /* B.NE slow */
+
+  /* X10 = length; if > 112 -> slow */
+  a64_emit(&a, a64_ldr_uoff(10, 9, (uint32_t)offsetof(PyASCIIObject, length)));
+  a64_emit(&a, a64_cmp_x_imm(10, 112));
+  slow_patches[n_slow++] = a.len;
+  a64_emit(&a, a64_b_cond(8, 0)); /* B.HI slow */
+
+  /* if len == 0 -> write "" and return */
+  size_t br_empty = a.len;
+  a64_emit(&a, a64_cbz(10, 0));
+
+  /* X11 = src = X9 + sizeof(PyASCIIObject) */
+  a64_emit(&a, a64_add_imm(11, 9, (uint16_t)sizeof(PyASCIIObject)));
+
+  /* if len < 16 -> lt16 */
+  a64_emit(&a, a64_cmp_x_imm(10, 16));
+  size_t br_lt16 = a.len;
+  a64_emit(&a, a64_b_cond(3, 0)); /* B.LO lt16 */
+
+  /* === 16 <= len <= 112: 16-byte NEON SIMD === */
+  a64_emit(&a, a64_mov(15, 20)); /* X15 = saved_dst */
+  a64_emit(&a, 0x4F01E404u); /* movi v4.16b, #0x20 */
+  a64_emit(&a, 0x4F01E445u); /* movi v5.16b, #0x22 ('"') */
+  a64_emit(&a, 0x4F02E786u); /* movi v6.16b, #0x5c ('\\') */
+  a64_emit(&a, a64_movz(12, '"', 0));
+  a64_emit(&a, a64_strb_post(12, 20, 1));
+  a64_emit(&a, a64_add_reg(14, 11, 10)); /* X14 = src_end */
+  a64_emit(&a, a64_subs_x_imm(13, 10, 16)); /* X13 = len - 16 */
+  size_t br_final16 = a.len;
+  a64_emit(&a, a64_cbz(13, 0));
+
+  size_t loop16 = a.len;
+  a64_emit(&a, 0x3CC10560u); /* ldr q0, [x11], #16 */
+  a64_emit(&a, 0x6E203481u); /* cmhi v1.16b, v4.16b, v0.16b */
+  a64_emit(&a, 0x6E258C02u); /* cmeq v2.16b, v0.16b, v5.16b */
+  a64_emit(&a, 0x6E268C03u); /* cmeq v3.16b, v0.16b, v6.16b */
+  a64_emit(&a, 0x4EA21C21u); /* orr v1.16b, v1.16b, v2.16b */
+  a64_emit(&a, 0x4EA31C21u); /* orr v1.16b, v1.16b, v3.16b */
+  a64_emit(&a, 0x6E30A821u); /* umaxv b1, v1.16b */
+  a64_emit(&a, 0x1E26002Cu); /* fmov w12, s1 */
+  size_t br_esc_l16 = a.len;
+  a64_emit(&a, a64_cbnz_w(12, 0));
+  a64_emit(&a, 0x3C810680u); /* str q0, [x20], #16 */
+  a64_emit(&a, a64_subs_x_imm(13, 13, 16));
+  a64_emit(&a, a64_b_cond(12, (int32_t)(loop16 - a.len))); /* B.GT loop16 */
+
+  /* final16: overlapping 16B tail at [src_end - 16] */
+  a.buf[br_final16] = a64_cbz(13, (int32_t)(a.len - br_final16));
+  a64_emit(&a, 0x3CDF01C0u); /* ldur q0, [x14, #-16] */
+  a64_emit(&a, 0x6E203481u); /* cmhi v1.16b, v4.16b, v0.16b */
+  a64_emit(&a, 0x6E258C02u); /* cmeq v2.16b, v0.16b, v5.16b */
+  a64_emit(&a, 0x6E268C03u); /* cmeq v3.16b, v0.16b, v6.16b */
+  a64_emit(&a, 0x4EA21C21u); /* orr v1.16b, v1.16b, v2.16b */
+  a64_emit(&a, 0x4EA31C21u); /* orr v1.16b, v1.16b, v3.16b */
+  a64_emit(&a, 0x6E30A821u); /* umaxv b1, v1.16b */
+  a64_emit(&a, 0x1E26002Cu); /* fmov w12, s1 */
+  size_t br_esc_f16 = a.len;
+  a64_emit(&a, a64_cbnz_w(12, 0));
+  a64_emit(&a, a64_add_reg(20, 15, 10)); /* X20 = saved_dst + len */
+  a64_emit(&a, a64_add_imm(20, 20, 1));  /* X20 = saved_dst + 1 + len */
+  a64_emit(&a, 0x3C9F0280u); /* stur q0, [x20, #-16] */
+  a64_emit(&a, a64_movz(12, '"', 0));
+  a64_emit(&a, a64_strb_post(12, 20, 1));
+  a64_emit(&a, a64_mov(0, 20));
+  a64_emit(&a, 0xD65F03C0u); /* ret */
+
+  /* === lt16: 8 <= len <= 15 (two overlapping 8B loads + 1 NEON check) === */
+  a.buf[br_lt16] = a64_b_cond(3, (int32_t)(a.len - br_lt16));
+  a64_emit(&a, a64_cmp_x_imm(10, 8));
+  size_t br_lt8 = a.len;
+  a64_emit(&a, a64_b_cond(3, 0)); /* B.LO lt8 */
+  a64_emit(&a, 0xFD400160u); /* ldr d0, [x11] */
+  a64_emit(&a, a64_add_reg(14, 11, 10));
+  a64_emit(&a, 0xFC5F81C4u); /* ldur d4, [x14, #-8] */
+  a64_emit(&a, 0x6E180480u); /* ins v0.d[1], v4.d[0] */
+  a64_emit(&a, 0x4F01E401u); /* movi v1.16b, #0x20 */
+  a64_emit(&a, 0x4F01E442u); /* movi v2.16b, #0x22 */
+  a64_emit(&a, 0x4F02E783u); /* movi v3.16b, #0x5c */
+  a64_emit(&a, 0x6E203421u); /* cmhi v1.16b, v1.16b, v0.16b */
+  a64_emit(&a, 0x6E228C02u); /* cmeq v2.16b, v0.16b, v2.16b */
+  a64_emit(&a, 0x6E238C03u); /* cmeq v3.16b, v0.16b, v3.16b */
+  a64_emit(&a, 0x4EA21C21u); /* orr v1.16b, v1.16b, v2.16b */
+  a64_emit(&a, 0x4EA31C21u); /* orr v1.16b, v1.16b, v3.16b */
+  a64_emit(&a, 0x6E30A821u); /* umaxv b1, v1.16b */
+  a64_emit(&a, 0x1E26002Cu); /* fmov w12, s1 */
+  slow_patches[n_slow++] = a.len;
+  a64_emit(&a, a64_cbnz_w(12, 0));
+  a64_emit(&a, a64_movz(12, '"', 0));
+  a64_emit(&a, a64_strb_post(12, 20, 1));
+  a64_emit(&a, 0xFD000280u); /* str d0, [x20] */
+  a64_emit(&a, a64_add_reg(20, 20, 10));
+  a64_emit(&a, 0xFC1F8284u); /* stur d4, [x20, #-8] */
+  a64_emit(&a, a64_strb_post(12, 20, 1));
+  a64_emit(&a, a64_mov(0, 20));
+  a64_emit(&a, 0xD65F03C0u); /* ret */
+
+  /* === lt8: 4 <= len <= 7 (two overlapping 4B loads + 1 NEON 8B check) === */
+  a.buf[br_lt8] = a64_b_cond(3, (int32_t)(a.len - br_lt8));
+  a64_emit(&a, a64_cmp_x_imm(10, 4));
+  size_t br_lt4 = a.len;
+  a64_emit(&a, a64_b_cond(3, 0)); /* B.LO lt4 */
+  a64_emit(&a, 0xBD400160u); /* ldr s0, [x11] */
+  a64_emit(&a, a64_add_reg(14, 11, 10));
+  a64_emit(&a, 0xBC5FC1C4u); /* ldur s4, [x14, #-4] */
+  a64_emit(&a, 0x6E0C0480u); /* ins v0.s[1], v4.s[0] */
+  a64_emit(&a, 0x4F01E401u); /* movi v1.16b, #0x20 */
+  a64_emit(&a, 0x4F01E442u); /* movi v2.16b, #0x22 */
+  a64_emit(&a, 0x4F02E783u); /* movi v3.16b, #0x5c */
+  a64_emit(&a, 0x6E203421u); /* cmhi v1.16b, v1.16b, v0.16b */
+  a64_emit(&a, 0x6E228C02u); /* cmeq v2.16b, v0.16b, v2.16b */
+  a64_emit(&a, 0x6E238C03u); /* cmeq v3.16b, v0.16b, v3.16b */
+  a64_emit(&a, 0x4EA21C21u); /* orr v1.16b, v1.16b, v2.16b */
+  a64_emit(&a, 0x4EA31C21u); /* orr v1.16b, v1.16b, v3.16b */
+  a64_emit(&a, 0x2E30A821u); /* umaxv b1, v1.8b */
+  a64_emit(&a, 0x1E26002Cu); /* fmov w12, s1 */
+  slow_patches[n_slow++] = a.len;
+  a64_emit(&a, a64_cbnz_w(12, 0));
+  a64_emit(&a, a64_movz(12, '"', 0));
+  a64_emit(&a, a64_strb_post(12, 20, 1));
+  a64_emit(&a, 0xBD000280u); /* str s0, [x20] */
+  a64_emit(&a, a64_add_reg(20, 20, 10));
+  a64_emit(&a, 0xBC1FC284u); /* stur s4, [x20, #-4] */
+  a64_emit(&a, a64_strb_post(12, 20, 1));
+  a64_emit(&a, a64_mov(0, 20));
+  a64_emit(&a, 0xD65F03C0u); /* ret */
+
+  /* === lt4: 1..3 bytes === */
+  a.buf[br_lt4] = a64_b_cond(3, (int32_t)(a.len - br_lt4));
+  a64_emit(&a, a64_mov(15, 20));
+  a64_emit(&a, a64_movz(12, '"', 0));
+  a64_emit(&a, a64_strb_post(12, 20, 1));
+  size_t lt4_loop = a.len;
+  a64_emit(&a, a64_ldrb_post(13, 11, 1));
+  a64_emit(&a, a64_cmp_w_imm(13, 0x20));
+  size_t br_esc_s1 = a.len;
+  a64_emit(&a, a64_b_cond(3, 0));
+  a64_emit(&a, a64_cmp_w_imm(13, '"'));
+  size_t br_esc_s2 = a.len;
+  a64_emit(&a, a64_b_cond(0, 0));
+  a64_emit(&a, a64_cmp_w_imm(13, '\\'));
+  size_t br_esc_s3 = a.len;
+  a64_emit(&a, a64_b_cond(0, 0));
+  a64_emit(&a, a64_strb_post(13, 20, 1));
+  a64_emit(&a, a64_subs_x_imm(10, 10, 1));
+  a64_emit(&a, a64_b_cond(1, (int32_t)(lt4_loop - a.len)));
+  a64_emit(&a, a64_strb_post(12, 20, 1));
+  a64_emit(&a, a64_mov(0, 20));
+  a64_emit(&a, 0xD65F03C0u); /* ret */
+
+  /* empty_str: write "" and return */
+  a.buf[br_empty] = a64_cbz(10, (int32_t)(a.len - br_empty));
+  a64_emit(&a, a64_movz(12, 0x2222u, 0));
+  a64_emit(&a, a64_strh_post(12, 20, 2));
+  a64_emit(&a, a64_mov(0, 20));
+  a64_emit(&a, 0xD65F03C0u); /* ret */
+
+  /* esc_restore: restore X20 = X15 and fall through to slow */
+  a.buf[br_esc_l16] = a64_cbnz_w(12, (int32_t)(a.len - br_esc_l16));
+  a.buf[br_esc_f16] = a64_cbnz_w(12, (int32_t)(a.len - br_esc_f16));
+  a.buf[br_esc_s1] = a64_b_cond(3, (int32_t)(a.len - br_esc_s1));
+  a.buf[br_esc_s2] = a64_b_cond(0, (int32_t)(a.len - br_esc_s2));
+  a.buf[br_esc_s3] = a64_b_cond(0, (int32_t)(a.len - br_esc_s3));
+  a64_emit(&a, a64_mov(20, 15));
+
+  /* slow: call cjson_jit_emit_str(b=X25, dst=X20, safe_end_p=X28, val=X9) */
+  size_t slow_label = a.len;
+  for (size_t k = 0; k < n_slow; k++) {
+    size_t pos = slow_patches[k];
+    uint32_t orig = a.buf[pos];
+    int32_t rel = (int32_t)(slow_label - pos);
+    if ((orig & 0xFF000000u) == 0x35000000u) {
+      a.buf[pos] = a64_cbnz_w((int)(orig & 0x1Fu), rel);
+    } else {
+      a.buf[pos] = a64_b_cond((int)(orig & 0xFu), rel);
+    }
+  }
+  a64_emit(&a, 0xA9BF7BFDu); /* stp x29, x30, [sp, #-16]! */
+  a64_emit(&a, a64_mov(0, 25));
+  a64_emit(&a, a64_mov(1, 20));
+  a64_emit(&a, a64_mov(2, 28));
+  a64_emit(&a, a64_mov(3, 9));
+  a64_load_u64(&a, 12, (uint64_t)(uintptr_t)&cjson_jit_emit_str);
+  a64_emit(&a, a64_blr(12));
+  size_t br_oom = a.len;
+  a64_emit(&a, a64_cbz(0, 0));
+  a64_emit(&a, a64_mov(20, 0));
+  a64_emit(&a, a64_ldr_uoff(21, 28, 0));
+  a.buf[br_oom] = a64_cbz(0, (int32_t)(a.len - br_oom));
+  a64_emit(&a, 0xA8C17BFDu); /* ldp x29, x30, [sp], #16 */
+  a64_emit(&a, 0xD65F03C0u); /* ret */
+
+  /* Align Stub 2 to 16 bytes */
+  while ((a.len & 3u) != 0) a64_emit(&a, 0xD503201Fu); /* nop */
+
+  /* ---- Stub 2: g_jit_stub_u32_long (-99,999,999 .. +99,999,999) ---- */
+  size_t int_off = a.len;
+  a64_emit(&a, a64_ldr_uoff(10, 9, (uint32_t)offsetof(PyLongObject, long_value.lv_tag)));
+  a64_emit(&a, a64_cmp_x_imm(10, 1));
+  size_t br_izero = a.len;
+  a64_emit(&a, a64_b_cond(0, 0)); /* B.EQ is_zero */
+  /* Check 1-digit positive or negative: (lv_tag & ~2) == (1 << _PyLong_NON_SIZE_BITS) */
+  a64_emit(&a, 0x927EF94Bu); /* and x11, x10, #~2 */
+  a64_emit(&a, a64_cmp_x_imm(11, (uint16_t)(1u << _PyLong_NON_SIZE_BITS)));
+  size_t br_islow1 = a.len;
+  a64_emit(&a, a64_b_cond(1, 0)); /* B.NE islow */
+  a64_emit(&a, a64_ldr_w_uoff(11, 9, (uint32_t)offsetof(PyLongObject, long_value.ob_digit)));
+  /* Check mag <= 99,999,999 (8 digits) */
+  a64_load_u64(&a, 12, 99999999ULL);
+  a64_emit(&a, a64_cmp_w_reg(11, 12));
+  size_t br_islow2 = a.len;
+  a64_emit(&a, a64_b_cond(8, 0)); /* B.HI islow */
+
+  /* Emit '-' if negative (bit 1 of X10 set) */
+  size_t br_pos = a.len;
+  a64_emit(&a, a64_tbz_w(10, 1, 0));
+  a64_emit(&a, a64_movz(12, '-', 0));
+  a64_emit(&a, a64_strb_post(12, 20, 1));
+  a.buf[br_pos] = a64_tbz_w(10, 1, (int32_t)(a.len - br_pos));
+
+  /* Fast 1..2 digits (1..99) */
+  a64_emit(&a, a64_cmp_w_imm(11, 99));
+  size_t br_gt99 = a.len;
+  a64_emit(&a, a64_b_cond(8, 0)); /* B.HI gt99 */
+  a64_emit(&a, a64_cmp_w_imm(11, 9));
+  size_t br_2d = a.len;
+  a64_emit(&a, a64_b_cond(8, 0)); /* B.HI d2 */
+  a64_emit(&a, a64_add_w_imm(11, 11, '0'));
+  a64_emit(&a, a64_strb_post(11, 20, 1));
+  a64_emit(&a, a64_mov(0, 20));
+  a64_emit(&a, 0xD65F03C0u); /* ret */
+
+  a.buf[br_2d] = a64_b_cond(8, (int32_t)(a.len - br_2d));
+  a64_load_u64(&a, 15, (uint64_t)(uintptr_t)DIGIT_PAIRS);
+  a64_emit(&a, a64_ldrh_idx_lsl1(11, 15, 11));
+  a64_emit(&a, a64_strh_post(11, 20, 2));
+  a64_emit(&a, a64_mov(0, 20));
+  a64_emit(&a, 0xD65F03C0u); /* ret */
+
+  /* gt99: check <= 9999 (3..4 digits) vs 10000..99999999 (5..8 digits) */
+  a.buf[br_gt99] = a64_b_cond(8, (int32_t)(a.len - br_gt99));
+  a64_load_u64(&a, 15, (uint64_t)(uintptr_t)DIGIT_PAIRS);
+  a64_emit(&a, a64_movz(12, 9999, 0));
+  a64_emit(&a, a64_cmp_w_reg(11, 12));
+  size_t br_gt9999 = a.len;
+  a64_emit(&a, a64_b_cond(8, 0)); /* B.HI gt9999 */
+
+  /* 100..9999: q = mag/100 (1..99), r = mag%100 (0..99) */
+  a64_emit(&a, a64_movz(12, 100, 0));
+  a64_emit(&a, a64_udiv_w(13, 11, 12));
+  a64_emit(&a, a64_msub_w(14, 13, 12, 11));
+  a64_emit(&a, a64_cmp_w_imm(13, 9));
+  size_t br_4d = a.len;
+  a64_emit(&a, a64_b_cond(8, 0)); /* B.HI d4 */
+  a64_emit(&a, a64_add_w_imm(13, 13, '0'));
+  a64_emit(&a, a64_strb_post(13, 20, 1));
+  a64_emit(&a, a64_ldrh_idx_lsl1(14, 15, 14));
+  a64_emit(&a, a64_strh_post(14, 20, 2));
+  a64_emit(&a, a64_mov(0, 20));
+  a64_emit(&a, 0xD65F03C0u); /* ret */
+
+  a.buf[br_4d] = a64_b_cond(8, (int32_t)(a.len - br_4d));
+  a64_emit(&a, a64_ldrh_idx_lsl1(13, 15, 13));
+  a64_emit(&a, a64_strh_post(13, 20, 2));
+  a64_emit(&a, a64_ldrh_idx_lsl1(14, 15, 14));
+  a64_emit(&a, a64_strh_post(14, 20, 2));
+  a64_emit(&a, a64_mov(0, 20));
+  a64_emit(&a, 0xD65F03C0u); /* ret */
+
+  /* 10000..99999999 (5..8 digits): hi = mag/10000 (1..9999), lo = mag%10000 (0..9999) */
+  a.buf[br_gt9999] = a64_b_cond(8, (int32_t)(a.len - br_gt9999));
+  a64_emit(&a, a64_movz(12, 10000, 0));
+  a64_emit(&a, a64_udiv_w(10, 11, 12));     /* W10 = hi (1..9999) */
+  a64_emit(&a, a64_msub_w(11, 10, 12, 11)); /* W11 = lo (0..9999) */
+  /* Emit hi (1..4 digits) */
+  a64_emit(&a, a64_cmp_w_imm(10, 99));
+  size_t br_hi34 = a.len;
+  a64_emit(&a, a64_b_cond(8, 0)); /* B.HI hi34 */
+  a64_emit(&a, a64_cmp_w_imm(10, 9));
+  size_t br_hi2 = a.len;
+  a64_emit(&a, a64_b_cond(8, 0)); /* B.HI hi2 */
+  a64_emit(&a, a64_add_w_imm(10, 10, '0'));
+  a64_emit(&a, a64_strb_post(10, 20, 1));
+  size_t br_lo_1 = a.len;
+  a64_emit(&a, a64_b(0));
+  a.buf[br_hi2] = a64_b_cond(8, (int32_t)(a.len - br_hi2));
+  a64_emit(&a, a64_ldrh_idx_lsl1(10, 15, 10));
+  a64_emit(&a, a64_strh_post(10, 20, 2));
+  size_t br_lo_2 = a.len;
+  a64_emit(&a, a64_b(0));
+  a.buf[br_hi34] = a64_b_cond(8, (int32_t)(a.len - br_hi34));
+  a64_emit(&a, a64_movz(12, 100, 0));
+  a64_emit(&a, a64_udiv_w(13, 10, 12));
+  a64_emit(&a, a64_msub_w(14, 13, 12, 10));
+  a64_emit(&a, a64_cmp_w_imm(13, 9));
+  size_t br_hi4 = a.len;
+  a64_emit(&a, a64_b_cond(8, 0));
+  a64_emit(&a, a64_add_w_imm(13, 13, '0'));
+  a64_emit(&a, a64_strb_post(13, 20, 1));
+  size_t br_hi3_tail = a.len;
+  a64_emit(&a, a64_b(0));
+  a.buf[br_hi4] = a64_b_cond(8, (int32_t)(a.len - br_hi4));
+  a64_emit(&a, a64_ldrh_idx_lsl1(13, 15, 13));
+  a64_emit(&a, a64_strh_post(13, 20, 2));
+  a.buf[br_hi3_tail] = a64_b((int32_t)(a.len - br_hi3_tail));
+  a64_emit(&a, a64_ldrh_idx_lsl1(14, 15, 14));
+  a64_emit(&a, a64_strh_post(14, 20, 2));
+
+  /* Emit lo (always 4 digits: lo/100 and lo%100) */
+  a.buf[br_lo_1] = a64_b((int32_t)(a.len - br_lo_1));
+  a.buf[br_lo_2] = a64_b((int32_t)(a.len - br_lo_2));
+  a64_emit(&a, a64_movz(12, 100, 0));
+  a64_emit(&a, a64_udiv_w(13, 11, 12));
+  a64_emit(&a, a64_msub_w(14, 13, 12, 11));
+  a64_emit(&a, a64_ldrh_idx_lsl1(13, 15, 13));
+  a64_emit(&a, a64_strh_post(13, 20, 2));
+  a64_emit(&a, a64_ldrh_idx_lsl1(14, 15, 14));
+  a64_emit(&a, a64_strh_post(14, 20, 2));
+  a64_emit(&a, a64_mov(0, 20));
+  a64_emit(&a, 0xD65F03C0u); /* ret */
+
+  /* is_zero: write '0' and return */
+  a.buf[br_izero] = a64_b_cond(0, (int32_t)(a.len - br_izero));
+  a64_emit(&a, a64_movz(10, '0', 0));
+  a64_emit(&a, a64_strb_post(10, 20, 1));
+  a64_emit(&a, a64_mov(0, 20));
+  a64_emit(&a, 0xD65F03C0u); /* ret */
+
+  /* islow: call cjson_jit_write_long(dst=X20, val=X9) */
+  a.buf[br_islow1] = a64_b_cond(1, (int32_t)(a.len - br_islow1));
+  a.buf[br_islow2] = a64_b_cond(8, (int32_t)(a.len - br_islow2));
+  a64_emit(&a, 0xA9BF7BFDu); /* stp x29, x30, [sp, #-16]! */
+  a64_emit(&a, a64_mov(0, 20));
+  a64_emit(&a, a64_mov(1, 9));
+  a64_load_u64(&a, 12, (uint64_t)(uintptr_t)&cjson_jit_write_long);
+  a64_emit(&a, a64_blr(12));
+  size_t br_ierr = a.len;
+  a64_emit(&a, a64_cbz(0, 0));
+  a64_emit(&a, a64_mov(20, 0));
+  a.buf[br_ierr] = a64_cbz(0, (int32_t)(a.len - br_ierr));
+  a64_emit(&a, 0xA8C17BFDu); /* ldp x29, x30, [sp], #16 */
+  a64_emit(&a, 0xD65F03C0u); /* ret */
+
+  if (a.len >= a.cap) return;
+
+  size_t code_bytes = a.len * sizeof(uint32_t);
+  size_t aligned = (code_bytes + 15u) & ~15u;
+  uint8_t *dest = NULL;
+#if defined(__APPLE__)
+  if (g_jit_mem == NULL) {
+    void *m = mmap(NULL, CJSON_JIT_POOL_BYTES, PROT_READ | PROT_WRITE | PROT_EXEC,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+    if (m == MAP_FAILED) return;
+    g_jit_mem = (uint8_t *)m;
+    g_jit_used = 0;
+  }
+  if (g_jit_used + aligned > CJSON_JIT_POOL_BYTES) return;
+  dest = g_jit_mem + g_jit_used;
+  if (__builtin_available(macOS 11.0, *)) {
+    pthread_jit_write_protect_np(0);
+    memcpy(dest, buf, code_bytes);
+    pthread_jit_write_protect_np(1);
+  } else {
+    return;
+  }
+  sys_icache_invalidate(dest, code_bytes);
+  g_jit_used += aligned;
+#else
+  size_t page_sz = (code_bytes + 4095u) & ~4095u;
+  void *page = mmap(NULL, page_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (page == MAP_FAILED) return;
+  memcpy(page, buf, code_bytes);
+  if (mprotect(page, page_sz, PROT_READ | PROT_EXEC) != 0) {
+    munmap(page, page_sz);
+    return;
+  }
+  __builtin___clear_cache((char *)page, (char *)page + code_bytes);
+  dest = (uint8_t *)page;
+#endif
+  g_jit_stub_str_neon = dest + str_off * sizeof(uint32_t);
+  g_jit_stub_u32_long = dest + int_off * sizeof(uint32_t);
 }
 
 static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
@@ -399,9 +868,10 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
     h = (h ^ (uint8_t)kbuf[j]) * 0x100000001B3ULL;
   }
 
-  /* Lock-free fast-path lookup */
-  for (int s = 0; s < CJSON_JIT_CACHE_SLOTS; s++) {
-    JitSchemaEntry *e = &g_jit_cache[s];
+  /* Lock-free O(1) 2-way set-associative lookup */
+  uint32_t set_base = (uint32_t)(h & (CJSON_JIT_CACHE_SLOTS - 2u));
+  for (uint32_t w = 0; w < 2; w++) {
+    JitSchemaEntry *e = &g_jit_cache[set_base + w];
     CJsonJitSplitLoopFn fn = __atomic_load_n(&e->fn, __ATOMIC_ACQUIRE);
     if (fn != NULL && e->sig_hash == h && e->is_combined == (uint8_t)is_combined &&
         e->n == n && e->kbuf_len == kbuf_len && e->psize == psize &&
@@ -417,8 +887,8 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
   pthread_mutex_lock(&g_jit_mu);
 
   /* Double-check under lock */
-  for (int s = 0; s < CJSON_JIT_CACHE_SLOTS; s++) {
-    JitSchemaEntry *e = &g_jit_cache[s];
+  for (uint32_t w = 0; w < 2; w++) {
+    JitSchemaEntry *e = &g_jit_cache[set_base + w];
     if (e->fn != NULL && e->sig_hash == h && e->is_combined == (uint8_t)is_combined &&
         e->n == n && e->kbuf_len == kbuf_len && e->psize == psize &&
         memcmp(e->vtypes, vtypes, n) == 0 &&
@@ -432,10 +902,20 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
     }
   }
 
-  if (g_jit_compiled_pages >= CJSON_JIT_CACHE_SLOTS) {
+  /* Find empty way in this 2-way set (never overwrite a live slot that another thread may read) */
+  uint32_t target_idx = CJSON_JIT_CACHE_SLOTS;
+  for (uint32_t w = 0; w < 2; w++) {
+    if (g_jit_cache[set_base + w].fn == NULL) {
+      target_idx = set_base + w;
+      break;
+    }
+  }
+  if (target_idx >= CJSON_JIT_CACHE_SLOTS || g_jit_compiled_pages >= CJSON_JIT_CACHE_SLOTS) {
     pthread_mutex_unlock(&g_jit_mu);
     return NULL; /* bounded JIT code memory: fall back cleanly to C */
   }
+
+  cjson_jit_init_stubs_locked();
 
 #if defined(__APPLE__)
   if (g_jit_mem == NULL) {
@@ -449,16 +929,24 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
     pthread_mutex_unlock(&g_jit_mu);
     return NULL;
   }
+  uint8_t *planned_dest = g_jit_mem + g_jit_used;
+#else
+  uint8_t *planned_dest = NULL;
 #endif
 
-  /* Pre-compute max fixed bytes per run between variable-length fields */
+  /* Pre-compute max fixed bytes per run AND total single-row max bytes.
+   * When total row_need <= 1024, ONE single buffer check at row entry suffices
+   * for the entire row because every C fallback helper guarantees >= 1024B slack! */
   uint16_t run_max[32];
+  uint32_t total_row_need = 2; /* trailing "}," */
   {
-    uint32_t acc = 2; /* trailing "}," */
+    uint32_t acc = 2;
     for (int j = (int)n - 1; j >= 0; j--) {
       uint8_t vt = vtypes[j];
       uint32_t vmax = (vt == JIT_VT_INT) ? 24u : ((vt == JIT_VT_FLOAT) ? 34u :
-                      ((vt == JIT_VT_BOOL) ? 5u : ((vt == JIT_VT_NONE) ? 4u : 2u)));
+                      ((vt == JIT_VT_BOOL) ? 5u : ((vt == JIT_VT_NONE) ? 4u :
+                      ((vt == JIT_VT_STR) ? 114u : 4u))));
+      total_row_need += (uint32_t)klen[j] + vmax;
       if (vt == JIT_VT_STR || vt == JIT_VT_DICT || vt == JIT_VT_LIST || vt == JIT_VT_ANY) {
         acc = (uint32_t)klen[j] + 4u;
       } else {
@@ -467,6 +955,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       run_max[j] = (acc > 3500u) ? 3500u : (uint16_t)acc;
     }
   }
+  int single_row_check = (total_row_need <= 1024u);
 
   uint32_t tmp_code[2048];
   Arm64Asm a = {tmp_code, 0, 2048};
@@ -632,16 +1121,14 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
     }
   }
 
-  /* Hoisted row buffer check for the first fixed run! */
-  int compact_codegen = (n <= 12);
-  uint32_t ascii_state_exp = cjson_jit_get_ascii_state();
-  a64_emit_buf_check(&a, run_max[0], err_patches, &n_err);
+  /* Hoisted row buffer check! */
+  a64_emit_buf_check(&a, single_row_check ? (uint16_t)total_row_need : run_max[0], err_patches, &n_err);
 
   for (uint32_t j = 0; j < n; j++) {
-    if (j > 0) {
+    if (!single_row_check && j > 0) {
       uint8_t prev_vt = vtypes[j - 1];
-      if (prev_vt == JIT_VT_STR || prev_vt == JIT_VT_DICT ||
-          prev_vt == JIT_VT_LIST || prev_vt == JIT_VT_ANY) {
+      if (prev_vt == JIT_VT_DICT || prev_vt == JIT_VT_LIST || prev_vt == JIT_VT_ANY ||
+          prev_vt == JIT_VT_STR) {
         a64_emit_buf_check(&a, run_max[j], err_patches, &n_err);
       }
     }
@@ -690,63 +1177,11 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       a64_emit(&a, a64_cmp_reg(10, 11));
       size_t br_not_int = a.len;
       a64_emit(&a, a64_b_cond(1, 0));
-      if (compact_codegen) {
-        /* Inline fast path for 0..99 (zero function call!) */
-        a64_emit(&a, a64_ldr_uoff(10, 9, (uint32_t)offsetof(PyLongObject, long_value.lv_tag)));
-        a64_emit(&a, a64_cmp_x_imm(10, 1));
-        size_t br_zero = a.len;
-        a64_emit(&a, a64_b_cond(0, 0));
-        a64_emit(&a, a64_cmp_x_imm(10, (uint16_t)(1u << _PyLong_NON_SIZE_BITS)));
-        size_t br_call_long1 = a.len;
-        a64_emit(&a, a64_b_cond(1, 0));
-        a64_emit(&a, a64_ldr_w_uoff(10, 9, (uint32_t)offsetof(PyLongObject, long_value.ob_digit)));
-        a64_emit(&a, a64_cmp_w_imm(10, 99));
-        size_t br_call_long2 = a.len;
-        a64_emit(&a, a64_b_cond(8, 0));
-        a64_emit(&a, a64_cmp_w_imm(10, 9));
-        size_t br_2dig = a.len;
-        a64_emit(&a, a64_b_cond(8, 0));
-        a64_emit(&a, a64_add_w_imm(10, 10, '0'));
-        a64_emit(&a, a64_strb_post(10, 20, 1));
-        size_t br_end1 = a.len;
-        a64_emit(&a, a64_b(0));
-        a.buf[br_zero] = a64_b_cond(0, (int32_t)(a.len - br_zero));
-        a64_emit(&a, a64_movz(10, '0', 0));
-        a64_emit(&a, a64_strb_post(10, 20, 1));
-        size_t br_end2 = a.len;
-        a64_emit(&a, a64_b(0));
-        a.buf[br_2dig] = a64_b_cond(8, (int32_t)(a.len - br_2dig));
-        a64_load_u64(&a, 11, (uint64_t)(uintptr_t)DIGIT_PAIRS);
-        a64_emit(&a, a64_ldrh_idx_lsl1(10, 11, 10));
-        a64_emit(&a, a64_strh_post(10, 20, 2));
-        size_t br_end3 = a.len;
-        a64_emit(&a, a64_b(0));
-        a.buf[br_call_long1] = a64_b_cond(1, (int32_t)(a.len - br_call_long1));
-        a.buf[br_call_long2] = a64_b_cond(8, (int32_t)(a.len - br_call_long2));
-        a64_emit(&a, a64_mov(0, 20));
-        a64_emit(&a, a64_mov(1, 9));
-        a64_load_u64(&a, 12, (uint64_t)(uintptr_t)&cjson_jit_write_long);
-        a64_emit(&a, a64_blr(12));
+      if (g_jit_stub_u32_long != NULL) {
+        /* 1-instruction BL to zero-frame inline -99,999,999..+99,999,999 stub! */
+        a64_emit_call_stub(&a, g_jit_stub_u32_long, planned_dest);
         err_patches[n_err++] = a.len;
         a64_emit(&a, a64_cbz(0, 0));
-        a64_emit(&a, a64_mov(20, 0));
-        size_t br_end4 = a.len;
-        a64_emit(&a, a64_b(0));
-        a.buf[br_not_int] = a64_b_cond(1, (int32_t)(a.len - br_not_int));
-        a64_load_u64(&a, 10, (uint64_t)(uintptr_t)Py_None);
-        a64_emit(&a, a64_cmp_reg(9, 10));
-        size_t br_any = a.len;
-        a64_emit(&a, a64_b_cond(1, 0));
-        a64_emit_literal(&a, "null", 4);
-        size_t br_end5 = a.len;
-        a64_emit(&a, a64_b(0));
-        a.buf[br_any] = a64_b_cond(1, (int32_t)(a.len - br_any));
-        a64_emit_call_any(&a, err_patches, &n_err);
-        a.buf[br_end1] = a64_b((int32_t)(a.len - br_end1));
-        a.buf[br_end2] = a64_b((int32_t)(a.len - br_end2));
-        a.buf[br_end3] = a64_b((int32_t)(a.len - br_end3));
-        a.buf[br_end4] = a64_b((int32_t)(a.len - br_end4));
-        a.buf[br_end5] = a64_b((int32_t)(a.len - br_end5));
       } else {
         a64_emit(&a, a64_mov(0, 20));
         a64_emit(&a, a64_mov(1, 9));
@@ -755,12 +1190,21 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
         err_patches[n_err++] = a.len;
         a64_emit(&a, a64_cbz(0, 0));
         a64_emit(&a, a64_mov(20, 0));
-        size_t br_end = a.len;
-        a64_emit(&a, a64_b(0));
-        a.buf[br_not_int] = a64_b_cond(1, (int32_t)(a.len - br_not_int));
-        a64_emit_call_any(&a, err_patches, &n_err);
-        a.buf[br_end] = a64_b((int32_t)(a.len - br_end));
       }
+      size_t br_end1 = a.len;
+      a64_emit(&a, a64_b(0));
+      a.buf[br_not_int] = a64_b_cond(1, (int32_t)(a.len - br_not_int));
+      a64_load_u64(&a, 10, (uint64_t)(uintptr_t)Py_None);
+      a64_emit(&a, a64_cmp_reg(9, 10));
+      size_t br_any = a.len;
+      a64_emit(&a, a64_b_cond(1, 0));
+      a64_emit_literal(&a, "null", 4);
+      size_t br_end2 = a.len;
+      a64_emit(&a, a64_b(0));
+      a.buf[br_any] = a64_b_cond(1, (int32_t)(a.len - br_any));
+      a64_emit_call_any(&a, err_patches, &n_err);
+      a.buf[br_end1] = a64_b((int32_t)(a.len - br_end1));
+      a.buf[br_end2] = a64_b((int32_t)(a.len - br_end2));
     } else if (vt == JIT_VT_FLOAT) {
       a64_emit(&a, a64_ldr_uoff(10, 9, (uint32_t)offsetof(PyObject, ob_type)));
       a64_load_u64(&a, 11, (uint64_t)(uintptr_t)&PyFloat_Type);
@@ -792,80 +1236,11 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       a64_emit(&a, a64_cmp_reg(10, 11));
       size_t br_not_str = a.len;
       a64_emit(&a, a64_b_cond(1, 0));
-      if (compact_codegen && ascii_state_exp != 0) {
-        /* Inline short clean ASCII string (0..16 bytes, zero BLR, 100% ASan-safe!) */
-        a64_emit(&a, a64_ldr_w_uoff(10, 9, (uint32_t)offsetof(PyASCIIObject, state)));
-        a64_emit(&a, a64_bic_w_imm3(10, 10));
-        a64_emit(&a, a64_cmp_w_imm(10, (uint16_t)ascii_state_exp));
-        size_t br_slow1 = a.len;
-        a64_emit(&a, a64_b_cond(1, 0));
-        a64_emit(&a, a64_ldr_uoff(10, 9, (uint32_t)offsetof(PyASCIIObject, length)));
-        a64_emit(&a, a64_cmp_x_imm(10, 16));
-        size_t br_slow2 = a.len;
-        a64_emit(&a, a64_b_cond(8, 0)); /* B.HI slow */
-        /* Check dst <= safe_end (128B slack easily holds 16+2=18B) */
-        a64_emit(&a, a64_cmp_reg(20, 21));
-        size_t br_slow3 = a.len;
-        a64_emit(&a, a64_b_cond(8, 0)); /* B.HI slow */
-        /* Save X14 = dst; X11 = src = X9 + sizeof(PyASCIIObject) */
-        a64_emit(&a, a64_mov(14, 20));
-        a64_emit(&a, a64_add_imm(11, 9, (uint16_t)sizeof(PyASCIIObject)));
-        a64_emit(&a, a64_movz(12, '"', 0));
-        a64_emit(&a, a64_strb_post(12, 20, 1));
-        size_t br_empty = a.len;
-        a64_emit(&a, a64_cbz(10, 0));
-        size_t str_loop = a.len;
-        a64_emit(&a, a64_ldrb_post(13, 11, 1));
-        a64_emit(&a, a64_cmp_w_imm(13, 0x20));
-        size_t br_esc1 = a.len;
-        a64_emit(&a, a64_b_cond(3, 0)); /* B.LO esc */
-        a64_emit(&a, a64_cmp_w_imm(13, '"'));
-        size_t br_esc2 = a.len;
-        a64_emit(&a, a64_b_cond(0, 0)); /* B.EQ esc */
-        a64_emit(&a, a64_cmp_w_imm(13, '\\'));
-        size_t br_esc3 = a.len;
-        a64_emit(&a, a64_b_cond(0, 0)); /* B.EQ esc */
-        a64_emit(&a, a64_strb_post(13, 20, 1));
-        a64_emit(&a, a64_subs_x_imm(10, 10, 1));
-        a64_emit(&a, a64_b_cond(1, (int32_t)(str_loop - a.len))); /* B.NE str_loop */
-        a.buf[br_empty] = a64_cbz(10, (int32_t)(a.len - br_empty));
-        a64_emit(&a, a64_strb_post(12, 20, 1)); /* closing '"' */
-        size_t br_end_fast = a.len;
-        a64_emit(&a, a64_b(0));
-        /* esc: restore dst = X14 and fall through to slow */
-        a.buf[br_esc1] = a64_b_cond(3, (int32_t)(a.len - br_esc1));
-        a.buf[br_esc2] = a64_b_cond(0, (int32_t)(a.len - br_esc2));
-        a.buf[br_esc3] = a64_b_cond(0, (int32_t)(a.len - br_esc3));
-        a64_emit(&a, a64_mov(20, 14));
-        /* slow: */
-        a.buf[br_slow1] = a64_b_cond(1, (int32_t)(a.len - br_slow1));
-        a.buf[br_slow2] = a64_b_cond(8, (int32_t)(a.len - br_slow2));
-        a.buf[br_slow3] = a64_b_cond(8, (int32_t)(a.len - br_slow3));
-        a64_emit(&a, a64_mov(0, 25));
-        a64_emit(&a, a64_mov(1, 20));
-        a64_emit(&a, a64_mov(2, 28));
-        a64_emit(&a, a64_mov(3, 9));
-        a64_load_u64(&a, 12, (uint64_t)(uintptr_t)&cjson_jit_emit_str);
-        a64_emit(&a, a64_blr(12));
+      if (g_jit_stub_str_neon != NULL) {
+        /* 1-instruction BL to 16-byte NEON SIMD clean ASCII string stub (0..112B)! */
+        a64_emit_call_stub(&a, g_jit_stub_str_neon, planned_dest);
         err_patches[n_err++] = a.len;
         a64_emit(&a, a64_cbz(0, 0));
-        a64_emit(&a, a64_mov(20, 0));
-        a64_emit(&a, a64_ldr_uoff(21, 28, 0));
-        size_t br_end1 = a.len;
-        a64_emit(&a, a64_b(0));
-        a.buf[br_not_str] = a64_b_cond(1, (int32_t)(a.len - br_not_str));
-        a64_load_u64(&a, 10, (uint64_t)(uintptr_t)Py_None);
-        a64_emit(&a, a64_cmp_reg(9, 10));
-        size_t br_any = a.len;
-        a64_emit(&a, a64_b_cond(1, 0));
-        a64_emit_literal(&a, "null", 4);
-        size_t br_end2 = a.len;
-        a64_emit(&a, a64_b(0));
-        a.buf[br_any] = a64_b_cond(1, (int32_t)(a.len - br_any));
-        a64_emit_call_any(&a, err_patches, &n_err);
-        a.buf[br_end_fast] = a64_b((int32_t)(a.len - br_end_fast));
-        a.buf[br_end1] = a64_b((int32_t)(a.len - br_end1));
-        a.buf[br_end2] = a64_b((int32_t)(a.len - br_end2));
       } else {
         a64_emit(&a, a64_mov(0, 25));
         a64_emit(&a, a64_mov(1, 20));
@@ -877,12 +1252,21 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
         a64_emit(&a, a64_cbz(0, 0));
         a64_emit(&a, a64_mov(20, 0));
         a64_emit(&a, a64_ldr_uoff(21, 28, 0));
-        size_t br_end1 = a.len;
-        a64_emit(&a, a64_b(0));
-        a.buf[br_not_str] = a64_b_cond(1, (int32_t)(a.len - br_not_str));
-        a64_emit_call_any(&a, err_patches, &n_err);
-        a.buf[br_end1] = a64_b((int32_t)(a.len - br_end1));
       }
+      size_t br_end1 = a.len;
+      a64_emit(&a, a64_b(0));
+      a.buf[br_not_str] = a64_b_cond(1, (int32_t)(a.len - br_not_str));
+      a64_load_u64(&a, 10, (uint64_t)(uintptr_t)Py_None);
+      a64_emit(&a, a64_cmp_reg(9, 10));
+      size_t br_any = a.len;
+      a64_emit(&a, a64_b_cond(1, 0));
+      a64_emit_literal(&a, "null", 4);
+      size_t br_end2 = a.len;
+      a64_emit(&a, a64_b(0));
+      a.buf[br_any] = a64_b_cond(1, (int32_t)(a.len - br_any));
+      a64_emit_call_any(&a, err_patches, &n_err);
+      a.buf[br_end1] = a64_b((int32_t)(a.len - br_end1));
+      a.buf[br_end2] = a64_b((int32_t)(a.len - br_end2));
     } else if (vt == JIT_VT_DICT) {
       a64_emit(&a, a64_ldr_uoff(10, 9, (uint32_t)offsetof(PyObject, ob_type)));
       a64_load_u64(&a, 11, (uint64_t)(uintptr_t)&PyDict_Type);
@@ -1043,8 +1427,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
 #endif
 
   CJsonJitSplitLoopFn fn = (CJsonJitSplitLoopFn)(uintptr_t)dest;
-  uint32_t idx = g_jit_next_slot++;
-  JitSchemaEntry *slot = &g_jit_cache[idx];
+  JitSchemaEntry *slot = &g_jit_cache[target_idx];
   slot->sig_hash = h;
   slot->n = n;
   slot->kbuf_len = kbuf_len;

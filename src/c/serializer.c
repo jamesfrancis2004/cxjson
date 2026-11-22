@@ -2098,7 +2098,14 @@ encode_dict_array_cached(JsonBuffer *b, char *dst, char **safe_end_p,
           int ok = 1;
 #ifdef CJSON_SCHEMA_JIT
           uint8_t jit_vtypes[30];
-          int jit_ok = (len >= 32 && sn <= 30 && b->default_fn == NULL);
+          int jit_ok = (len >= 24 && sn <= 30 && b->default_fn == NULL &&
+                        i + 1 < len &&
+                        Py_TYPE(items[i + 1]) == &PyDict_Type &&
+                        ((PyDictObject *)items[i + 1])->ma_keys == mp->ma_keys &&
+                        ((PyDictObject *)items[i + 1])->ma_used == mp->ma_used &&
+                        Py_TYPE(items[len >> 1]) == &PyDict_Type &&
+                        ((PyDictObject *)items[len >> 1])->ma_keys == mp->ma_keys &&
+                        ((PyDictObject *)items[len >> 1])->ma_used == mp->ma_used);
 #endif
           PyObject *tk, *tv;
           Py_ssize_t tpos = 0;
@@ -2189,7 +2196,11 @@ encode_dict_array_cached(JsonBuffer *b, char *dst, char **safe_end_p,
                                          ((size_t)1 << log2_idx));
 #ifdef CJSON_SCHEMA_JIT
         if (CJSON_UNLIKELY(i == 0 && jit_fn == NULL && len >= 32 && b->default_fn == NULL &&
-                           mp->ma_used == nentries && nentries > 0 && nentries <= 30)) {
+                           mp->ma_used == nentries && nentries > 0 && nentries <= 30 &&
+                           Py_TYPE(items[1]) == &PyDict_Type &&
+                           ((PyDictObject *)items[1])->ma_used == nentries &&
+                           Py_TYPE(items[len >> 1]) == &PyDict_Type &&
+                           ((PyDictObject *)items[len >> 1])->ma_used == nentries)) {
           uint32_t cn = (uint32_t)nentries;
           uint32_t ckused = 0;
           int cok = 1;
