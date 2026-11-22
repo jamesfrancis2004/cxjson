@@ -1814,6 +1814,7 @@ static char *encode_array_fast(JsonBuffer *b, char *dst, char **safe_end_p,
                                PyObject *obj);
 
 #include "jit_ser_arm64.h"
+#include "jit_ser_x86_64.h"
 
 /* Out-of-line homogeneous dict-array encoder with per-call pre-encoded key
  * cache. Kept noinline so its 3KB stack cache never bloats encode_array_fast's
