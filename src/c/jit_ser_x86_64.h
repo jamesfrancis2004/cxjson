@@ -329,9 +329,9 @@ static inline uint32_t cjson_jit_get_ascii_state(void) {
   if (CJSON_UNLIKELY(!g_jit_ascii_state_inited)) {
     PyObject *probe = PyUnicode_FromString("ab");
     if (probe != NULL) {
-      uint32_t st = 0;
-      memcpy(&st, &((PyASCIIObject *)probe)->state, sizeof(st));
-      g_jit_ascii_state_val = st & ~3u;
+      uint8_t st = 0;
+      memcpy(&st, &((PyASCIIObject *)probe)->state, 1);
+      g_jit_ascii_state_val = (uint32_t)(st & 0x7Cu);
       Py_DECREF(probe);
     }
     g_jit_ascii_state_inited = 1;
@@ -369,9 +369,9 @@ static void cjson_jit_init_stubs_locked(void) {
   x64_b(&a, 0x49); x64_b(&a, 0x39); x64_b(&a, 0xDE);
   slow_patches[n_slow++] = x64_jcc32(&a, 0x87);
 
-  /* mov eax, [r9 + state]; and eax, -4; cmp eax, ascii_st; jne slow */
-  x64_b(&a, 0x41); x64_b(&a, 0x8B); x64_b(&a, 0x41); x64_b(&a, (uint8_t)offsetof(PyASCIIObject, state));
-  x64_b(&a, 0x83); x64_b(&a, 0xE0); x64_b(&a, 0xFC);
+  /* movzx eax, byte [r9 + state]; and eax, 0x7c; cmp eax, ascii_st; jne slow */
+  x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0xB6); x64_b(&a, 0x41); x64_b(&a, (uint8_t)offsetof(PyASCIIObject, state));
+  x64_b(&a, 0x83); x64_b(&a, 0xE0); x64_b(&a, 0x7C);
   x64_b(&a, 0x3D); x64_u32(&a, ascii_st);
   slow_patches[n_slow++] = x64_jcc32(&a, 0x85);
 
@@ -452,8 +452,72 @@ static void cjson_jit_init_stubs_locked(void) {
   x64_b(&a, 0x4C); x64_b(&a, 0x89); x64_b(&a, 0xF0); /* mov rax, r14 */
   x64_b(&a, 0xC3); /* ret */
 
-  /* === lt16: 1..15 bytes === */
+  /* === lt16: check 8..15 (overlapping 8B SSE2), 4..7 (overlapping 4B SSE2), 1..3 (scalar) === */
   x64_patch32(&a, br_lt16, a.len);
+  x64_b(&a, 0x48); x64_b(&a, 0x83); x64_b(&a, 0xF9); x64_b(&a, 8); /* cmp rcx, 8 */
+  size_t br_lt8 = x64_jcc32(&a, 0x82); /* jb lt8 */
+
+  /* 8 <= len <= 15: two overlapping 8B loads packed into xmm2, ONE SSE2 check */
+  x64_b(&a, 0x4C); x64_b(&a, 0x8D); x64_b(&a, 0x04); x64_b(&a, 0x0E); /* lea r8, [rsi + rcx] */
+  x64_b(&a, 0xF3); x64_b(&a, 0x0F); x64_b(&a, 0x7E); x64_b(&a, 0x06); /* movq xmm0, [rsi] */
+  x64_b(&a, 0xF3); x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0x7E); x64_b(&a, 0x48); x64_b(&a, (uint8_t)-8); /* movq xmm1, [r8-8] */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0xD0); /* movdqa xmm2, xmm0 */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x6C); x64_b(&a, 0xD1); /* punpcklqdq xmm2, xmm1 */
+  x64_mov_r10_u64(&a, (uint64_t)(uintptr_t)sse_consts);
+  x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0x1A); /* movdqa xmm3, [r10+0] (0x20) */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x64); x64_b(&a, 0xDA); /* pcmpgtb xmm3, xmm2 */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0xE2); /* movdqa xmm4, xmm2 */
+  x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0x74); x64_b(&a, 0x62); x64_b(&a, 16); /* pcmpeqb xmm4, [r10+16] */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0xEB); x64_b(&a, 0xDC); /* por xmm3, xmm4 */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0xE2); /* movdqa xmm4, xmm2 */
+  x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0x74); x64_b(&a, 0x62); x64_b(&a, 32); /* pcmpeqb xmm4, [r10+32] */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0xEB); x64_b(&a, 0xDC); /* por xmm3, xmm4 */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0xD7); x64_b(&a, 0xC3); /* pmovmskb eax, xmm3 */
+  x64_b(&a, 0x85); x64_b(&a, 0xC0); /* test eax, eax */
+  slow_patches[n_slow++] = x64_jcc32(&a, 0x85); /* jnz slow (r14 untouched!) */
+  x64_b(&a, 0x41); x64_b(&a, 0xC6); x64_b(&a, 0x06); x64_b(&a, '"');
+  x64_b(&a, 0x49); x64_b(&a, 0xFF); x64_b(&a, 0xC6); /* inc r14 */
+  x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0xD6); x64_b(&a, 0x06); /* movq [r14], xmm0 */
+  x64_b(&a, 0x49); x64_b(&a, 0x01); x64_b(&a, 0xCE); /* add r14, rcx */
+  x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0xD6); x64_b(&a, 0x4E); x64_b(&a, (uint8_t)-8); /* movq [r14-8], xmm1 */
+  x64_b(&a, 0x41); x64_b(&a, 0xC6); x64_b(&a, 0x06); x64_b(&a, '"');
+  x64_b(&a, 0x49); x64_b(&a, 0xFF); x64_b(&a, 0xC6);
+  x64_b(&a, 0x4C); x64_b(&a, 0x89); x64_b(&a, 0xF0);
+  x64_b(&a, 0xC3);
+
+  /* lt8: 4 <= len <= 7 (two overlapping 4B loads packed into xmm2, ONE SSE2 check on low 8B) */
+  x64_patch32(&a, br_lt8, a.len);
+  x64_b(&a, 0x48); x64_b(&a, 0x83); x64_b(&a, 0xF9); x64_b(&a, 4); /* cmp rcx, 4 */
+  size_t br_lt4 = x64_jcc32(&a, 0x82); /* jb lt4 */
+  x64_b(&a, 0x4C); x64_b(&a, 0x8D); x64_b(&a, 0x04); x64_b(&a, 0x0E); /* lea r8, [rsi + rcx] */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x6E); x64_b(&a, 0x06); /* movd xmm0, [rsi] */
+  x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0x6E); x64_b(&a, 0x48); x64_b(&a, (uint8_t)-4); /* movd xmm1, [r8-4] */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0xD0); /* movdqa xmm2, xmm0 */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x62); x64_b(&a, 0xD1); /* punpckldq xmm2, xmm1 */
+  x64_mov_r10_u64(&a, (uint64_t)(uintptr_t)sse_consts);
+  x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0x1A);
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x64); x64_b(&a, 0xDA);
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0xE2);
+  x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0x74); x64_b(&a, 0x62); x64_b(&a, 16);
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0xEB); x64_b(&a, 0xDC);
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0xE2);
+  x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0x74); x64_b(&a, 0x62); x64_b(&a, 32);
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0xEB); x64_b(&a, 0xDC);
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0xD7); x64_b(&a, 0xC3); /* pmovmskb eax, xmm3 */
+  x64_b(&a, 0x84); x64_b(&a, 0xC0); /* test al, al (low 8 bytes only!) */
+  slow_patches[n_slow++] = x64_jcc32(&a, 0x85); /* jnz slow */
+  x64_b(&a, 0x41); x64_b(&a, 0xC6); x64_b(&a, 0x06); x64_b(&a, '"');
+  x64_b(&a, 0x49); x64_b(&a, 0xFF); x64_b(&a, 0xC6);
+  x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0x7E); x64_b(&a, 0x06); /* movd [r14], xmm0 */
+  x64_b(&a, 0x49); x64_b(&a, 0x01); x64_b(&a, 0xCE); /* add r14, rcx */
+  x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0x7E); x64_b(&a, 0x4E); x64_b(&a, (uint8_t)-4); /* movd [r14-4], xmm1 */
+  x64_b(&a, 0x41); x64_b(&a, 0xC6); x64_b(&a, 0x06); x64_b(&a, '"');
+  x64_b(&a, 0x49); x64_b(&a, 0xFF); x64_b(&a, 0xC6);
+  x64_b(&a, 0x4C); x64_b(&a, 0x89); x64_b(&a, 0xF0);
+  x64_b(&a, 0xC3);
+
+  /* === lt4: 1..3 bytes === */
+  x64_patch32(&a, br_lt4, a.len);
   x64_b(&a, 0x4D); x64_b(&a, 0x89); x64_b(&a, 0xF3); /* mov r11, r14 */
   x64_b(&a, 0x41); x64_b(&a, 0xC6); x64_b(&a, 0x06); x64_b(&a, '"');
   x64_b(&a, 0x49); x64_b(&a, 0xFF); x64_b(&a, 0xC6);
@@ -828,8 +892,8 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
         const char *rk = kbuf + koff[j] + 2u;
         size_t br_key_ok = x64_jcc32(&a, 0x84); /* je key_ok */
         /* Inline byte-equality fallback */
-        x64_b(&a, 0x41); x64_b(&a, 0x8B); x64_b(&a, 0x42); x64_b(&a, (uint8_t)offsetof(PyASCIIObject, state));
-        x64_b(&a, 0x83); x64_b(&a, 0xE0); x64_b(&a, 0xFC);
+        x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0xB6); x64_b(&a, 0x42); x64_b(&a, (uint8_t)offsetof(PyASCIIObject, state));
+        x64_b(&a, 0x83); x64_b(&a, 0xE0); x64_b(&a, 0x7C);
         x64_b(&a, 0x3D); x64_u32(&a, ascii_st);
         done_patches[n_done++] = x64_jcc32(&a, 0x85);
         x64_b(&a, 0x49); x64_b(&a, 0x83); x64_b(&a, 0x7A); x64_b(&a, (uint8_t)offsetof(PyASCIIObject, length)); x64_b(&a, (uint8_t)raw_klen);
