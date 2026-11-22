@@ -1830,6 +1830,18 @@ static char *encode_dict_array_cached(
                 memcpy(dst, "false", 5);
                 dst += 5;
               }
+#if PY_VERSION_HEX >= 0x030D0000
+#define CJSON_SPLIT_MUTATED() \
+  (mp->ma_values != orig_vals || mp->ma_keys != split_dk || \
+   (uint32_t)mp->ma_used != split_n || dv->valid != 1 || \
+   dv->size != (uint8_t)split_n || dv->size > dv->capacity || \
+   memcmp((const uint8_t *)&dv->values[dv->capacity], split_order, split_n) != 0)
+#else
+#define CJSON_SPLIT_MUTATED() \
+  (mp->ma_values != orig_vals || mp->ma_keys != split_dk || \
+   (uint32_t)mp->ma_used != split_n || vraw[-2] != (uint8_t)split_n || \
+   memcmp(vraw - 2 - split_n, split_prefix, split_n) != 0)
+#endif
             } else if (vtp == &PyList_Type || vtp == &PyTuple_Type) {
               if (PySequence_Fast_GET_SIZE(dval) == 0) {
                 dst[0] = '['; dst[1] = ']'; dst += 2;
@@ -1837,17 +1849,7 @@ static char *encode_dict_array_cached(
                 dst = encode_array_fast(b, dst, &safe_end, dval);
                 if (CJSON_UNLIKELY(dst == NULL)) { b->depth--; return NULL; }
               }
-              if (CJSON_UNLIKELY(mp->ma_values != orig_vals || mp->ma_keys != split_dk ||
-                                 (uint32_t)mp->ma_used != split_n
-#if PY_VERSION_HEX >= 0x030D0000
-                                 || dv->valid != 1 || dv->size != (uint8_t)split_n ||
-                                 dv->size > dv->capacity ||
-                                 memcmp((const uint8_t *)&dv->values[dv->capacity], split_order, split_n) != 0
-#else
-                                 || vraw[-2] != (uint8_t)split_n ||
-                                 memcmp(vraw - 2 - split_n, split_prefix, split_n) != 0
-#endif
-                                 )) {
+              if (CJSON_UNLIKELY(CJSON_SPLIT_MUTATED())) {
                 b->depth--;
                 PyErr_SetString(PyExc_RuntimeError, "dictionary changed size during iteration");
                 return NULL;
@@ -1859,17 +1861,7 @@ static char *encode_dict_array_cached(
                 dst = encode_dict_fast(b, dst, &safe_end, dval);
                 if (CJSON_UNLIKELY(dst == NULL)) { b->depth--; return NULL; }
               }
-              if (CJSON_UNLIKELY(mp->ma_values != orig_vals || mp->ma_keys != split_dk ||
-                                 (uint32_t)mp->ma_used != split_n
-#if PY_VERSION_HEX >= 0x030D0000
-                                 || dv->valid != 1 || dv->size != (uint8_t)split_n ||
-                                 dv->size > dv->capacity ||
-                                 memcmp((const uint8_t *)&dv->values[dv->capacity], split_order, split_n) != 0
-#else
-                                 || vraw[-2] != (uint8_t)split_n ||
-                                 memcmp(vraw - 2 - split_n, split_prefix, split_n) != 0
-#endif
-                                 )) {
+              if (CJSON_UNLIKELY(CJSON_SPLIT_MUTATED())) {
                 b->depth--;
                 PyErr_SetString(PyExc_RuntimeError, "dictionary changed size during iteration");
                 return NULL;
@@ -1882,22 +1874,13 @@ static char *encode_dict_array_cached(
               }
               dst = b->data + b->len;
               safe_end = b->data + b->cap - 128;
-              if (CJSON_UNLIKELY(mp->ma_values != orig_vals || mp->ma_keys != split_dk ||
-                                 (uint32_t)mp->ma_used != split_n
-#if PY_VERSION_HEX >= 0x030D0000
-                                 || dv->valid != 1 || dv->size != (uint8_t)split_n ||
-                                 dv->size > dv->capacity ||
-                                 memcmp((const uint8_t *)&dv->values[dv->capacity], split_order, split_n) != 0
-#else
-                                 || vraw[-2] != (uint8_t)split_n ||
-                                 memcmp(vraw - 2 - split_n, split_prefix, split_n) != 0
-#endif
-                                 )) {
+              if (CJSON_UNLIKELY(CJSON_SPLIT_MUTATED())) {
                 b->depth--;
                 PyErr_SetString(PyExc_RuntimeError, "dictionary changed size during iteration");
                 return NULL;
               }
             }
+#undef CJSON_SPLIT_MUTATED
           }
           *dst++ = '}';
           b->depth--;
