@@ -15,7 +15,7 @@ static inline PyObject *make_ascii_str(const char *start, Py_ssize_t len) {
   }
 #if PY_VERSION_HEX >= 0x030C0000 && PY_VERSION_HEX < 0x030F0000 && \
     !defined(Py_GIL_DISABLED) && !defined(Py_LIMITED_API) && !defined(PYPY_VERSION) && \
-    !defined(Py_TRACE_REFS) && !defined(Py_REF_DEBUG)
+    !defined(Py_TRACE_REFS) && !defined(Py_REF_DEBUG) && !defined(Py_STATS)
   if (CJSON_LIKELY(len <= 4096)) {
     PyASCIIObject *ascii = (PyASCIIObject *)PyObject_Malloc(sizeof(PyASCIIObject) + (size_t)len + 1u);
     if (CJSON_UNLIKELY(ascii == NULL)) return PyErr_NoMemory();

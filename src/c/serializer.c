@@ -1713,10 +1713,9 @@ static char *encode_dict_array_cached(
   PyDictKeysObject *split_dk = NULL;
   uint32_t split_n = 0;
 #if PY_VERSION_HEX < 0x030D0000
-  uint8_t split_psize = 0;
   uint8_t split_prefix[32];
-  uint8_t split_order[30];
 #endif
+  uint8_t split_order[30];
   uint16_t split_koff[30];
   uint16_t split_klen[30];
   char split_kbuf[1024];
@@ -1761,15 +1760,19 @@ static char *encode_dict_array_cached(
       if (mp->ma_values != NULL && mp->ma_used > 0 && mp->ma_used <= 30) {
 #if PY_VERSION_HEX >= 0x030D0000
         const CJsonSerDictValues313 *dv = (const CJsonSerDictValues313 *)mp->ma_values;
+        const uint8_t *dv_order = (const uint8_t *)&dv->values[dv->capacity];
         int split_hit = (mp->ma_keys == split_dk && (uint32_t)mp->ma_used == split_n &&
-                         dv->valid == 1 && dv->size == (uint8_t)split_n);
+                         dv->valid == 1 && dv->size == (uint8_t)split_n &&
+                         dv->size <= dv->capacity &&
+                         memcmp(dv_order, split_order, split_n) == 0);
         PyObject *const *svals = dv->values;
 #else
         const uint8_t *vraw = (const uint8_t *)mp->ma_values;
         uint8_t psize = vraw[-1];
         int split_hit = (mp->ma_keys == split_dk && (uint32_t)mp->ma_used == split_n &&
-                         psize == split_psize && psize <= 32 &&
-                         memcmp(vraw - psize, split_prefix, psize) == 0);
+                         psize <= 32 && (uint32_t)psize >= 2u + split_n &&
+                         vraw[-2] == (uint8_t)split_n &&
+                         memcmp(vraw - 2 - split_n, split_prefix, split_n) == 0);
         PyObject *const *svals = (PyObject *const *)mp->ma_values;
 #endif
         if (CJSON_LIKELY(split_hit)) {
@@ -1794,11 +1797,12 @@ static char *encode_dict_array_cached(
               dst = b->data + b->len;
               safe_end = b->data + b->cap - 128;
             }
-#if PY_VERSION_HEX >= 0x030D0000
-            PyObject *dval = svals[j];
-#else
             PyObject *dval = svals[split_order[j]];
-#endif
+            if (CJSON_UNLIKELY(dval == NULL)) {
+              b->depth--;
+              PyErr_SetString(PyExc_RuntimeError, "dictionary changed size during iteration");
+              return NULL;
+            }
             PyTypeObject *vtp = Py_TYPE(dval);
             if (vtp == &PyUnicode_Type) {
               dst = emit_str_inline(b, dst, &safe_end, dval);
@@ -1834,7 +1838,16 @@ static char *encode_dict_array_cached(
                 if (CJSON_UNLIKELY(dst == NULL)) { b->depth--; return NULL; }
               }
               if (CJSON_UNLIKELY(mp->ma_values != orig_vals || mp->ma_keys != split_dk ||
-                                 (uint32_t)mp->ma_used != split_n)) {
+                                 (uint32_t)mp->ma_used != split_n
+#if PY_VERSION_HEX >= 0x030D0000
+                                 || dv->valid != 1 || dv->size != (uint8_t)split_n ||
+                                 dv->size > dv->capacity ||
+                                 memcmp((const uint8_t *)&dv->values[dv->capacity], split_order, split_n) != 0
+#else
+                                 || vraw[-2] != (uint8_t)split_n ||
+                                 memcmp(vraw - 2 - split_n, split_prefix, split_n) != 0
+#endif
+                                 )) {
                 b->depth--;
                 PyErr_SetString(PyExc_RuntimeError, "dictionary changed size during iteration");
                 return NULL;
@@ -1847,7 +1860,16 @@ static char *encode_dict_array_cached(
                 if (CJSON_UNLIKELY(dst == NULL)) { b->depth--; return NULL; }
               }
               if (CJSON_UNLIKELY(mp->ma_values != orig_vals || mp->ma_keys != split_dk ||
-                                 (uint32_t)mp->ma_used != split_n)) {
+                                 (uint32_t)mp->ma_used != split_n
+#if PY_VERSION_HEX >= 0x030D0000
+                                 || dv->valid != 1 || dv->size != (uint8_t)split_n ||
+                                 dv->size > dv->capacity ||
+                                 memcmp((const uint8_t *)&dv->values[dv->capacity], split_order, split_n) != 0
+#else
+                                 || vraw[-2] != (uint8_t)split_n ||
+                                 memcmp(vraw - 2 - split_n, split_prefix, split_n) != 0
+#endif
+                                 )) {
                 b->depth--;
                 PyErr_SetString(PyExc_RuntimeError, "dictionary changed size during iteration");
                 return NULL;
@@ -1861,7 +1883,16 @@ static char *encode_dict_array_cached(
               dst = b->data + b->len;
               safe_end = b->data + b->cap - 128;
               if (CJSON_UNLIKELY(mp->ma_values != orig_vals || mp->ma_keys != split_dk ||
-                                 (uint32_t)mp->ma_used != split_n)) {
+                                 (uint32_t)mp->ma_used != split_n
+#if PY_VERSION_HEX >= 0x030D0000
+                                 || dv->valid != 1 || dv->size != (uint8_t)split_n ||
+                                 dv->size > dv->capacity ||
+                                 memcmp((const uint8_t *)&dv->values[dv->capacity], split_order, split_n) != 0
+#else
+                                 || vraw[-2] != (uint8_t)split_n ||
+                                 memcmp(vraw - 2 - split_n, split_prefix, split_n) != 0
+#endif
+                                 )) {
                 b->depth--;
                 PyErr_SetString(PyExc_RuntimeError, "dictionary changed size during iteration");
                 return NULL;
@@ -1875,7 +1906,8 @@ static char *encode_dict_array_cached(
         }
         /* Warm the 1-pointer split-table template on first sight */
 #if PY_VERSION_HEX >= 0x030D0000
-        if (dv->valid == 1 && dv->size == (uint8_t)mp->ma_used) {
+        if (dv->valid == 1 && dv->size == (uint8_t)mp->ma_used &&
+            dv->size <= dv->capacity) {
 #else
         if (psize <= 32 && vraw[-2] == (uint8_t)mp->ma_used) {
 #endif
@@ -1887,7 +1919,13 @@ static char *encode_dict_array_cached(
           uint32_t tj = 0;
           while (PyDict_Next(item, &tpos, &tk, &tv) && tj < sn) {
 #if PY_VERSION_HEX >= 0x030D0000
-            if (CJSON_UNLIKELY(tv != dv->values[tj])) { ok = 0; break; }
+            uint8_t ix = dv_order[tj];
+            if (CJSON_UNLIKELY(ix >= dv->capacity || tv != dv->values[ix])) { ok = 0; break; }
+            split_order[tj] = ix;
+#else
+            uint8_t ix = vraw[-3 - (int)tj];
+            if (CJSON_UNLIKELY(tv != svals[ix])) { ok = 0; break; }
+            split_order[tj] = ix;
 #endif
             if (!PyUnicode_IS_COMPACT_ASCII(tk)) { ok = 0; break; }
             Py_ssize_t tkl = PyUnicode_GET_LENGTH(tk);
@@ -1902,9 +1940,6 @@ static char *encode_dict_array_cached(
             kdst[3 + tkl] = ':';
             split_koff[tj] = (uint16_t)kused;
             split_klen[tj] = (uint16_t)(tkl + 4);
-#if PY_VERSION_HEX < 0x030D0000
-            split_order[tj] = vraw[-3 - (int)tj];
-#endif
             kused += (uint32_t)(tkl + 4);
             tj++;
           }
@@ -1912,8 +1947,7 @@ static char *encode_dict_array_cached(
             split_dk = mp->ma_keys;
             split_n = sn;
 #if PY_VERSION_HEX < 0x030D0000
-            split_psize = psize;
-            memcpy(split_prefix, vraw - psize, psize);
+            memcpy(split_prefix, vraw - 2 - sn, sn);
 #endif
           }
         }

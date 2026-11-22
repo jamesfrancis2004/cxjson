@@ -474,6 +474,121 @@ def test_direct_dict_float_pair_and_parallel_numpy():
     assert cxjson.dumps(nan_arr, option=cxjson.OPT_SERIALIZE_NUMPY) == cxjson.dumps(nan_arr.tolist())
 
 
+def test_cpython_internal_invariants():
+    """Verify every CPython-internal optimization invariant across 3.12 / 3.13 / 3.14:
+    1. Split-table obj.__dict__ key insertion order & partial-attribute NULL slots.
+    2. Split-table default() delete+insert same-size mutation safety.
+    3. Shared-keys (cjson_build_shared_keys) USABLE_FRACTION sizing across all log2_size buckets.
+    4. Manual PyASCIIObject & PyLongObject constructors (non-immortal refcnt, hash, repr, boundaries).
+    """
+    # 1a. Split-table obj.__dict__ differing insertion order must preserve exact key order
+    class Foo:
+        pass
+    a = Foo(); a.x = 1; a.y = 2
+    b = Foo(); b.y = 2; b.x = 1
+    c = Foo(); c.x = 3; c.y = 4
+    d = Foo(); d.y = 4; d.x = 3
+    dicts_order = [a.__dict__, b.__dict__, c.__dict__, d.__dict__] * 3
+    expected_order = json.dumps(dicts_order, separators=(",", ":")).encode("utf-8")
+    assert cxjson.dumps(dicts_order) == expected_order
+
+    # 1b. Split-table obj.__dict__ with partial attributes (NULL slots in dv->values[])
+    class Bar:
+        pass
+    seed = Bar(); seed.a = 10; seed.b = 20; seed.c = 30
+    o1 = Bar(); o1.a = 1; o1.b = 2
+    o2 = Bar(); o2.b = 2; o2.c = 3
+    o3 = Bar(); o3.c = 3; o3.a = 1
+    o4 = Bar(); o4.c = 3; o4.b = 2; o4.a = 1
+    o5 = Bar(); o5.a = 1; o5.b = 2; del o5.a
+    o6 = Bar(); o6.a = 1; o6.b = 2; o6.c = 3; del o6.b
+    for seq in (
+        [o1.__dict__, o2.__dict__, o3.__dict__, o4.__dict__, o5.__dict__, o6.__dict__, seed.__dict__] * 2,
+        [seed.__dict__, o4.__dict__, o2.__dict__, o1.__dict__, o3.__dict__, o6.__dict__, o5.__dict__] * 2,
+        [o4.__dict__, o4.__dict__, o1.__dict__, o2.__dict__, o2.__dict__, o3.__dict__] * 2,
+    ):
+        expected = json.dumps(seq, separators=(",", ":")).encode("utf-8")
+        assert cxjson.dumps(seq) == expected
+
+    # 1c. Homogeneous reverse-order split dicts (hits split_hit with non-identity split_order)
+    class Rev:
+        pass
+    rseed = Rev(); rseed.a = 0; rseed.b = 0; rseed.c = 0
+    revs = []
+    for i in range(20):
+        r = Rev()
+        r.c = i * 3
+        r.b = i * 2
+        r.a = i
+        revs.append(r.__dict__)
+    assert cxjson.dumps(revs) == json.dumps(revs, separators=(",", ":")).encode("utf-8")
+
+    # 2. Split-table default() delete + insert keeping ma_used == split_n must raise RuntimeError
+    class Mutator:
+        pass
+    class Baz:
+        pass
+    bseed = Baz(); bseed.a = 0; bseed.b = 0; bseed.c = 0
+    b1 = Baz(); b1.a = 1; b1.b = 2
+    b2 = Baz(); b2.a = Mutator(); b2.b = 2
+    def swap_keys(_x):
+        del b2.b
+        b2.c = 99
+        return "mut"
+    try:
+        cxjson.dumps([b1.__dict__] * 5 + [b2.__dict__] + [b1.__dict__] * 4, default=swap_keys)
+        raise AssertionError("Expected RuntimeError when split-dict keys swapped during dumps")
+    except RuntimeError:
+        pass
+
+    # 3. Shared-keys USABLE_FRACTION sizing across log2_size=4 (n<=10), 5 (11..21), 6 (22..30)
+    for n in (1, 3, 10, 11, 21, 22, 30):
+        raw = cxjson.dumps([{f"k{j:02d}": i + j for j in range(n)} for i in range(8)])
+        loaded = cxjson.loads(raw)
+        assert len(loaded) == 8
+        for item in loaded:
+            assert sys.getsizeof(item) > 0
+            cp = item.copy()
+            assert cp == item
+        loaded[4][f"extra_{n}"] = [1, 2, 3]
+        del loaded[5]["k00"]
+        loaded[6].update({"k00": -1, "new_key": "ok"})
+        assert cxjson.loads(cxjson.dumps(loaded)) == loaded
+
+    # 4. Manual PyLongObject & PyASCIIObject constructor invariants
+    boundary_ints = [
+        0, 1, -1, 5, -5, 256, 257, 2100, 2101,
+        (1 << 30) - 1, -((1 << 30) - 1),
+        (1 << 30), -(1 << 30),
+        (1 << 60) - 1, -((1 << 60) - 1),
+        (1 << 60), -(1 << 60),
+        (1 << 63) - 1, -(1 << 63),
+        (1 << 64) - 1,
+    ]
+    parsed_ints = cxjson.loads(json.dumps(boundary_ints))
+    assert parsed_ints == boundary_ints
+    for v, ref in zip(parsed_ints, boundary_ints):
+        assert type(v) is int
+        assert v == ref
+        assert hash(v) == hash(ref)
+        assert repr(v) == repr(ref)
+        if abs(ref) > 2100:
+            # Must NOT be accidentally immortal (refcnt ~ 2^30)
+            assert sys.getrefcount(v) < 100
+
+    for slen in (0, 1, 2, 7, 8, 15, 16, 17, 64, 512, 4096, 4097):
+        ref = f"u{slen}_" + ("x" * max(0, slen - len(f"u{slen}_")))
+        ref = ref[:slen]
+        s = cxjson.loads(json.dumps(ref))
+        assert type(s) is str
+        assert s == ref
+        assert len(s) == slen
+        assert hash(s) == hash(ref)
+        assert repr(s) == repr(ref)
+        if slen >= 2:
+            assert sys.getrefcount(s) < 100
+
+
 if __name__ == "__main__":
     test_split_dict_gc_cycles_and_tracking()
     print("PASS: test_split_dict_gc_cycles_and_tracking")
@@ -491,4 +606,6 @@ if __name__ == "__main__":
     print("PASS: test_slotted_dataclass_and_split_dict_dumps")
     test_direct_dict_float_pair_and_parallel_numpy()
     print("PASS: test_direct_dict_float_pair_and_parallel_numpy")
+    test_cpython_internal_invariants()
+    print("PASS: test_cpython_internal_invariants")
     print("\nALL v0.1.1 REGRESSION TESTS PASSED!")

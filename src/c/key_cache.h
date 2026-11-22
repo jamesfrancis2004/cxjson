@@ -413,10 +413,13 @@ static CJsonDictKeysObject *cjson_build_shared_keys(
     PyObject *const *keys, const Py_hash_t *hashes, uint32_t n) {
   if (n == 0 || n > CJSON_SPLIT_MAX_KEYS) return NULL;
   /* Use log2_size >= 4 so CPython's free_keys_object never puts it in the
-   * log2_size==3 freelist (which expects fixed 5-entry size). */
+   * log2_size==3 freelist (which expects fixed 5-entry size).
+   * Allocate full USABLE_FRACTION(1 << log2_size) entries so the allocation
+   * matches CPython's _PyDict_KeysSize(dk) invariant. */
   uint8_t log2_size = (n <= 10) ? 4 : ((n <= 21) ? 5 : 6);
   size_t table_size = (size_t)1 << log2_size;
-  size_t alloc_size = sizeof(CJsonDictKeysObject) + table_size + (size_t)n * sizeof(CJsonDictUnicodeEntry);
+  size_t usable = (table_size * 2u) / 3u;
+  size_t alloc_size = sizeof(CJsonDictKeysObject) + table_size + usable * sizeof(CJsonDictUnicodeEntry);
   CJsonDictKeysObject *dk = (CJsonDictKeysObject *)PyObject_Malloc(alloc_size);
   if (dk == NULL) return NULL;
   dk->dk_refcnt = 1;
@@ -441,6 +444,9 @@ static CJsonDictKeysObject *cjson_build_shared_keys(
       j = (j * 5 + perturb + 1) & mask;
     }
     dk->dk_indices[j] = (char)(int8_t)i;
+  }
+  if ((size_t)n < usable) {
+    memset(&ep[n], 0, (usable - (size_t)n) * sizeof(CJsonDictUnicodeEntry));
   }
   return dk;
 }
