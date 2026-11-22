@@ -125,7 +125,10 @@ static inline PyObject *cjson_new_pylong_u64(uint64_t mag, int is_neg) {
 #if PY_VERSION_HEX >= 0x030C0000 && PY_VERSION_HEX < 0x030F0000 && \
     PYLONG_BITS_IN_DIGIT == 30 && !defined(Py_GIL_DISABLED) && \
     !defined(Py_LIMITED_API) && !defined(PYPY_VERSION) && \
-    !defined(Py_TRACE_REFS) && !defined(Py_REF_DEBUG)
+    !defined(Py_TRACE_REFS) && !defined(Py_REF_DEBUG) && !defined(Py_STATS)
+  if (CJSON_UNLIKELY(mag == 0)) {
+    return PyLong_FromLong(0);
+  }
   if (CJSON_LIKELY(mag < (1ULL << 30))) {
     PyLongObject *lo = (PyLongObject *)PyObject_Malloc(
         offsetof(PyLongObject, long_value.ob_digit) + sizeof(digit));

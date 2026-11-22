@@ -2668,6 +2668,86 @@ static void verify_split_dict_selfcheck(void) {
 }
 #endif
 
+static int verify_manual_object_selfcheck(void) {
+  /* Poison PyObject_Malloc freelist slots with 0xFF so recycled memory tests
+   * that manual constructors never inherit immortal refcounts or dirty flags. */
+#if PY_VERSION_HEX >= 0x030C0000 && PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED) && !defined(Py_LIMITED_API) && !defined(PYPY_VERSION)
+  {
+    size_t sz_str12 = sizeof(PyASCIIObject) + 13u;
+    size_t sz_long1 = offsetof(PyLongObject, long_value.ob_digit) + sizeof(digit);
+    size_t sz_long2 = offsetof(PyLongObject, long_value.ob_digit) + 2u * sizeof(digit);
+    void *p1 = PyObject_Malloc(sz_str12);
+    void *p2 = PyObject_Malloc(sz_long1);
+    void *p3 = PyObject_Malloc(sz_long2);
+    if (p1) { memset(p1, 0xFF, sz_str12); PyObject_Free(p1); }
+    if (p2) { memset(p2, 0xFF, sz_long1); PyObject_Free(p2); }
+    if (p3) { memset(p3, 0xFF, sz_long2); PyObject_Free(p3); }
+  }
+#endif
+
+  /* Verify make_ascii_str() layout, refcount == 1, hash, and repr */
+  static const char *const str_probes[] = {"ab", "hello_cxjson", "0123456789abcdef_0123456789abcdef"};
+  for (size_t i = 0; i < sizeof(str_probes) / sizeof(str_probes[0]); i++) {
+    Py_ssize_t slen = (Py_ssize_t)strlen(str_probes[i]);
+    PyObject *s = make_ascii_str(str_probes[i], slen);
+    PyObject *ref = PyUnicode_FromStringAndSize(str_probes[i], slen);
+    int ok = (s != NULL && ref != NULL && PyUnicode_CheckExact(s) &&
+              PyUnicode_IS_COMPACT_ASCII(s) && Py_REFCNT(s) == 1 &&
+              PyUnicode_GET_LENGTH(s) == slen &&
+              PyUnicode_Compare(s, ref) == 0 &&
+              PyObject_Hash(s) == PyObject_Hash(ref));
+    if (ok) {
+      PyObject *r = PyObject_Repr(s);
+      if (r == NULL) ok = 0;
+      Py_XDECREF(r);
+    }
+    Py_XDECREF(s);
+    Py_XDECREF(ref);
+    if (!ok) {
+      PyErr_SetString(PyExc_ImportError, "cxjson: CPython PyASCIIObject layout self-check failed");
+      return -1;
+    }
+  }
+
+  /* Verify cjson_new_pylong_u64() for 0, 1-digit, and 2-digit +/- integers */
+  static const struct {
+    uint64_t mag;
+    int is_neg;
+    long long expected;
+  } int_probes[] = {
+      {0ULL, 0, 0LL},
+      {1000000ULL, 0, 1000000LL},
+      {1000000ULL, 1, -1000000LL},
+      {(1ULL << 30) - 1ULL, 0, (long long)((1ULL << 30) - 1ULL)},
+      {(1ULL << 30) - 1ULL, 1, -(long long)((1ULL << 30) - 1ULL)},
+      {1ULL << 30, 0, (long long)(1ULL << 30)},
+      {1ULL << 30, 1, -(long long)(1ULL << 30)},
+      {(1ULL << 60) - 1ULL, 0, (long long)((1ULL << 60) - 1ULL)},
+      {(1ULL << 60) - 1ULL, 1, -(long long)((1ULL << 60) - 1ULL)},
+  };
+  for (size_t i = 0; i < sizeof(int_probes) / sizeof(int_probes[0]); i++) {
+    PyObject *v = cjson_new_pylong_u64(int_probes[i].mag, int_probes[i].is_neg);
+    PyObject *ref = PyLong_FromLongLong(int_probes[i].expected);
+    int ok = (v != NULL && ref != NULL && PyLong_CheckExact(v) &&
+              (int_probes[i].mag == 0 || Py_REFCNT(v) == 1) &&
+              PyObject_RichCompareBool(v, ref, Py_EQ) == 1 &&
+              PyObject_Hash(v) == PyObject_Hash(ref));
+    if (ok) {
+      PyObject *r = PyObject_Repr(v);
+      if (r == NULL) ok = 0;
+      Py_XDECREF(r);
+    }
+    Py_XDECREF(v);
+    Py_XDECREF(ref);
+    if (!ok) {
+      PyErr_SetString(PyExc_ImportError, "cxjson: CPython PyLongObject layout self-check failed");
+      return -1;
+    }
+  }
+  return 0;
+}
+
 int init_deserializer_types(void) {
   if (g_empty_str == NULL) {
     g_empty_str = PyUnicode_FromStringAndSize("", 0);
@@ -2694,6 +2774,9 @@ int init_deserializer_types(void) {
   JSONDecodeError = PyErr_NewException("cxjson.JSONDecodeError", base_err, NULL);
   Py_DECREF(base_err);
   if (JSONDecodeError == NULL) return -1;
+  if (verify_manual_object_selfcheck() < 0) {
+    return -1;
+  }
 #if defined(CJSON_SPLIT_DICT_FAST)
   verify_split_dict_selfcheck();
 #endif

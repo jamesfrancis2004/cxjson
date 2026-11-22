@@ -529,25 +529,59 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
     a64_emit(&a, a64_cbz(22, 0));
 
 #if PY_VERSION_HEX >= 0x030D0000
-    a64_emit(&a, a64_ldurb(10, 22, 1));
+    /* Verify dv->size == n, dv->valid == 1, dv->capacity >= n, and
+     * get_insertion_order_array(dv) = (uint8_t *)&dv->values[dv->capacity] matches order[0..n-1]. */
+    a64_emit(&a, a64_ldurb(10, 22, 1)); /* dv->size */
     a64_emit(&a, a64_cmp_w_imm(10, (uint16_t)n));
     done_patches[n_done++] = a.len;
     a64_emit(&a, a64_b_cond(1, 0));
-    a64_emit(&a, a64_ldurb(10, 22, 3));
+    a64_emit(&a, a64_ldurb(10, 22, 3)); /* dv->valid */
     a64_emit(&a, a64_cmp_w_imm(10, 1));
     done_patches[n_done++] = a.len;
     a64_emit(&a, a64_b_cond(1, 0));
-    a64_emit(&a, a64_add_imm(22, 22, 8));
+    a64_emit(&a, a64_ldurb(12, 22, 0)); /* X12 = dv->capacity */
+    a64_emit(&a, a64_cmp_w_imm(12, (uint16_t)n));
+    done_patches[n_done++] = a.len;
+    a64_emit(&a, a64_b_cond(3, 0)); /* B.LO done (capacity < n) */
+    a64_emit(&a, a64_add_imm(22, 22, 8)); /* X22 = dv->values */
+    /* X13 = &dv->values[capacity] = X22 + (X12 << 3) */
+    a64_emit(&a, 0x8B000C00u | (12u << 16) | (22u << 5) | 13u); /* ADD X13, X22, X12, LSL #3 */
+    for (uint32_t off = 0; off < n; ) {
+      if (off + 8 <= n) {
+        uint64_t ow;
+        memcpy(&ow, order + off, 8);
+        a64_emit(&a, a64_ldur_x(10, 13, (int32_t)off));
+        a64_load_u64(&a, 11, ow);
+        a64_emit(&a, a64_cmp_reg(10, 11));
+        done_patches[n_done++] = a.len;
+        a64_emit(&a, a64_b_cond(1, 0));
+        off += 8;
+      } else {
+        a64_emit(&a, a64_ldurb(10, 13, (int32_t)off));
+        a64_emit(&a, a64_cmp_w_imm(10, order[off]));
+        done_patches[n_done++] = a.len;
+        a64_emit(&a, a64_b_cond(1, 0));
+        off += 1;
+      }
+    }
 #else
-    a64_emit(&a, a64_ldurh(10, 22, -2));
-    a64_load_u64(&a, 11, (uint64_t)(((uint16_t)psize << 8) | (uint16_t)n));
-    a64_emit(&a, a64_cmp_reg(10, 11));
+    /* Verify psize <= 32, psize >= 2 + n, used == n, and vraw[-2-n .. -3] == prefix[0..n-1] */
+    a64_emit(&a, a64_ldurb(10, 22, -1)); /* psize */
+    a64_emit(&a, a64_cmp_w_imm(10, 32));
+    done_patches[n_done++] = a.len;
+    a64_emit(&a, a64_b_cond(8, 0)); /* B.HI done */
+    a64_emit(&a, a64_cmp_w_imm(10, (uint16_t)(2u + n)));
+    done_patches[n_done++] = a.len;
+    a64_emit(&a, a64_b_cond(3, 0)); /* B.LO done */
+    a64_emit(&a, a64_ldurb(10, 22, -2)); /* used */
+    a64_emit(&a, a64_cmp_w_imm(10, (uint16_t)n));
     done_patches[n_done++] = a.len;
     a64_emit(&a, a64_b_cond(1, 0));
-    for (int32_t off = -(int32_t)psize; off < 0; ) {
-      if (off + 8 <= 0) {
+    for (int32_t off = -(int32_t)(2u + n); off < -2; ) {
+      uint32_t idx = (uint32_t)(off + (int32_t)(2u + n));
+      if (off + 8 <= -2) {
         uint64_t pw;
-        memcpy(&pw, prefix + (psize + off), 8);
+        memcpy(&pw, prefix + idx, 8);
         a64_emit(&a, a64_ldur_x(10, 22, off));
         a64_load_u64(&a, 11, pw);
         a64_emit(&a, a64_cmp_reg(10, 11));
@@ -556,7 +590,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
         off += 8;
       } else {
         a64_emit(&a, a64_ldurb(10, 22, off));
-        a64_emit(&a, a64_cmp_w_imm(10, prefix[psize + off]));
+        a64_emit(&a, a64_cmp_w_imm(10, prefix[idx]));
         done_patches[n_done++] = a.len;
         a64_emit(&a, a64_b_cond(1, 0));
         off += 1;

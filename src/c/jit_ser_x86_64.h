@@ -372,26 +372,50 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile(
   done_patches[n_done++] = x64_jcc32(&a, 0x84);
 
 #if PY_VERSION_HEX >= 0x030D0000
-  /* CMP BYTE [R15+1], n; JNE done; CMP BYTE [R15+3], 1; JNE done; ADD R15, 8 */
+  /* Verify dv->size == n, dv->valid == 1, dv->capacity >= n, and
+   * (uint8_t *)&dv->values[dv->capacity] matches order[0..n-1]. */
   x64_b(&a, 0x41); x64_b(&a, 0x80); x64_b(&a, 0x7F); x64_b(&a, 1); x64_b(&a, (uint8_t)n);
   done_patches[n_done++] = x64_jcc32(&a, 0x85);
   x64_b(&a, 0x41); x64_b(&a, 0x80); x64_b(&a, 0x7F); x64_b(&a, 3); x64_b(&a, 1);
   done_patches[n_done++] = x64_jcc32(&a, 0x85);
+  /* MOVZX R10, BYTE [R15+0] (dv->capacity); CMP R10B, n; JB done */
+  x64_b(&a, 0x4D); x64_b(&a, 0x0F); x64_b(&a, 0xB6); x64_b(&a, 0x17);
+  x64_b(&a, 0x41); x64_b(&a, 0x80); x64_b(&a, 0xFA); x64_b(&a, (uint8_t)n);
+  done_patches[n_done++] = x64_jcc32(&a, 0x82); /* JB */
+  /* ADD R15, 8 (R15 = dv->values); LEA R11, [R15 + R10*8] (dv_order) */
   x64_b(&a, 0x49); x64_b(&a, 0x83); x64_b(&a, 0xC7); x64_b(&a, 8);
+  x64_b(&a, 0x4F); x64_b(&a, 0x8D); x64_b(&a, 0x1C); x64_b(&a, 0xD7);
+  for (uint32_t off = 0; off < n; ) {
+    if (off + 8 <= n) {
+      uint64_t ow; memcpy(&ow, order + off, 8);
+      x64_mov_rax_u64(&a, ow);
+      x64_b(&a, 0x49); x64_b(&a, 0x39); x64_b(&a, 0x43); x64_b(&a, (uint8_t)off);
+      done_patches[n_done++] = x64_jcc32(&a, 0x85);
+      off += 8;
+    } else {
+      x64_b(&a, 0x41); x64_b(&a, 0x80); x64_b(&a, 0x7B); x64_b(&a, (uint8_t)off); x64_b(&a, order[off]);
+      done_patches[n_done++] = x64_jcc32(&a, 0x85);
+      off += 1;
+    }
+  }
 #else
-  /* CMP WORD [R15-2], ((psize<<8)|n); JNE done */
-  x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x81); x64_b(&a, 0x7F); x64_b(&a, (uint8_t)-2);
-  x64_u16(&a, (uint16_t)(((uint16_t)psize << 8) | (uint16_t)n));
-  done_patches[n_done++] = x64_jcc32(&a, 0x85);
-  for (int32_t off = -(int32_t)psize; off < 0; ) {
-    if (off + 8 <= 0) {
-      uint64_t pw; memcpy(&pw, prefix + (psize + off), 8);
+  /* Verify psize <= 32, psize >= 2+n, used == n, and vraw[-2-n .. -3] == prefix[0..n-1] */
+  x64_b(&a, 0x41); x64_b(&a, 0x80); x64_b(&a, 0x7F); x64_b(&a, (uint8_t)-1); x64_b(&a, 32);
+  done_patches[n_done++] = x64_jcc32(&a, 0x87); /* JA */
+  x64_b(&a, 0x41); x64_b(&a, 0x80); x64_b(&a, 0x7F); x64_b(&a, (uint8_t)-1); x64_b(&a, (uint8_t)(2u + n));
+  done_patches[n_done++] = x64_jcc32(&a, 0x82); /* JB */
+  x64_b(&a, 0x41); x64_b(&a, 0x80); x64_b(&a, 0x7F); x64_b(&a, (uint8_t)-2); x64_b(&a, (uint8_t)n);
+  done_patches[n_done++] = x64_jcc32(&a, 0x85); /* JNE */
+  for (int32_t off = -(int32_t)(2u + n); off < -2; ) {
+    uint32_t idx = (uint32_t)(off + (int32_t)(2u + n));
+    if (off + 8 <= -2) {
+      uint64_t pw; memcpy(&pw, prefix + idx, 8);
       x64_mov_rax_u64(&a, pw);
       x64_b(&a, 0x49); x64_b(&a, 0x39); x64_b(&a, 0x47); x64_b(&a, (uint8_t)(int8_t)off);
       done_patches[n_done++] = x64_jcc32(&a, 0x85);
       off += 8;
     } else {
-      x64_b(&a, 0x41); x64_b(&a, 0x80); x64_b(&a, 0x7F); x64_b(&a, (uint8_t)(int8_t)off); x64_b(&a, prefix[psize + off]);
+      x64_b(&a, 0x41); x64_b(&a, 0x80); x64_b(&a, 0x7F); x64_b(&a, (uint8_t)(int8_t)off); x64_b(&a, prefix[idx]);
       done_patches[n_done++] = x64_jcc32(&a, 0x85);
       off += 1;
     }
