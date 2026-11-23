@@ -769,7 +769,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
   }
   int single_row_check = (total_row_need <= 1024u);
 
-  uint8_t tmp_code[24576];
+  uint8_t tmp_code[65536];
   X64Asm a = {tmp_code, 0, sizeof(tmp_code)};
 
   /* Prologue */
@@ -796,7 +796,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
 
   size_t done_patches[256];
   size_t n_done = 0;
-  size_t err_patches[384];
+  size_t err_patches[512];
   size_t n_err = 0;
 
   size_t loop_top = a.len;
@@ -1287,14 +1287,14 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
           Py_TYPE(sample_vals[j]) == &PyDict_Type) {
         PyDictObject *smp = (PyDictObject *)sample_vals[j];
         Py_ssize_t sn = smp->ma_used;
-        if (sn >= 1 && sn <= 8) {
-          char skbuf[384];
-          uint16_t skoff[8], sklen[8];
-          uint8_t svt[8], sorder[8];
+        if (sn >= 1 && sn <= 30) {
+          char skbuf[1024];
+          uint16_t skoff[30], sklen[30];
+          uint8_t svt[30], sorder[30];
 #if PY_VERSION_HEX < 0x030D0000
           uint8_t sprefix[32];
 #endif
-          PyObject *skeys[8];
+          PyObject *skeys[30];
           uint32_t skused = 0;
           uint32_t sub_need = 1;
           int sub_is_split = (smp->ma_values != NULL);
@@ -1351,6 +1351,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
               else if (tvtp == &PyUnicode_Type) { svt[tj] = JIT_VT_STR; sub_need += (uint32_t)tkl + 8u; }
               else if (tvtp == &PyBool_Type) { svt[tj] = JIT_VT_BOOL; sub_need += (uint32_t)tkl + 9u; }
               else if (tv == Py_None) { svt[tj] = JIT_VT_NONE; sub_need += (uint32_t)tkl + 8u; }
+              else if (tvtp == &PyList_Type) { svt[tj] = JIT_VT_LIST; sub_need += (uint32_t)tkl + 8u; }
               else { sub_ok = 0; break; }
               skused += (uint32_t)(tkl + 4);
               tj++;
@@ -1382,6 +1383,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
                 else if (tvtp == &PyUnicode_Type) { svt[tj] = JIT_VT_STR; sub_need += (uint32_t)tkl + 8u; }
                 else if (tvtp == &PyBool_Type) { svt[tj] = JIT_VT_BOOL; sub_need += (uint32_t)tkl + 9u; }
                 else if (tv == Py_None) { svt[tj] = JIT_VT_NONE; sub_need += (uint32_t)tkl + 8u; }
+                else if (tvtp == &PyList_Type) { svt[tj] = JIT_VT_LIST; sub_need += (uint32_t)tkl + 8u; }
                 else { sub_ok = 0; break; }
                 skused += (uint32_t)(tkl + 4);
               }
@@ -1389,7 +1391,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
           }
 
           if (sub_ok && sub_need <= 1024u) {
-            size_t sub_fail[32];
+            size_t sub_fail[96];
             size_t n_sub_fail = 0;
             /* Check ma_used == sn */
             x64_b(&a, 0x49); x64_b(&a, 0x83); x64_b(&a, 0x79); x64_b(&a, (uint8_t)offsetof(PyDictObject, ma_used)); x64_b(&a, (uint8_t)sn);

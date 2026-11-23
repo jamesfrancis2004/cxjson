@@ -459,7 +459,7 @@ static void a64_emit_buf_check(Arm64Asm *a, uint16_t need, size_t *err_patches,
   a->buf[br_ok] = a64_b_cond(9, (int32_t)(a->len - br_ok));
 }
 
-#define CJSON_JIT_POOL_BYTES (1024 * 1024)
+#define CJSON_JIT_POOL_BYTES (2 * 1024 * 1024)
 #define CJSON_JIT_CACHE_SLOTS 256
 
 typedef struct {
@@ -1063,7 +1063,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
     g_jit_mem = (uint8_t *)m;
     g_jit_used = 0;
   }
-  if (g_jit_used + 8192 > CJSON_JIT_POOL_BYTES) {
+  if (g_jit_used + 32768 > CJSON_JIT_POOL_BYTES) {
     __atomic_store_n(&g_jit_pool_full, 1, __ATOMIC_RELAXED);
     pthread_mutex_unlock(&g_jit_mu);
     return NULL;
@@ -1105,8 +1105,8 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
   }
   int single_row_check = (total_row_need <= 1024u);
 
-  uint32_t tmp_code[4096];
-  Arm64Asm a = {tmp_code, 0, 4096};
+  uint32_t tmp_code[8192];
+  Arm64Asm a = {tmp_code, 0, 8192};
 
   /* Prologue (112B frame: [SP, #96] is scratch slot for saving parent X22
    * across inline nested dicts) */
@@ -1129,7 +1129,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
 
   size_t done_patches[256];
   size_t n_done = 0;
-  size_t err_patches[384];
+  size_t err_patches[512];
   size_t n_err = 0;
 
   size_t loop_top = a.len;
@@ -1759,16 +1759,16 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
           Py_TYPE(sample_vals[j]) == &PyDict_Type) {
         PyDictObject *sub = (PyDictObject *)sample_vals[j];
         Py_ssize_t sn = sub->ma_used;
-        if (sn >= 1 && sn <= 8) {
+        if (sn >= 1 && sn <= 30) {
           int sub_is_split = (sub->ma_values != NULL);
           int sub_ok = 1;
-          char skbuf[320];
-          uint16_t skoff[8], sklen[8];
-          uint8_t svt[8], sorder[8];
+          char skbuf[1024];
+          uint16_t skoff[30], sklen[30];
+          uint8_t svt[30], sorder[30];
 #if PY_VERSION_HEX < 0x030D0000
           uint8_t sprefix[32];
 #endif
-          PyObject *skeys[8];
+          PyObject *skeys[30];
           uint32_t skused = 0;
           uint32_t sub_need = 2;
           if (sub_is_split) {
@@ -1851,6 +1851,9 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
               } else if (tv == Py_None) {
                 svt[tj] = JIT_VT_NONE;
                 sub_need += (uint32_t)tkl + 8u;
+              } else if (tvtp == &PyList_Type) {
+                svt[tj] = JIT_VT_LIST;
+                sub_need += (uint32_t)tkl + 8u;
               } else {
                 sub_ok = 0;
                 break;
@@ -1916,6 +1919,9 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
                 } else if (tv == Py_None) {
                   svt[tj] = JIT_VT_NONE;
                   sub_need += (uint32_t)tkl + 8u;
+                } else if (tvtp == &PyList_Type) {
+                  svt[tj] = JIT_VT_LIST;
+                  sub_need += (uint32_t)tkl + 8u;
                 } else {
                   sub_ok = 0;
                   break;
@@ -1926,7 +1932,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
           }
 
           if (sub_ok && sub_need <= 1024u) {
-            size_t sub_fail[32];
+            size_t sub_fail[96];
             size_t n_sub_fail = 0;
             /* Check ma_used == sn */
             a64_emit(&a, a64_cmp_x_imm(10, (uint16_t)sn));
