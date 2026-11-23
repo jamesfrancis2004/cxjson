@@ -2185,6 +2185,8 @@ static PyObject *parse_object_rec(
   return dict;
 }
 
+#include "jit_deser_arm64.h"
+
 static PyObject *parse_array_rec(
     JsonParser *jp, const char **p_io, const char *end, int depth, uint32_t schema_slot) {
   const char *p = skip_ws(*p_io, end);
@@ -2198,6 +2200,9 @@ static PyObject *parse_array_rec(
   }
 
   size_t base = jp->item_sp;
+#ifdef CJSON_DESER_SCHEMA_JIT
+  int djit_stalls = 0;
+#endif
 
 dispatch_item:;
   for (;;) {
@@ -2300,6 +2305,35 @@ dispatch_item:;
 
     PyObject *val;
     if (c == '{') {
+#ifdef CJSON_DESER_SCHEMA_JIT
+      if (CJSON_LIKELY(djit_stalls < 4 && depth + 1 < CJSON_REC_PARSE_DEPTH &&
+                       (jp->item_sp - base) >= 2 && (end - p) >= 128)) {
+        ObjectSchema *sc = &g_schemas[schema_slot];
+        if (sc->split_ok) {
+          CJsonJitDeserLoopFn djit = cjson_deser_jit_get_or_compile(sc);
+          if (djit != NULL) {
+            CJsonDictKeysObject *saved_dk = sc->shared_keys;
+            uint8_t saved_prefix[32];
+            memcpy(saved_prefix, sc->values_prefix, sc->prefix_size);
+            saved_dk->dk_refcnt++;
+            JitDeserCtx dctx = {saved_dk, saved_prefix, sc->prefix_size, depth, schema_slot, 0};
+            const char *before_p = p;
+            p = djit(jp, p, end, &dctx);
+            cjson_free_shared_keys(saved_dk);
+            if (CJSON_UNLIKELY(dctx.error)) return NULL;
+            if (p > before_p) {
+              if (p < end && *p == '{') {
+                /* Bailed cleanly at start of next object after consuming ',': fall through to parse_object_rec */
+              } else {
+                goto after_item;
+              }
+            } else {
+              djit_stalls++;
+            }
+          }
+        }
+      }
+#endif
       if (CJSON_UNLIKELY(depth + 1 >= CJSON_REC_PARSE_DEPTH)) {
         val = parse_document_iter(jp, &p, end, depth);
       } else {
