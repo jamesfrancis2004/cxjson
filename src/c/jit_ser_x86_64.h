@@ -406,6 +406,67 @@ static inline uint32_t cjson_jit_get_ascii_state(void) {
  * 2) g_jit_stub_u32_long:
  *    In:  R9 = long, R14 = dst
  *    Out: RAX = new_dst (or NULL on error), R14 = new_dst */
+/* Inline 2..3 element list[float] (GeoJSON [lon, lat, elev]) directly in JIT.
+ * Uses [RSP+40] to save ob_item across cjson_jit_write_double calls. */
+static int x64_emit_inline_float_list(X64Asm *a, PyObject *sample_val,
+                                      int check_list_type, int need_buf_check,
+                                      size_t *err_patches, size_t *n_err,
+                                      size_t *br_done_out) {
+  if (sample_val == NULL || Py_TYPE(sample_val) != &PyList_Type) return 0;
+  Py_ssize_t flen = PyList_GET_SIZE(sample_val);
+  if (flen != 2 && flen != 3) return 0;
+  for (Py_ssize_t fi = 0; fi < flen; fi++) {
+    if (Py_TYPE(PyList_GET_ITEM(sample_val, fi)) != &PyFloat_Type) return 0;
+  }
+
+  size_t misses[6];
+  size_t n_miss = 0;
+  if (check_list_type) {
+    x64_mov_rax_u64(a, (uint64_t)(uintptr_t)&PyList_Type);
+    x64_b(a, 0x49); x64_b(a, 0x39); x64_b(a, 0x41); x64_b(a, (uint8_t)offsetof(PyObject, ob_type));
+    misses[n_miss++] = x64_jcc32(a, 0x85);
+  }
+  x64_b(a, 0x49); x64_b(a, 0x83); x64_b(a, 0x79); x64_b(a, (uint8_t)offsetof(PyVarObject, ob_size)); x64_b(a, (uint8_t)flen);
+  misses[n_miss++] = x64_jcc32(a, 0x85);
+
+  x64_b(a, 0x4D); x64_b(a, 0x8B); x64_b(a, 0x51); x64_b(a, (uint8_t)offsetof(PyListObject, ob_item)); /* mov r10, [r9+ob_item] */
+  x64_mov_rax_u64(a, (uint64_t)(uintptr_t)&PyFloat_Type);
+  for (uint32_t fi = 0; fi < (uint32_t)flen; fi++) {
+    if (fi == 0) {
+      x64_b(a, 0x4D); x64_b(a, 0x8B); x64_b(a, 0x1A); /* mov r11, [r10] */
+    } else {
+      x64_b(a, 0x4D); x64_b(a, 0x8B); x64_b(a, 0x5A); x64_b(a, (uint8_t)(fi * 8u));
+    }
+    x64_b(a, 0x49); x64_b(a, 0x39); x64_b(a, 0x43); x64_b(a, (uint8_t)offsetof(PyObject, ob_type));
+    misses[n_miss++] = x64_jcc32(a, 0x85);
+  }
+  x64_b(a, 0x4C); x64_b(a, 0x89); x64_b(a, 0x54); x64_b(a, 0x24); x64_b(a, 40); /* mov [rsp+40], r10 */
+  if (need_buf_check) {
+    x64_emit_buf_check(a, 128, err_patches, n_err);
+  }
+  x64_emit_literal(a, "[", 1);
+  for (uint32_t fi = 0; fi < (uint32_t)flen; fi++) {
+    if (fi > 0) x64_emit_literal(a, ",", 1);
+    x64_b(a, 0x4C); x64_b(a, 0x8B); x64_b(a, 0x54); x64_b(a, 0x24); x64_b(a, 40); /* mov r10, [rsp+40] */
+    if (fi == 0) {
+      x64_b(a, 0x4D); x64_b(a, 0x8B); x64_b(a, 0x1A);
+    } else {
+      x64_b(a, 0x4D); x64_b(a, 0x8B); x64_b(a, 0x5A); x64_b(a, (uint8_t)(fi * 8u));
+    }
+    x64_b(a, 0xF2); x64_b(a, 0x41); x64_b(a, 0x0F); x64_b(a, 0x10); x64_b(a, 0x43); x64_b(a, (uint8_t)offsetof(PyFloatObject, ob_fval));
+    x64_b(a, 0x4C); x64_b(a, 0x89); x64_b(a, 0xF7); /* mov rdi, r14 */
+    x64_mov_rax_u64(a, (uint64_t)(uintptr_t)&cjson_jit_write_double);
+    x64_call_rax(a);
+    x64_b(a, 0x49); x64_b(a, 0x89); x64_b(a, 0xC6); /* mov r14, rax */
+  }
+  x64_emit_literal(a, "]", 1);
+  *br_done_out = x64_jmp32(a);
+  for (size_t m = 0; m < n_miss; m++) {
+    x64_patch32(a, misses[m], a->len);
+  }
+  return 1;
+}
+
 static void cjson_jit_init_stubs_locked(void) {
   if (g_jit_stub_str_sse2 != NULL) return;
   uint32_t ascii_st = cjson_jit_get_ascii_state();
@@ -939,7 +1000,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
   x64_b(&a, 0x41); x64_b(&a, 0x55); /* push r13 */
   x64_b(&a, 0x41); x64_b(&a, 0x56); /* push r14 */
   x64_b(&a, 0x41); x64_b(&a, 0x57); /* push r15 */
-  x64_b(&a, 0x48); x64_b(&a, 0x83); x64_b(&a, 0xEC); x64_b(&a, 40);
+  x64_b(&a, 0x48); x64_b(&a, 0x83); x64_b(&a, 0xEC); x64_b(&a, 56);
 
   x64_b(&a, 0x49); x64_b(&a, 0x89); x64_b(&a, 0xFC); /* mov r12, rdi */
   x64_b(&a, 0x48); x64_b(&a, 0x89); x64_b(&a, 0x34); x64_b(&a, 0x24); /* mov [rsp], rsi */
@@ -1573,7 +1634,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
               else if (tvtp == &PyUnicode_Type) { svt[tj] = JIT_VT_STR; sub_need += (uint32_t)tkl + 22u; }
               else if (tvtp == &PyBool_Type) { svt[tj] = JIT_VT_BOOL; sub_need += (uint32_t)tkl + 9u; }
               else if (tv == Py_None) { svt[tj] = JIT_VT_NONE; sub_need += (uint32_t)tkl + 8u; }
-              else if (tvtp == &PyList_Type) { svt[tj] = JIT_VT_LIST; sub_need += (uint32_t)tkl + 8u; }
+              else if (tvtp == &PyList_Type) { svt[tj] = JIT_VT_LIST; sub_need += (uint32_t)tkl + ((PyList_GET_SIZE(tv) == 2 || PyList_GET_SIZE(tv) == 3) ? 116u : 8u); }
               else { sub_ok = 0; break; }
               skused += (uint32_t)(tkl + 4);
               tj++;
@@ -1606,7 +1667,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
                 else if (tvtp == &PyUnicode_Type) { svt[tj] = JIT_VT_STR; sub_need += (uint32_t)tkl + 22u; }
                 else if (tvtp == &PyBool_Type) { svt[tj] = JIT_VT_BOOL; sub_need += (uint32_t)tkl + 9u; }
                 else if (tv == Py_None) { svt[tj] = JIT_VT_NONE; sub_need += (uint32_t)tkl + 8u; }
-                else if (tvtp == &PyList_Type) { svt[tj] = JIT_VT_LIST; sub_need += (uint32_t)tkl + 8u; }
+                else if (tvtp == &PyList_Type) { svt[tj] = JIT_VT_LIST; sub_need += (uint32_t)tkl + ((PyList_GET_SIZE(tv) == 2 || PyList_GET_SIZE(tv) == 3) ? 116u : 8u); }
                 else { sub_ok = 0; break; }
                 skused += (uint32_t)(tkl + 4);
               }
@@ -1818,6 +1879,14 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
                 x64_patch32(&a, sb_a, a.len);
                 x64_emit_call_4(&a, (uint64_t)(uintptr_t)&cjson_jit_encode_any, err_patches, &n_err);
                 x64_patch32(&a, sb_e, a.len);
+              } else if (sv == JIT_VT_LIST) {
+                size_t sb_fl_done = 0;
+                int sb_has_fl = x64_emit_inline_float_list(
+                    &a, ssvals[k], 1, 0, err_patches, &n_err, &sb_fl_done);
+                x64_emit_call_4(&a, (uint64_t)(uintptr_t)&cjson_jit_encode_any, err_patches, &n_err);
+                if (sb_has_fl) {
+                  x64_patch32(&a, sb_fl_done, a.len);
+                }
               } else {
                 x64_emit_call_4(&a, (uint64_t)(uintptr_t)&cjson_jit_encode_any, err_patches, &n_err);
               }
@@ -1867,7 +1936,13 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       /* Inline 1..2 element homogeneous list[str] or list[int] (zero C call!) */
       int inlined_list = 0;
       size_t br_l_done1 = 0, br_l_done2 = 0;
-      if (sample_vals != NULL && sample_vals[j] != NULL &&
+      int inlined_flist = 0;
+      size_t br_fl_done = 0;
+      if (sample_vals != NULL && sample_vals[j] != NULL) {
+        inlined_flist = x64_emit_inline_float_list(
+            &a, sample_vals[j], 0, 1, err_patches, &n_err, &br_fl_done);
+      }
+      if (!inlined_flist && sample_vals != NULL && sample_vals[j] != NULL &&
           Py_TYPE(sample_vals[j]) == &PyList_Type &&
           PyList_GET_SIZE(sample_vals[j]) >= 1) {
         PyTypeObject *etp = Py_TYPE(PyList_GET_ITEM(sample_vals[j], 0));
@@ -1947,6 +2022,9 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
         x64_patch32(&a, br_l_done1, a.len);
         x64_patch32(&a, br_l_done2, a.len);
       }
+      if (inlined_flist) {
+        x64_patch32(&a, br_fl_done, a.len);
+      }
     } else {
       x64_emit_call_4(&a, (uint64_t)(uintptr_t)&cjson_jit_encode_any, err_patches, &n_err);
     }
@@ -1971,7 +2049,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
   x64_b(&a, 0x4C); x64_b(&a, 0x89); x64_b(&a, 0xF0);
 
   size_t epilogue_label = a.len;
-  x64_b(&a, 0x48); x64_b(&a, 0x83); x64_b(&a, 0xC4); x64_b(&a, 40);
+  x64_b(&a, 0x48); x64_b(&a, 0x83); x64_b(&a, 0xC4); x64_b(&a, 56);
   x64_b(&a, 0x41); x64_b(&a, 0x5F);
   x64_b(&a, 0x41); x64_b(&a, 0x5E);
   x64_b(&a, 0x41); x64_b(&a, 0x5D);

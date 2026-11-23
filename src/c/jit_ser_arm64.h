@@ -523,6 +523,66 @@ static void a64_emit_buf_check(Arm64Asm *a, uint16_t need, size_t *err_patches,
   a->buf[br_ok] = a64_b_cond(9, (int32_t)(a->len - br_ok));
 }
 
+/* Inline 2..3 element list[float] (GeoJSON [lon, lat, elev]) directly in JIT.
+ * Uses [SP, #104] to save ob_item across cjson_jit_write_double calls. */
+static int a64_emit_inline_float_list(Arm64Asm *a, PyObject *sample_val,
+                                      int check_list_type, int need_buf_check,
+                                      size_t *err_patches, size_t *n_err,
+                                      size_t *br_done_out) {
+  if (sample_val == NULL || Py_TYPE(sample_val) != &PyList_Type) return 0;
+  Py_ssize_t flen = PyList_GET_SIZE(sample_val);
+  if (flen != 2 && flen != 3) return 0;
+  for (Py_ssize_t fi = 0; fi < flen; fi++) {
+    if (Py_TYPE(PyList_GET_ITEM(sample_val, fi)) != &PyFloat_Type) return 0;
+  }
+
+  size_t misses[6];
+  size_t n_miss = 0;
+  if (check_list_type) {
+    a64_emit(a, a64_ldr_uoff(10, 9, (uint32_t)offsetof(PyObject, ob_type)));
+    a64_load_u64(a, 11, (uint64_t)(uintptr_t)&PyList_Type);
+    a64_emit(a, a64_cmp_reg(10, 11));
+    misses[n_miss++] = a->len;
+    a64_emit(a, a64_b_cond(1, 0));
+  }
+  a64_emit(a, a64_ldr_uoff(10, 9, (uint32_t)offsetof(PyVarObject, ob_size)));
+  a64_emit(a, a64_cmp_x_imm(10, (uint16_t)flen));
+  misses[n_miss++] = a->len;
+  a64_emit(a, a64_b_cond(1, 0));
+
+  a64_emit(a, a64_ldr_uoff(10, 9, (uint32_t)offsetof(PyListObject, ob_item)));
+  a64_load_u64(a, 11, (uint64_t)(uintptr_t)&PyFloat_Type);
+  for (uint32_t fi = 0; fi < (uint32_t)flen; fi++) {
+    a64_emit(a, a64_ldr_uoff(12, 10, fi * 8u));
+    a64_emit(a, a64_ldr_uoff(13, 12, (uint32_t)offsetof(PyObject, ob_type)));
+    a64_emit(a, a64_cmp_reg(13, 11));
+    misses[n_miss++] = a->len;
+    a64_emit(a, a64_b_cond(1, 0));
+  }
+  a64_emit(a, a64_str_x_uoff(10, 31, 104));
+  if (need_buf_check) {
+    a64_emit_buf_check(a, 128, err_patches, n_err);
+  }
+  a64_emit_literal(a, "[", 1);
+  for (uint32_t fi = 0; fi < (uint32_t)flen; fi++) {
+    if (fi > 0) a64_emit_literal(a, ",", 1);
+    a64_emit(a, a64_ldr_uoff(10, 31, 104));
+    a64_emit(a, a64_ldr_uoff(12, 10, fi * 8u));
+    a64_emit(a, a64_ldr_d_uoff(0, 12, (uint32_t)offsetof(PyFloatObject, ob_fval)));
+    a64_emit(a, a64_mov(0, 20));
+    a64_load_u64(a, 12, (uint64_t)(uintptr_t)&cjson_jit_write_double);
+    a64_emit(a, a64_blr(12));
+    a64_emit(a, a64_mov(20, 0));
+  }
+  a64_emit_literal(a, "]", 1);
+  *br_done_out = a->len;
+  a64_emit(a, a64_b(0));
+  for (size_t m = 0; m < n_miss; m++) {
+    a->buf[misses[m]] = a64_b_cond(1, (int32_t)(a->len - misses[m]));
+  }
+  return 1;
+}
+
 #define CJSON_JIT_POOL_BYTES (4 * 1024 * 1024)
 #define CJSON_JIT_CACHE_SLOTS 512
 
@@ -1977,7 +2037,10 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
                 sub_need += (uint32_t)tkl + 8u;
               } else if (tvtp == &PyList_Type) {
                 svt[tj] = JIT_VT_LIST;
-                sub_need += (uint32_t)tkl + 8u;
+                sub_need += (uint32_t)tkl +
+                            ((PyList_GET_SIZE(tv) == 2 || PyList_GET_SIZE(tv) == 3)
+                                 ? 116u
+                                 : 8u);
               } else {
                 sub_ok = 0;
                 break;
@@ -2046,7 +2109,10 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
                   sub_need += (uint32_t)tkl + 8u;
                 } else if (tvtp == &PyList_Type) {
                   svt[tj] = JIT_VT_LIST;
-                  sub_need += (uint32_t)tkl + 8u;
+                  sub_need += (uint32_t)tkl +
+                              ((PyList_GET_SIZE(tv) == 2 || PyList_GET_SIZE(tv) == 3)
+                                   ? 116u
+                                   : 8u);
                 } else {
                   sub_ok = 0;
                   break;
@@ -2317,6 +2383,14 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
                 a.buf[sb_a] = a64_b_cond(1, (int32_t)(a.len - sb_a));
                 a64_emit_call_any(&a, err_patches, &n_err);
                 a.buf[sb_e] = a64_b((int32_t)(a.len - sb_e));
+              } else if (sv == JIT_VT_LIST) {
+                size_t sb_fl_done = 0;
+                int sb_has_fl = a64_emit_inline_float_list(
+                    &a, ssvals[k], 1, 0, err_patches, &n_err, &sb_fl_done);
+                a64_emit_call_any(&a, err_patches, &n_err);
+                if (sb_has_fl) {
+                  a.buf[sb_fl_done] = a64_b((int32_t)(a.len - sb_fl_done));
+                }
               } else {
                 a64_emit_call_any(&a, err_patches, &n_err);
               }
@@ -2394,7 +2468,13 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       /* Inline 1..2 element homogeneous list[str] or list[int] (zero C call!) */
       int inlined_list = 0;
       size_t br_l_done1 = 0, br_l_done2 = 0;
-      if (sample_vals != NULL && sample_vals[j] != NULL &&
+      int inlined_flist = 0;
+      size_t br_fl_done = 0;
+      if (sample_vals != NULL && sample_vals[j] != NULL) {
+        inlined_flist = a64_emit_inline_float_list(
+            &a, sample_vals[j], 0, 1, err_patches, &n_err, &br_fl_done);
+      }
+      if (!inlined_flist && sample_vals != NULL && sample_vals[j] != NULL &&
           Py_TYPE(sample_vals[j]) == &PyList_Type &&
           PyList_GET_SIZE(sample_vals[j]) >= 1) {
         PyTypeObject *etp = Py_TYPE(PyList_GET_ITEM(sample_vals[j], 0));
@@ -2496,6 +2576,9 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       if (inlined_list) {
         a.buf[br_l_done1] = a64_b((int32_t)(a.len - br_l_done1));
         a.buf[br_l_done2] = a64_b((int32_t)(a.len - br_l_done2));
+      }
+      if (inlined_flist) {
+        a.buf[br_fl_done] = a64_b((int32_t)(a.len - br_fl_done));
       }
     } else {
       a64_emit_call_any(&a, err_patches, &n_err);
