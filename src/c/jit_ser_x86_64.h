@@ -301,7 +301,7 @@ static void x64_emit_buf_check(X64Asm *a, uint32_t need, size_t *err_patches, si
   x64_patch32(a, br_ok, a->len);
 }
 
-#define CJSON_JIT_CACHE_SLOTS 256
+#define CJSON_JIT_CACHE_SLOTS 512
 
 typedef struct {
   uint64_t sig_hash;
@@ -792,10 +792,10 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
     h = (h ^ (uint8_t)kbuf[j]) * 0x100000001B3ULL;
   }
 
-  /* Lock-free O(1) 2-way set-associative lookup */
-  uint32_t set_base = (uint32_t)(h & (CJSON_JIT_CACHE_SLOTS - 2u));
+  /* Lock-free O(1) 4-way set-associative lookup */
+  uint32_t set_base = (uint32_t)(h & (CJSON_JIT_CACHE_SLOTS - 4u));
   uint32_t occupied = 0;
-  for (uint32_t w = 0; w < 2; w++) {
+  for (uint32_t w = 0; w < 4; w++) {
     JitSchemaEntry *e = &g_jit_cache[set_base + w];
     CJsonJitSplitLoopFn fn = __atomic_load_n(&e->fn, __ATOMIC_ACQUIRE);
     if (fn != NULL) {
@@ -812,13 +812,13 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       }
     }
   }
-  if (occupied == 2 || __atomic_load_n(&g_jit_pool_full, __ATOMIC_RELAXED)) {
+  if (occupied == 4 || __atomic_load_n(&g_jit_pool_full, __ATOMIC_RELAXED)) {
     return NULL;
   }
 
   pthread_mutex_lock(&g_jit_mu);
 
-  for (uint32_t w = 0; w < 2; w++) {
+  for (uint32_t w = 0; w < 4; w++) {
     JitSchemaEntry *e = &g_jit_cache[set_base + w];
     if (e->fn != NULL && e->sig_hash == h && e->is_combined == (uint8_t)is_combined &&
         e->is_dict_of_dicts == (uint8_t)is_dict_of_dicts &&
@@ -835,7 +835,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
   }
 
   uint32_t target_idx = CJSON_JIT_CACHE_SLOTS;
-  for (uint32_t w = 0; w < 2; w++) {
+  for (uint32_t w = 0; w < 4; w++) {
     if (g_jit_cache[set_base + w].fn == NULL) {
       target_idx = set_base + w;
       break;

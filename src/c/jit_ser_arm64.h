@@ -459,8 +459,8 @@ static void a64_emit_buf_check(Arm64Asm *a, uint16_t need, size_t *err_patches,
   a->buf[br_ok] = a64_b_cond(9, (int32_t)(a->len - br_ok));
 }
 
-#define CJSON_JIT_POOL_BYTES (2 * 1024 * 1024)
-#define CJSON_JIT_CACHE_SLOTS 256
+#define CJSON_JIT_POOL_BYTES (4 * 1024 * 1024)
+#define CJSON_JIT_CACHE_SLOTS 512
 
 typedef struct {
   uint64_t sig_hash;
@@ -981,10 +981,10 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
     h = (h ^ (uint8_t)kbuf[j]) * 0x100000001B3ULL;
   }
 
-  /* Lock-free O(1) 2-way set-associative lookup */
-  uint32_t set_base = (uint32_t)(h & (CJSON_JIT_CACHE_SLOTS - 2u));
+  /* Lock-free O(1) 4-way set-associative lookup */
+  uint32_t set_base = (uint32_t)(h & (CJSON_JIT_CACHE_SLOTS - 4u));
   uint32_t occupied = 0;
-  for (uint32_t w = 0; w < 2; w++) {
+  for (uint32_t w = 0; w < 4; w++) {
     JitSchemaEntry *e = &g_jit_cache[set_base + w];
     CJsonJitSplitLoopFn fn = __atomic_load_n(&e->fn, __ATOMIC_ACQUIRE);
     if (fn != NULL) {
@@ -1003,16 +1003,16 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       }
     }
   }
-  /* Lock-free fast bailout when this 2-way set or global JIT pool is already
+  /* Lock-free fast bailout when this 4-way set or global JIT pool is already
    * full */
-  if (occupied == 2 || __atomic_load_n(&g_jit_pool_full, __ATOMIC_RELAXED)) {
+  if (occupied == 4 || __atomic_load_n(&g_jit_pool_full, __ATOMIC_RELAXED)) {
     return NULL;
   }
 
   pthread_mutex_lock(&g_jit_mu);
 
   /* Double-check under lock */
-  for (uint32_t w = 0; w < 2; w++) {
+  for (uint32_t w = 0; w < 4; w++) {
     JitSchemaEntry *e = &g_jit_cache[set_base + w];
     if (e->fn != NULL && e->sig_hash == h &&
         e->is_combined == (uint8_t)is_combined &&
@@ -1031,10 +1031,10 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
     }
   }
 
-  /* Find empty way in this 2-way set (never overwrite a live slot that another
+  /* Find empty way in this 4-way set (never overwrite a live slot that another
    * thread may read) */
   uint32_t target_idx = CJSON_JIT_CACHE_SLOTS;
-  for (uint32_t w = 0; w < 2; w++) {
+  for (uint32_t w = 0; w < 4; w++) {
     if (g_jit_cache[set_base + w].fn == NULL) {
       target_idx = set_base + w;
       break;

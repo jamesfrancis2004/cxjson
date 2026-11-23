@@ -1862,26 +1862,12 @@ cjson_jit_try_compile_combined_arr(CJsonSerDictUnicodeEntry *ep,
 }
 
 __attribute__((noinline)) static CJsonJitSplitLoopFn
-cjson_jit_try_compile_dod(CJsonSerDictUnicodeEntry *ep, Py_ssize_t nentries,
-                          PyDictKeysObject **out_split_dk, Py_ssize_t *out_sn,
-                          int *out_is_split) {
-  Py_ssize_t mid = nentries >> 1;
-  Py_ssize_t q3 = mid + (nentries >> 2);
-  PyObject *mv = ep[mid].me_value;
-  PyObject *mv2 = (mid + 1 < nentries) ? ep[mid + 1].me_value : NULL;
-  PyObject *mv3 = (q3 < nentries) ? ep[q3].me_value : mv2;
-  if (mv == NULL || mv2 == NULL || mv3 == NULL ||
-      Py_TYPE(mv) != &PyDict_Type || Py_TYPE(mv2) != &PyDict_Type ||
-      Py_TYPE(mv3) != &PyDict_Type) {
-    return NULL;
-  }
+cjson_jit_compile_dod_from_dict(PyObject *mv, PyDictKeysObject **out_split_dk,
+                                Py_ssize_t *out_sn, int *out_is_split) {
+  if (mv == NULL || Py_TYPE(mv) != &PyDict_Type) return NULL;
   PyDictObject *dmp = (PyDictObject *)mv;
-  PyDictObject *dmp2 = (PyDictObject *)mv2;
-  PyDictObject *dmp3 = (PyDictObject *)mv3;
   Py_ssize_t sn = dmp->ma_used;
-  if (sn <= 0 || sn > 30 || dmp2->ma_used != sn || dmp3->ma_used != sn) {
-    return NULL;
-  }
+  if (sn <= 0 || sn > 30) return NULL;
   char dkbuf[1024];
   uint16_t dkoff[30], dklen[30];
   uint8_t dvtypes[30], dorder[30];
@@ -1892,9 +1878,7 @@ cjson_jit_try_compile_dod(CJsonSerDictUnicodeEntry *ep, Py_ssize_t nentries,
   PyObject *dvals[30];
   uint32_t dkused = 0;
 
-  if (dmp->ma_values != NULL && dmp2->ma_values != NULL &&
-      dmp3->ma_values != NULL && dmp->ma_keys == dmp2->ma_keys &&
-      dmp->ma_keys == dmp3->ma_keys) {
+  if (dmp->ma_values != NULL) {
 #if PY_VERSION_HEX >= 0x030D0000
     typedef struct {
       uint8_t capacity;
@@ -1967,9 +1951,7 @@ cjson_jit_try_compile_dod(CJsonSerDictUnicodeEntry *ep, Py_ssize_t nentries,
       *out_is_split = 1;
     }
     return fn;
-  } else if (dmp->ma_values == NULL && dmp2->ma_values == NULL &&
-             dmp3->ma_values == NULL &&
-             ((CJsonSerDictKeysObject *)dmp->ma_keys)->dk_kind == 1 &&
+  } else if (((CJsonSerDictKeysObject *)dmp->ma_keys)->dk_kind == 1 &&
              ((CJsonSerDictKeysObject *)dmp->ma_keys)->dk_nentries == sn) {
     CJsonSerDictKeysObject *sdk = (CJsonSerDictKeysObject *)dmp->ma_keys;
     CJsonSerDictUnicodeEntry *sep = (CJsonSerDictUnicodeEntry *)(sdk->dk_indices + ((size_t)1 << sdk->dk_log2_index_bytes));
@@ -2004,12 +1986,114 @@ cjson_jit_try_compile_dod(CJsonSerDictUnicodeEntry *ep, Py_ssize_t nentries,
     CJsonJitSplitLoopFn fn = cjson_jit_get_or_compile_dict_of_dicts(
         1, (uint32_t)sn, dkbuf, dkused, dkoff, dklen, dvtypes, NULL, 0, NULL, dkeys, dvals);
     if (fn != NULL) {
+      *out_split_dk = NULL;
       *out_sn = sn;
       *out_is_split = 0;
     }
     return fn;
   }
   return NULL;
+}
+
+typedef struct {
+  PyDictKeysObject *split_dk;
+  uintptr_t shape_id;
+  Py_ssize_t sn;
+  CJsonJitSplitLoopFn fn;
+  uint8_t is_split;
+  uint8_t stalls;
+} JitPicEntry;
+
+static inline uintptr_t cjson_jit_dict_shape_id(PyDictObject *dmp, int is_split) {
+  if (is_split) return (uintptr_t)dmp->ma_keys;
+  CJsonSerDictKeysObject *sdk = (CJsonSerDictKeysObject *)dmp->ma_keys;
+  if (sdk->dk_kind != 1 || sdk->dk_nentries != dmp->ma_used || dmp->ma_used <= 0)
+    return 0;
+  CJsonSerDictUnicodeEntry *sep = (CJsonSerDictUnicodeEntry *)(
+      sdk->dk_indices + ((size_t)1 << sdk->dk_log2_index_bytes));
+  return (uintptr_t)sep[0].me_key ^ ((uintptr_t)sep[dmp->ma_used - 1].me_key << 1);
+}
+
+/* Out-of-line 4-entry ring PIC dispatcher for dict-of-dicts (zero stack bloat on small dicts!). */
+__attribute__((noinline)) static char *
+cjson_jit_dod_pic_dispatch(JsonBuffer *b, char *dst, char **safe_end_p,
+                           CJsonSerDictUnicodeEntry *ep, Py_ssize_t nentries,
+                           Py_ssize_t *di_io, JitPicEntry *pic, int *pic_n_io,
+                           int *pic_next_io) {
+  Py_ssize_t di = *di_io;
+  PyObject *dval = ep[di].me_value;
+  if (dval == NULL || Py_TYPE(dval) != &PyDict_Type) return dst;
+  PyDictObject *dmp = (PyDictObject *)dval;
+  Py_ssize_t sn = dmp->ma_used;
+  if (sn <= 0 || sn > 30) return dst;
+  int is_split = (dmp->ma_values != NULL);
+  uintptr_t sid = cjson_jit_dict_shape_id(dmp, is_split);
+  if (sid == 0) return dst;
+  int pic_n = *pic_n_io;
+
+  /* 1. Lookup in 4-entry PIC */
+  int match_idx = -1;
+  for (int k = 0; k < pic_n; k++) {
+    if (pic[k].sn == sn && pic[k].is_split == (uint8_t)is_split &&
+        pic[k].shape_id == sid) {
+      match_idx = k;
+      break;
+    }
+  }
+  /* 2. Miss: if next 3 entries have same shape (run >= 4), compile & insert (ring-evict if full)! */
+  if (match_idx < 0 && di + 3 < nentries) {
+    int run_ok = 1;
+    for (Py_ssize_t k = 1; k <= 3; k++) {
+      PyObject *nv = ep[di + k].me_value;
+      if (nv == NULL || Py_TYPE(nv) != &PyDict_Type ||
+          ((PyDictObject *)nv)->ma_used != sn ||
+          (is_split ? (((PyDictObject *)nv)->ma_values == NULL ||
+                       ((PyDictObject *)nv)->ma_keys != dmp->ma_keys)
+                    : (((PyDictObject *)nv)->ma_values != NULL))) {
+        run_ok = 0;
+        break;
+      }
+    }
+    if (run_ok) {
+      PyDictKeysObject *sdk = NULL;
+      Py_ssize_t csn = 0;
+      int cis = 0;
+      CJsonJitSplitLoopFn fn = cjson_jit_compile_dod_from_dict(dval, &sdk, &csn, &cis);
+      if (fn != NULL) {
+        int slot;
+        if (pic_n < 4) {
+          slot = pic_n;
+          *pic_n_io = pic_n + 1;
+        } else {
+          slot = (*pic_next_io)++ & 3;
+        }
+        match_idx = slot;
+        pic[slot].split_dk = sdk;
+        pic[slot].shape_id = sid;
+        pic[slot].sn = csn;
+        pic[slot].fn = fn;
+        pic[slot].is_split = (uint8_t)cis;
+        pic[slot].stalls = 0;
+      }
+    }
+  }
+  if (match_idx >= 0 && pic[match_idx].fn != NULL) {
+    JitRunCtx jctx = {b, safe_end_p, pic[match_idx].split_dk, NULL};
+    Py_ssize_t ji = di;
+    b->depth++;
+    char *jdst = pic[match_idx].fn((PyObject *const *)ep, nentries, &ji, dst, &jctx);
+    b->depth--;
+    if (CJSON_UNLIKELY(jdst == NULL)) return NULL;
+    dst = jdst;
+    if (ji > di) {
+      *di_io = ji;
+      return dst;
+    }
+    if (++pic[match_idx].stalls >= 4) {
+      pic[match_idx].fn = NULL;
+    }
+  }
+  return dst;
 }
 #endif
 
@@ -2053,34 +2137,50 @@ encode_dict_array_cached(JsonBuffer *b, char *dst, char **safe_end_p,
   uint16_t split_klen[30];
   char split_kbuf[1024];
 #ifdef CJSON_SCHEMA_JIT
-  CJsonJitSplitLoopFn jit_fn = NULL;
-  int jit_stalls = 0;
+  JitPicEntry arr_pic[4];
+  int arr_pic_n = 0;
+  int arr_pic_next = 0;
 #endif
 #endif
 
   for (Py_ssize_t i = 0; i < len; i++) {
 #ifdef CJSON_SCHEMA_JIT
-    if (jit_fn != NULL && b->default_fn == NULL &&
+    if (arr_pic_n > 0 && b->default_fn == NULL &&
         b->depth < CJSON_REC_SER_DEPTH - 2) {
-      JitRunCtx jctx;
-      jctx.b = b;
-      jctx.safe_end_p = &safe_end;
-      jctx.dk = split_dk;
-#if PY_VERSION_HEX >= 0x030D0000
-      jctx.prefix = NULL;
-#else
-      jctx.prefix = split_prefix;
-#endif
-      Py_ssize_t before_i = i;
-      b->depth++;
-      dst = jit_fn(items, len, &i, dst, &jctx);
-      b->depth--;
-      if (CJSON_UNLIKELY(dst == NULL))
-        return NULL;
-      if (i >= len)
-        break;
-      if (i == before_i && ++jit_stalls >= 4) {
-        jit_fn = NULL;
+      PyObject *it = items[i];
+      if (CJSON_LIKELY(Py_TYPE(it) == &PyDict_Type)) {
+        PyDictObject *imp = (PyDictObject *)it;
+        int is_sp = (imp->ma_values != NULL);
+        uintptr_t sid = cjson_jit_dict_shape_id(imp, is_sp);
+        if (sid != 0) {
+          for (int pk = 0; pk < arr_pic_n; pk++) {
+            if (arr_pic[pk].fn != NULL && arr_pic[pk].sn == imp->ma_used &&
+                arr_pic[pk].is_split == (uint8_t)is_sp &&
+                arr_pic[pk].shape_id == sid) {
+              JitRunCtx jctx;
+              jctx.b = b;
+              jctx.safe_end_p = &safe_end;
+              jctx.dk = arr_pic[pk].split_dk;
+              jctx.prefix = NULL;
+              Py_ssize_t before_i = i;
+              b->depth++;
+              dst = arr_pic[pk].fn(items, len, &i, dst, &jctx);
+              b->depth--;
+              if (CJSON_UNLIKELY(dst == NULL))
+                return NULL;
+              if (i >= len)
+                goto arr_done;
+              if (i > before_i) {
+                i--;
+                goto arr_next_iter;
+              }
+              if (++arr_pic[pk].stalls >= 4) {
+                arr_pic[pk].fn = NULL;
+              }
+              break;
+            }
+          }
+        }
       }
     }
 #endif
@@ -2301,10 +2401,14 @@ encode_dict_array_cached(JsonBuffer *b, char *dst, char **safe_end_p,
                         i + 1 < len &&
                         Py_TYPE(items[i + 1]) == &PyDict_Type &&
                         ((PyDictObject *)items[i + 1])->ma_keys == mp->ma_keys &&
-                        ((PyDictObject *)items[i + 1])->ma_used == mp->ma_used &&
-                        Py_TYPE(items[len >> 1]) == &PyDict_Type &&
-                        ((PyDictObject *)items[len >> 1])->ma_keys == mp->ma_keys &&
-                        ((PyDictObject *)items[len >> 1])->ma_used == mp->ma_used);
+                        ((PyDictObject *)items[i + 1])->ma_used == mp->ma_used);
+          if (jit_ok) {
+            uintptr_t sid = (uintptr_t)mp->ma_keys;
+            for (int pk = 0; pk < arr_pic_n; pk++) {
+              if (arr_pic[pk].is_split == 1 && arr_pic[pk].sn == (Py_ssize_t)sn &&
+                  arr_pic[pk].shape_id == sid) { jit_ok = 0; break; }
+            }
+          }
 #endif
           PyObject *tk, *tv;
           Py_ssize_t tpos = 0;
@@ -2370,14 +2474,23 @@ encode_dict_array_cached(JsonBuffer *b, char *dst, char **safe_end_p,
 #ifdef CJSON_SCHEMA_JIT
             if (jit_ok) {
 #if PY_VERSION_HEX >= 0x030D0000
-              jit_fn = cjson_jit_get_or_compile(sn, split_kbuf, kused,
+              CJsonJitSplitLoopFn fn = cjson_jit_get_or_compile(sn, split_kbuf, kused,
                                                 split_koff, split_klen,
                                                 jit_vtypes, split_order, 0, NULL, jit_svals);
 #else
-              jit_fn = cjson_jit_get_or_compile(
+              CJsonJitSplitLoopFn fn = cjson_jit_get_or_compile(
                   sn, split_kbuf, kused, split_koff, split_klen, jit_vtypes,
                   split_order, (uint8_t)sn, split_prefix, jit_svals);
 #endif
+              if (fn != NULL) {
+                int slot = (arr_pic_n < 4) ? arr_pic_n++ : (arr_pic_next++ & 3);
+                arr_pic[slot].split_dk = mp->ma_keys;
+                arr_pic[slot].shape_id = (uintptr_t)mp->ma_keys;
+                arr_pic[slot].sn = (Py_ssize_t)sn;
+                arr_pic[slot].fn = fn;
+                arr_pic[slot].is_split = 1;
+                arr_pic[slot].stalls = 0;
+              }
             }
 #endif
           }
@@ -2395,15 +2508,33 @@ encode_dict_array_cached(JsonBuffer *b, char *dst, char **safe_end_p,
             (CJsonSerDictUnicodeEntry *)(dk->dk_indices +
                                          ((size_t)1 << log2_idx));
 #ifdef CJSON_SCHEMA_JIT
-        if (CJSON_UNLIKELY(i == 0 && jit_fn == NULL && len >= 32 && b->default_fn == NULL &&
+        if (CJSON_UNLIKELY(len >= 16 && b->default_fn == NULL &&
                            mp->ma_used == nentries && nentries > 0 && nentries <= 30 &&
-                           Py_TYPE(items[1]) == &PyDict_Type &&
-                           ((PyDictObject *)items[1])->ma_values == NULL &&
-                           ((PyDictObject *)items[1])->ma_used == nentries &&
-                           Py_TYPE(items[len >> 1]) == &PyDict_Type &&
-                           ((PyDictObject *)items[len >> 1])->ma_values == NULL &&
-                           ((PyDictObject *)items[len >> 1])->ma_used == nentries)) {
-          jit_fn = cjson_jit_try_compile_combined_arr(ep, nentries);
+                           i + 2 < len &&
+                           Py_TYPE(items[i + 1]) == &PyDict_Type &&
+                           ((PyDictObject *)items[i + 1])->ma_values == NULL &&
+                           ((PyDictObject *)items[i + 1])->ma_used == nentries &&
+                           Py_TYPE(items[i + 2]) == &PyDict_Type &&
+                           ((PyDictObject *)items[i + 2])->ma_values == NULL &&
+                           ((PyDictObject *)items[i + 2])->ma_used == nentries)) {
+          uintptr_t sid = (uintptr_t)ep[0].me_key ^ ((uintptr_t)ep[nentries - 1].me_key << 1);
+          int dup = 0;
+          for (int pk = 0; pk < arr_pic_n; pk++) {
+            if (arr_pic[pk].is_split == 0 && arr_pic[pk].sn == nentries &&
+                arr_pic[pk].shape_id == sid) { dup = 1; break; }
+          }
+          if (!dup) {
+            CJsonJitSplitLoopFn fn = cjson_jit_try_compile_combined_arr(ep, nentries);
+            if (fn != NULL) {
+              int slot = (arr_pic_n < 4) ? arr_pic_n++ : (arr_pic_next++ & 3);
+              arr_pic[slot].split_dk = NULL;
+              arr_pic[slot].shape_id = sid;
+              arr_pic[slot].sn = nentries;
+              arr_pic[slot].fn = fn;
+              arr_pic[slot].is_split = 0;
+              arr_pic[slot].stalls = 0;
+            }
+          }
         }
 #endif
         for (Py_ssize_t di = 0; di < nentries; di++) {
@@ -2763,7 +2894,13 @@ encode_dict_array_cached(JsonBuffer *b, char *dst, char **safe_end_p,
 #endif
     }
     *dst++ = ',';
+#ifdef CJSON_SCHEMA_JIT
+  arr_next_iter:;
+#endif
   }
+#ifdef CJSON_SCHEMA_JIT
+arr_done:;
+#endif
   *out_idx = len;
   *safe_end_p = safe_end;
   return dst;
@@ -3579,38 +3716,27 @@ static char *encode_dict_fast(JsonBuffer *b, char *dst, char **safe_end_p,
           (CJsonSerDictUnicodeEntry *)(dk->dk_indices +
                                        ((size_t)1 << log2_idx));
 #ifdef CJSON_SCHEMA_JIT
-      CJsonJitSplitLoopFn dod_jit_fn = NULL;
-      PyDictKeysObject *dod_split_dk = NULL;
-      Py_ssize_t dod_sn = 0;
-      int dod_is_split = 0;
-      int dod_stalls = 0;
-      if (CJSON_UNLIKELY(nentries >= 24 && b->default_fn == NULL &&
-                         b->depth < CJSON_REC_SER_DEPTH)) {
-        dod_jit_fn = cjson_jit_try_compile_dod(ep, nentries, &dod_split_dk,
-                                               &dod_sn, &dod_is_split);
-      }
+      JitPicEntry dod_pic[4];
+      int dod_pic_n = 0;
+      int dod_pic_next = 0;
+      int dod_enabled = (nentries >= 24 && b->default_fn == NULL &&
+                         b->depth < CJSON_REC_SER_DEPTH);
 #endif
       for (Py_ssize_t di = 0; di < nentries; di++) {
         PyObject *dval = ep[di].me_value;
         if (CJSON_UNLIKELY(dval == NULL))
           continue;
 #ifdef CJSON_SCHEMA_JIT
-        if (CJSON_UNLIKELY(dod_jit_fn != NULL && Py_TYPE(dval) == &PyDict_Type &&
-                           ((PyDictObject *)dval)->ma_used == dod_sn &&
-                           (!dod_is_split || ((PyDictObject *)dval)->ma_keys == dod_split_dk))) {
-          JitRunCtx jctx = {b, &safe_end, dod_split_dk, NULL};
-          Py_ssize_t ji = di;
-          b->depth++;
-          char *jdst = dod_jit_fn((PyObject *const *)ep, nentries, &ji, dst, &jctx);
-          b->depth--;
+        if (CJSON_UNLIKELY(dod_enabled && Py_TYPE(dval) == &PyDict_Type)) {
+          Py_ssize_t next_di = di;
+          char *jdst = cjson_jit_dod_pic_dispatch(b, dst, &safe_end, ep, nentries,
+                                                  &next_di, dod_pic, &dod_pic_n,
+                                                  &dod_pic_next);
           if (CJSON_UNLIKELY(jdst == NULL)) { b->depth--; return NULL; }
           dst = jdst;
-          if (ji > di) {
-            di = ji - 1;
+          if (next_di > di) {
+            di = next_di - 1;
             continue;
-          }
-          if (++dod_stalls >= 4) {
-            dod_jit_fn = NULL;
           }
         }
 #endif
