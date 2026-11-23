@@ -2186,6 +2186,7 @@ static PyObject *parse_object_rec(
 }
 
 #include "jit_deser_arm64.h"
+#include "jit_deser_x86_64.h"
 
 static PyObject *parse_array_rec(
     JsonParser *jp, const char **p_io, const char *end, int depth, uint32_t schema_slot) {
@@ -2307,16 +2308,24 @@ dispatch_item:;
     if (c == '{') {
 #ifdef CJSON_DESER_SCHEMA_JIT
       if (CJSON_LIKELY(djit_stalls < 4 && depth + 1 < CJSON_REC_PARSE_DEPTH &&
-                       (jp->item_sp - base) >= 2 && (end - p) >= 128)) {
+                       (jp->item_sp - base) >= 2 && (end - p) >= 256)) {
         ObjectSchema *sc = &g_schemas[schema_slot];
         if (sc->split_ok) {
-          CJsonJitDeserLoopFn djit = cjson_deser_jit_get_or_compile(sc);
+          /* Detect minified vs pretty/spaced JSON from first char after '{' (or after first key) */
+          int is_pretty = (p + 1 < end && (uint8_t)p[1] <= 0x20);
+          if (!is_pretty && sc->len > 0) {
+            uint32_t k0 = sc->keys[0].klen;
+            if (p + k0 + 4 < end && p[k0 + 3] == ':' && (uint8_t)p[k0 + 4] <= 0x20) {
+              is_pretty = 1;
+            }
+          }
+          CJsonJitDeserLoopFn djit = cjson_deser_jit_get_or_compile(sc, is_pretty, 0);
           if (djit != NULL) {
             CJsonDictKeysObject *saved_dk = sc->shared_keys;
             uint8_t saved_prefix[32];
             memcpy(saved_prefix, sc->values_prefix, sc->prefix_size);
             saved_dk->dk_refcnt++;
-            JitDeserCtx dctx = {saved_dk, saved_prefix, sc->prefix_size, depth, schema_slot, 0};
+            JitDeserCtx dctx = {saved_dk, saved_prefix, sc->prefix_size, depth, schema_slot, 0, NULL};
             const char *before_p = p;
             p = djit(jp, p, end, &dctx);
             cjson_free_shared_keys(saved_dk);

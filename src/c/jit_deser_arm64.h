@@ -1,18 +1,15 @@
 #ifndef CJSON_JIT_DESER_ARM64_H
 #define CJSON_JIT_DESER_ARM64_H
 
-/* Experimental Runtime Schema-Guided JIT Deserializer for ARM64
- * (macOS Apple Silicon & Linux aarch64, CPython 3.12-3.14).
- *
- * Compiles a specialized machine-code loop for arrays of homogeneous JSON
- * objects matching an ObjectSchema (sc->split_ok == 1):
- *   - Immediate 64-bit/32-bit/16-bit/8-bit matching of {"key": and ,"key":
- *     directly against input UTF-8 bytes (zero SchemaKey loads, zero hashing)
- *   - Inline true / false / null and 0..99 immortal small-int parsing (zero C calls)
- *   - Direct calls to parse_string_fast / parse_number / parse_any (no switch cascade)
- *   - Direct split-table PyDictObject materialization into jp->items[]
- *   - Exact bailout to row_start_p with Py_DECREF cleanup on any mismatch/whitespace/error
- *   - Thread-safe W^X compilation, lock-free O(1) cache, CXJSON_JIT=0 kill switch */
+/* Runtime Schema-Guided JIT Deserializer for ARM64 (macOS Apple Silicon & Linux aarch64).
+ * Full parity with jit_deser_x86_64.h:
+ *   - Compiles specialized machine code for ObjectSchema (sc->split_ok == 1)
+ *   - Supports BOTH minified AND pretty-printed/spaced real-world JSON
+ *   - Supports BOTH array-of-objects loops AND single/nested/dict-of-dicts objects
+ *   - Compiled-in immediate 64/32/16/8-bit key matching (up to 48B keys)
+ *   - Zero-call inline true/false/null, "" empty string, 0..99 immortal small ints,
+ *     [] empty list, {} empty dict, and direct parse_string_fast/parse_number/parse_object/parse_array
+ *   - Exact bailout with Py_DECREF cleanup on any mismatch/error; CXJSON_JIT=0 kill switch */
 
 #if (defined(__APPLE__) || defined(__linux__)) && defined(__aarch64__) && \
     defined(CJSON_SPLIT_DICT_FAST) && \
@@ -38,18 +35,20 @@ typedef struct {
   int depth;
   uint32_t schema_slot;
   int error;
+  PyObject *single_out; /* populated when is_single == 1 */
 } JitDeserCtx;
 
 typedef const char *(*CJsonJitDeserLoopFn)(
     JsonParser *jp,       /* X0 */
-    const char *p,        /* X1 (points at '{') */
+    const char *p,        /* X1 (points at '{' for array loop, or first char after '{' for single) */
     const char *end,      /* X2 */
     JitDeserCtx *ctx      /* X3 */
 );
 
 static int g_djit_enabled_state = -1;
 static PyObject *g_djit_small_ints[100];
-static int g_djit_small_ints_inited = 0;
+static PyObject *g_djit_empty_str = NULL;
+static int g_djit_inited = 0;
 
 static inline int cjson_deser_jit_is_enabled(void) {
   if (CJSON_UNLIKELY(g_djit_enabled_state < 0)) {
@@ -59,13 +58,13 @@ static inline int cjson_deser_jit_is_enabled(void) {
   return g_djit_enabled_state;
 }
 
-static void cjson_djit_init_small_ints(void) {
-  if (CJSON_LIKELY(g_djit_small_ints_inited)) return;
+static void cjson_djit_init_globals(void) {
+  if (CJSON_LIKELY(g_djit_inited)) return;
   for (int i = 0; i < 100; i++) {
     g_djit_small_ints[i] = PyLong_FromLong(i);
-    /* Python 3.12+: 0..256 are immortal singletons; keep ref forever */
   }
-  g_djit_small_ints_inited = 1;
+  g_djit_empty_str = PyUnicode_FromStringAndSize("", 0);
+  g_djit_inited = 1;
 }
 
 /* ---- C helpers invoked by JIT deserializer ---- */
@@ -77,6 +76,40 @@ static PyObject *cjson_djit_parse_str(JsonParser *jp, const char **p_io, const c
 __attribute__((noinline))
 static PyObject *cjson_djit_parse_num(JsonParser *jp, const char **p_io, const char *end) {
   return parse_number(jp, p_io, end);
+}
+
+__attribute__((noinline))
+static PyObject *cjson_djit_parse_obj(
+    JsonParser *jp, const char **p_io, const char *end, int depth, uint32_t child_slot) {
+  if (CJSON_UNLIKELY(depth >= CJSON_REC_PARSE_DEPTH)) {
+    const char *p = *p_io - 1;
+    PyObject *v = parse_document_iter(jp, &p, end, depth - 1);
+    *p_io = p;
+    return v;
+  }
+  return parse_object_rec(jp, p_io, end, depth, child_slot);
+}
+
+__attribute__((noinline))
+static PyObject *cjson_djit_parse_arr(
+    JsonParser *jp, const char **p_io, const char *end, int depth, uint32_t child_slot) {
+  if (CJSON_UNLIKELY(depth >= CJSON_REC_PARSE_DEPTH)) {
+    const char *p = *p_io - 1;
+    PyObject *v = parse_document_iter(jp, &p, end, depth - 1);
+    *p_io = p;
+    return v;
+  }
+  return parse_array_rec(jp, p_io, end, depth, child_slot);
+}
+
+__attribute__((noinline))
+static PyObject *cjson_djit_new_empty_list(void) {
+  return PyList_New(0);
+}
+
+__attribute__((noinline))
+static PyObject *cjson_djit_new_empty_dict(void) {
+  return PyDict_New();
 }
 
 __attribute__((noinline))
@@ -139,14 +172,13 @@ static void cjson_djit_decref_vals(PyObject **vals, uint32_t count) {
   }
 }
 
-__attribute__((noinline))
-static int cjson_djit_finish_split_dict(
-    JsonParser *jp, JitDeserCtx *ctx, uint32_t expected_len, PyObject **split_vals) {
+static inline PyObject *cjson_djit_build_split_dict_inner(
+    JitDeserCtx *ctx, uint32_t expected_len, PyObject **split_vals) {
   PyObject *sdict = PyDict_New();
   if (CJSON_UNLIKELY(sdict == NULL)) {
     cjson_djit_decref_vals(split_vals, expected_len);
     ctx->error = 1;
-    return -1;
+    return NULL;
   }
   CJsonDictKeysObject *saved_dk = ctx->saved_dk;
   saved_dk->dk_refcnt++;
@@ -161,7 +193,7 @@ static int cjson_djit_finish_split_dict(
     cjson_free_shared_keys(saved_dk);
     PyErr_NoMemory();
     ctx->error = 1;
-    return -1;
+    return NULL;
   }
   dv->capacity = (uint8_t)expected_len;
   dv->size = (uint8_t)expected_len;
@@ -181,7 +213,7 @@ static int cjson_djit_finish_split_dict(
     cjson_free_shared_keys(saved_dk);
     PyErr_NoMemory();
     ctx->error = 1;
-    return -1;
+    return NULL;
   }
   memcpy(raw, ctx->prefix, ctx->psize);
   PyObject **dst_vals = (PyObject **)(raw + ctx->psize);
@@ -199,6 +231,14 @@ static int cjson_djit_finish_split_dict(
       break;
     }
   }
+  return sdict;
+}
+
+__attribute__((noinline))
+static int cjson_djit_finish_split_dict(
+    JsonParser *jp, JitDeserCtx *ctx, uint32_t expected_len, PyObject **split_vals) {
+  PyObject *sdict = cjson_djit_build_split_dict_inner(ctx, expected_len, split_vals);
+  if (CJSON_UNLIKELY(sdict == NULL)) return -1;
   if (CJSON_UNLIKELY(jp->item_sp >= jp->item_cap)) {
     if (parser_grow_items(jp) < 0) {
       Py_DECREF(sdict);
@@ -210,7 +250,17 @@ static int cjson_djit_finish_split_dict(
   return 0;
 }
 
-/* ---- Minimal ARM64 assembler helpers for deserializer JIT ---- */
+__attribute__((noinline))
+static int cjson_djit_finish_single_dict(
+    JsonParser *jp, JitDeserCtx *ctx, uint32_t expected_len, PyObject **split_vals) {
+  (void)jp;
+  PyObject *sdict = cjson_djit_build_split_dict_inner(ctx, expected_len, split_vals);
+  if (CJSON_UNLIKELY(sdict == NULL)) return -1;
+  ctx->single_out = sdict;
+  return 0;
+}
+
+/* ---- Minimal ARM64 assembler helpers ---- */
 typedef struct {
   uint32_t *buf;
   size_t len;
@@ -221,7 +271,6 @@ static inline void da64_emit(DjitAsm *a, uint32_t insn) {
   if (a->len < a->cap) a->buf[a->len] = insn;
   a->len++;
 }
-
 static inline uint32_t da64_mov(int rd, int rm) {
   return 0xAA0003E0u | ((uint32_t)rm << 16) | (uint32_t)rd;
 }
@@ -287,8 +336,52 @@ static void da64_load_u64(DjitAsm *a, int rd, uint64_t val) {
   if ((val >> 48) & 0xFFFFu) da64_emit(a, da64_movk(rd, (uint16_t)((val >> 48) & 0xFFFFu), 48));
 }
 
-/* Emit exact byte-sequence check against [X20 + 0..len-1], branching to bail on mismatch,
- * then advancing X20 += len. Caller ensures [X20 .. X20 + len] is in-bounds. */
+/* Inline RFC 8259 whitespace skip (' ', '\n', '\r', '\t') within [X20, X21).
+ * Fast-exits in 2 insns when *X20 > 0x20, and skips 8-space indent chunks in 1 compare! */
+static void da64_emit_skip_ws(DjitAsm *a) {
+  size_t ws_loop = a->len;
+  da64_emit(a, da64_cmp_reg(20, 21));
+  size_t br_end = a->len;
+  da64_emit(a, da64_b_cond(10, 0)); /* B.GE done */
+  da64_emit(a, da64_ldurb(10, 20, 0));
+  da64_emit(a, da64_cmp_w_imm(10, ' '));
+  size_t br_sp = a->len;
+  da64_emit(a, da64_b_cond(0, 0)); /* B.EQ check_8sp */
+  size_t br_done1 = a->len;
+  da64_emit(a, da64_b_cond(8, 0)); /* B.HI done (> ' ') */
+  da64_emit(a, da64_cmp_w_imm(10, '\n'));
+  size_t br_adv2 = a->len;
+  da64_emit(a, da64_b_cond(0, 0));
+  da64_emit(a, da64_cmp_w_imm(10, '\t'));
+  size_t br_adv3 = a->len;
+  da64_emit(a, da64_b_cond(0, 0));
+  da64_emit(a, da64_cmp_w_imm(10, '\r'));
+  size_t br_done2 = a->len;
+  da64_emit(a, da64_b_cond(1, 0)); /* B.NE done */
+  size_t adv = a->len;
+  da64_emit(a, da64_add_imm(20, 20, 1));
+  da64_emit(a, da64_b((int32_t)(ws_loop - a->len)));
+
+  /* check_8sp: skip 8 spaces at a time when X20 + 8 <= X21 */
+  size_t check_8sp = a->len;
+  da64_emit(a, da64_add_imm(10, 20, 8));
+  da64_emit(a, da64_cmp_reg(10, 21));
+  da64_emit(a, da64_b_cond(8, (int32_t)(adv - a->len))); /* B.HI adv (+1) */
+  da64_emit(a, da64_ldur_x(10, 20, 0));
+  da64_load_u64(a, 11, 0x2020202020202020ULL);
+  da64_emit(a, da64_cmp_reg(10, 11));
+  da64_emit(a, da64_b_cond(1, (int32_t)(adv - a->len))); /* B.NE adv (+1) */
+  da64_emit(a, da64_add_imm(20, 20, 8));
+  da64_emit(a, da64_b((int32_t)(ws_loop - a->len)));
+
+  a->buf[br_sp] = da64_b_cond(0, (int32_t)(check_8sp - br_sp));
+  a->buf[br_adv2] = da64_b_cond(0, (int32_t)(adv - br_adv2));
+  a->buf[br_adv3] = da64_b_cond(0, (int32_t)(adv - br_adv3));
+  a->buf[br_end] = da64_b_cond(10, (int32_t)(a->len - br_end));
+  a->buf[br_done1] = da64_b_cond(8, (int32_t)(a->len - br_done1));
+  a->buf[br_done2] = da64_b_cond(1, (int32_t)(a->len - br_done2));
+}
+
 static void da64_emit_match_lit(DjitAsm *a, const char *lit, uint32_t len,
                                 size_t *bail_patches, size_t *n_bail) {
   uint32_t off = 0;
@@ -299,7 +392,7 @@ static void da64_emit_match_lit(DjitAsm *a, const char *lit, uint32_t len,
     da64_load_u64(a, 11, w);
     da64_emit(a, da64_cmp_reg(10, 11));
     bail_patches[(*n_bail)++] = a->len;
-    da64_emit(a, da64_b_cond(1, 0)); /* B.NE bail */
+    da64_emit(a, da64_b_cond(1, 0));
     off += 8;
   }
   if (off + 4 <= len) {
@@ -331,31 +424,31 @@ static void da64_emit_match_lit(DjitAsm *a, const char *lit, uint32_t len,
   da64_emit(a, da64_add_imm(20, 20, (uint16_t)len));
 }
 
-/* Emit call to cjson_djit_parse_any(jp=X19, &p_tmp=[SP+88], end=X21, depth=ctx->depth+1, child_slot) */
-static void da64_emit_call_any(DjitAsm *a, uint32_t child_slot,
-                               size_t *err_patches, size_t *n_err) {
+static void da64_emit_call_5(DjitAsm *a, uint64_t fn_addr, uint32_t child_slot,
+                             size_t *err_patches, size_t *n_err) {
   da64_emit(a, da64_str_uoff(20, 31, 88));
   da64_emit(a, da64_mov(0, 19));
   da64_emit(a, da64_add_imm(1, 31, 88));
   da64_emit(a, da64_mov(2, 21));
-  /* LDR W3, [X22, #offsetof(JitDeserCtx, depth)]; ADD W3, W3, #1 */
   da64_emit(a, da64_ldur_w(3, 22, (int32_t)offsetof(JitDeserCtx, depth)));
   da64_emit(a, 0x11000463u); /* ADD W3, W3, #1 */
   da64_emit(a, da64_movz(4, (uint16_t)child_slot, 0));
-  da64_load_u64(a, 12, (uint64_t)(uintptr_t)&cjson_djit_parse_any);
+  da64_load_u64(a, 12, fn_addr);
   da64_emit(a, da64_blr(12));
   da64_emit(a, da64_ldr_uoff(20, 31, 88));
   err_patches[(*n_err)++] = a->len;
   da64_emit(a, da64_cbz(0, 0));
 }
 
-#define CJSON_DJIT_POOL_BYTES (512 * 1024)
-#define CJSON_DJIT_CACHE_SLOTS 128
+#define CJSON_DJIT_POOL_BYTES (1024 * 1024)
+#define CJSON_DJIT_CACHE_SLOTS 256
 
 typedef struct {
   uint64_t sig_hash;
-  CJsonDictKeysObject *dk; /* key identity; valid while schema lives */
+  CJsonDictKeysObject *dk;
   uint32_t n;
+  uint8_t is_pretty;
+  uint8_t is_single;
   uint8_t vkinds[CJSON_SPLIT_MAX_KEYS];
   CJsonJitDeserLoopFn fn;
 } DjitSchemaEntry;
@@ -369,12 +462,14 @@ static DjitSchemaEntry g_djit_cache[CJSON_DJIT_CACHE_SLOTS];
 static uint32_t g_djit_compiled = 0;
 static int g_djit_pool_full = 0;
 
-static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(const ObjectSchema *sc) {
+static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(
+    const ObjectSchema *sc, int is_pretty, int is_single) {
   if (!cjson_deser_jit_is_enabled() || !sc->split_ok) return NULL;
   uint32_t n = sc->len;
   if (n == 0 || n > CJSON_SPLIT_MAX_KEYS) return NULL;
 
-  uint64_t h = ((uint64_t)(uintptr_t)sc->shared_keys * 0x9E3779B97F4A7C15ULL) ^ ((uint64_t)n << 48);
+  uint64_t h = ((uint64_t)(uintptr_t)sc->shared_keys * 0x9E3779B97F4A7C15ULL) ^
+               ((uint64_t)n << 48) ^ ((uint64_t)is_pretty << 56) ^ ((uint64_t)is_single << 57);
   uint8_t vkinds[CJSON_SPLIT_MAX_KEYS];
   for (uint32_t j = 0; j < n; j++) {
     if (sc->keys[j].klen == 0 || sc->keys[j].klen > 48) return NULL;
@@ -382,7 +477,6 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(const ObjectSchema *sc
     h = (h ^ ((uint64_t)vkinds[j] << 8) ^ sc->keys[j].w0) * 0xBF58476D1CE4E5B9ULL;
   }
 
-  /* Lock-free O(1) 2-way lookup */
   uint32_t set_base = (uint32_t)(h & (CJSON_DJIT_CACHE_SLOTS - 2u));
   uint32_t occupied = 0;
   for (uint32_t w = 0; w < 2; w++) {
@@ -391,6 +485,7 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(const ObjectSchema *sc
     if (fn != NULL) {
       occupied++;
       if (e->sig_hash == h && e->dk == sc->shared_keys && e->n == n &&
+          e->is_pretty == (uint8_t)is_pretty && e->is_single == (uint8_t)is_single &&
           memcmp(e->vkinds, vkinds, n) == 0) {
         return fn;
       }
@@ -401,11 +496,12 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(const ObjectSchema *sc
   }
 
   pthread_mutex_lock(&g_djit_mu);
-  cjson_djit_init_small_ints();
+  cjson_djit_init_globals();
 
   for (uint32_t w = 0; w < 2; w++) {
     DjitSchemaEntry *e = &g_djit_cache[set_base + w];
     if (e->fn != NULL && e->sig_hash == h && e->dk == sc->shared_keys && e->n == n &&
+        e->is_pretty == (uint8_t)is_pretty && e->is_single == (uint8_t)is_single &&
         memcmp(e->vkinds, vkinds, n) == 0) {
       CJsonJitDeserLoopFn fn = e->fn;
       pthread_mutex_unlock(&g_djit_mu);
@@ -436,18 +532,17 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(const ObjectSchema *sc
     g_djit_mem = (uint8_t *)m;
     g_djit_used = 0;
   }
-  if (g_djit_used + 8192 > CJSON_DJIT_POOL_BYTES) {
+  if (g_djit_used + 16384 > CJSON_DJIT_POOL_BYTES) {
     __atomic_store_n(&g_djit_pool_full, 1, __ATOMIC_RELAXED);
     pthread_mutex_unlock(&g_djit_mu);
     return NULL;
   }
 #endif
 
-  uint32_t tmp_code[4096];
-  DjitAsm a = {tmp_code, 0, 4096};
+  uint32_t tmp_code[6144];
+  DjitAsm a = {tmp_code, 0, 6144};
 
-  /* Prologue: 352-byte stack frame ([SP+0..79]=saved regs, [SP+88]=p_tmp, [SP+96..351]=split_vals[32])
-   * STP X29, X30, [SP, #-352]! -> imm7 = -44 = 0x54 */
+  /* Prologue: 352-byte frame */
   da64_emit(&a, 0xA9800000u | (0x54u << 15) | (30u << 10) | (31u << 5) | 29u);
   da64_emit(&a, 0xA9000000u | (2u << 15) | (20u << 10) | (31u << 5) | 19u);
   da64_emit(&a, 0xA9000000u | (4u << 15) | (22u << 10) | (31u << 5) | 21u);
@@ -460,12 +555,11 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(const ObjectSchema *sc
   da64_emit(&a, da64_mov(22, 3)); /* X22 = ctx */
   da64_emit(&a, da64_add_imm(24, 31, 96)); /* X24 = split_vals */
 
-  size_t bail_patches[256];
+  size_t bail_patches[384];
   size_t n_bail = 0;
-  size_t err_patches[128];
+  size_t err_patches[192];
   size_t n_err = 0;
 
-  /* Loop over consecutive objects '{...},{...},...' */
   size_t loop_top = a.len;
   da64_emit(&a, da64_mov(23, 20)); /* X23 = row_start_p */
   da64_emit(&a, da64_movz(25, 0, 0)); /* X25 = parsed count = 0 */
@@ -473,142 +567,201 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(const ObjectSchema *sc
   for (uint32_t j = 0; j < n; j++) {
     const SchemaKey *sk = &sc->keys[j];
     uint32_t klen = sk->klen;
-    char lit[64];
-    lit[0] = (j == 0) ? '{' : ',';
-    lit[1] = '"';
-    memcpy(lit + 2, PyUnicode_1BYTE_DATA(sk->key), klen);
-    lit[2 + klen] = '"';
-    lit[3 + klen] = ':';
-    uint32_t lit_len = klen + 4u;
+    if (!is_pretty) {
+      char lit[64];
+      uint32_t lit_len;
+      if (j == 0 && is_single) {
+        /* single mode: p already points at '"' of first key */
+        lit[0] = '"';
+        memcpy(lit + 1, PyUnicode_1BYTE_DATA(sk->key), klen);
+        lit[1 + klen] = '"';
+        lit[2 + klen] = ':';
+        lit_len = klen + 3u;
+      } else {
+        lit[0] = (j == 0) ? '{' : ',';
+        lit[1] = '"';
+        memcpy(lit + 2, PyUnicode_1BYTE_DATA(sk->key), klen);
+        lit[2 + klen] = '"';
+        lit[3 + klen] = ':';
+        lit_len = klen + 4u;
+      }
+      da64_emit(&a, da64_add_imm(10, 20, (uint16_t)(lit_len + 16u)));
+      da64_emit(&a, da64_cmp_reg(10, 21));
+      bail_patches[n_bail++] = a.len;
+      da64_emit(&a, da64_b_cond(8, 0));
+      da64_emit_match_lit(&a, lit, lit_len, bail_patches, &n_bail);
+    } else {
+      /* Pretty / spaced JSON: match '{' or ',' + ws + '"key"' + ws + ':' + ws */
+      if (j == 0) {
+        if (!is_single) {
+          da64_emit(&a, da64_cmp_reg(20, 21));
+          bail_patches[n_bail++] = a.len;
+          da64_emit(&a, da64_b_cond(10, 0));
+          da64_emit(&a, da64_ldurb(10, 20, 0));
+          da64_emit(&a, da64_cmp_w_imm(10, '{'));
+          bail_patches[n_bail++] = a.len;
+          da64_emit(&a, da64_b_cond(1, 0));
+          da64_emit(&a, da64_add_imm(20, 20, 1));
+          da64_emit_skip_ws(&a);
+        }
+      } else {
+        da64_emit_skip_ws(&a);
+        da64_emit(&a, da64_cmp_reg(20, 21));
+        bail_patches[n_bail++] = a.len;
+        da64_emit(&a, da64_b_cond(10, 0));
+        da64_emit(&a, da64_ldurb(10, 20, 0));
+        da64_emit(&a, da64_cmp_w_imm(10, ','));
+        bail_patches[n_bail++] = a.len;
+        da64_emit(&a, da64_b_cond(1, 0));
+        da64_emit(&a, da64_add_imm(20, 20, 1));
+        da64_emit_skip_ws(&a);
+      }
+      char klit[64];
+      klit[0] = '"';
+      memcpy(klit + 1, PyUnicode_1BYTE_DATA(sk->key), klen);
+      klit[1 + klen] = '"';
+      uint32_t klit_len = klen + 2u;
+      da64_emit(&a, da64_add_imm(10, 20, (uint16_t)(klit_len + 16u)));
+      da64_emit(&a, da64_cmp_reg(10, 21));
+      bail_patches[n_bail++] = a.len;
+      da64_emit(&a, da64_b_cond(8, 0));
+      da64_emit_match_lit(&a, klit, klit_len, bail_patches, &n_bail);
+      /* Skip optional space before ':', match ':', skip optional ws after ':' */
+      da64_emit_skip_ws(&a);
+      da64_emit(&a, da64_cmp_reg(20, 21));
+      bail_patches[n_bail++] = a.len;
+      da64_emit(&a, da64_b_cond(10, 0));
+      da64_emit(&a, da64_ldurb(10, 20, 0));
+      da64_emit(&a, da64_cmp_w_imm(10, ':'));
+      bail_patches[n_bail++] = a.len;
+      da64_emit(&a, da64_b_cond(1, 0));
+      da64_emit(&a, da64_add_imm(20, 20, 1));
+      da64_emit_skip_ws(&a);
+      /* Ensure >= 16 bytes remain for safe unaligned short-value loads */
+      da64_emit(&a, da64_add_imm(10, 20, 16));
+      da64_emit(&a, da64_cmp_reg(10, 21));
+      bail_patches[n_bail++] = a.len;
+      da64_emit(&a, da64_b_cond(8, 0));
+    }
 
-    /* Bounds check: p + lit_len + 16 <= end (ensures safe unaligned loads for key + short value) */
-    da64_emit(&a, da64_add_imm(10, 20, (uint16_t)(lit_len + 16u)));
-    da64_emit(&a, da64_cmp_reg(10, 21));
-    bail_patches[n_bail++] = a.len;
-    da64_emit(&a, da64_b_cond(8, 0)); /* B.HI bail */
-
-    /* Match {"key": or ,"key": directly */
-    da64_emit_match_lit(&a, lit, lit_len, bail_patches, &n_bail);
-
-    /* Parse value according to predicted val_kind */
     uint8_t vk = sk->val_kind;
     uint32_t child_slot = (uint32_t)((uint64_t)sk->py_hash & 63u);
 
     if (vk == 4) {
-      /* Bool / null: 100% inline! */
+      /* Bool / null: 100% inline */
       da64_emit(&a, da64_ldur_w(10, 20, 0));
-      da64_load_u64(&a, 11, 0x65757274ULL); /* "true" */
+      da64_load_u64(&a, 11, 0x65757274ULL);
       da64_emit(&a, da64_cmp_w_reg(10, 11));
-      size_t br_not_true = a.len;
+      size_t br_nt = a.len;
       da64_emit(&a, da64_b_cond(1, 0));
       da64_emit(&a, da64_add_imm(20, 20, 4));
       da64_load_u64(&a, 0, (uint64_t)(uintptr_t)Py_True);
-      size_t br_done1 = a.len;
+      size_t br_d1 = a.len;
       da64_emit(&a, da64_b(0));
 
-      a.buf[br_not_true] = da64_b_cond(1, (int32_t)(a.len - br_not_true));
-      da64_load_u64(&a, 11, 0x736c6166ULL); /* "fals" */
+      a.buf[br_nt] = da64_b_cond(1, (int32_t)(a.len - br_nt));
+      da64_load_u64(&a, 11, 0x736c6166ULL);
       da64_emit(&a, da64_cmp_w_reg(10, 11));
-      size_t br_not_false1 = a.len;
+      size_t br_nf1 = a.len;
       da64_emit(&a, da64_b_cond(1, 0));
       da64_emit(&a, da64_ldurb(12, 20, 4));
       da64_emit(&a, da64_cmp_w_imm(12, 'e'));
-      size_t br_not_false2 = a.len;
+      size_t br_nf2 = a.len;
       da64_emit(&a, da64_b_cond(1, 0));
       da64_emit(&a, da64_add_imm(20, 20, 5));
       da64_load_u64(&a, 0, (uint64_t)(uintptr_t)Py_False);
-      size_t br_done2 = a.len;
+      size_t br_d2 = a.len;
       da64_emit(&a, da64_b(0));
 
-      a.buf[br_not_false1] = da64_b_cond(1, (int32_t)(a.len - br_not_false1));
-      a.buf[br_not_false2] = da64_b_cond(1, (int32_t)(a.len - br_not_false2));
-      da64_load_u64(&a, 11, 0x6c6c756eULL); /* "null" */
+      a.buf[br_nf1] = da64_b_cond(1, (int32_t)(a.len - br_nf1));
+      a.buf[br_nf2] = da64_b_cond(1, (int32_t)(a.len - br_nf2));
+      da64_load_u64(&a, 11, 0x6c6c756eULL);
       da64_emit(&a, da64_cmp_w_reg(10, 11));
-      size_t br_not_null = a.len;
+      size_t br_nn = a.len;
       da64_emit(&a, da64_b_cond(1, 0));
       da64_emit(&a, da64_add_imm(20, 20, 4));
       da64_load_u64(&a, 0, (uint64_t)(uintptr_t)Py_None);
-      size_t br_done3 = a.len;
+      size_t br_d3 = a.len;
       da64_emit(&a, da64_b(0));
 
-      a.buf[br_not_null] = da64_b_cond(1, (int32_t)(a.len - br_not_null));
-      da64_emit_call_any(&a, child_slot, err_patches, &n_err);
-      a.buf[br_done1] = da64_b((int32_t)(a.len - br_done1));
-      a.buf[br_done2] = da64_b((int32_t)(a.len - br_done2));
-      a.buf[br_done3] = da64_b((int32_t)(a.len - br_done3));
+      a.buf[br_nn] = da64_b_cond(1, (int32_t)(a.len - br_nn));
+      da64_emit_call_5(&a, (uint64_t)(uintptr_t)&cjson_djit_parse_any, child_slot, err_patches, &n_err);
+      a.buf[br_d1] = da64_b((int32_t)(a.len - br_d1));
+      a.buf[br_d2] = da64_b((int32_t)(a.len - br_d2));
+      a.buf[br_d3] = da64_b((int32_t)(a.len - br_d3));
     } else if (vk == 1) {
-      /* Number: inline 0..99 immortal small-int fast path, else parse_number / null / any */
+      /* Number: inline 0..99 immortal small-int + direct parse_number */
       da64_emit(&a, da64_ldurb(10, 20, 0));
-      da64_emit(&a, da64_sub_w_imm(11, 10, '0')); /* W11 = d0 */
+      da64_emit(&a, da64_sub_w_imm(11, 10, '0'));
       da64_emit(&a, da64_cmp_w_imm(11, 9));
-      size_t br_not_dig = a.len;
-      da64_emit(&a, da64_b_cond(8, 0)); /* B.HI not_dig */
-      /* Check next byte W12 = p[1] */
+      size_t br_nd = a.len;
+      da64_emit(&a, da64_b_cond(8, 0));
       da64_emit(&a, da64_ldurb(12, 20, 1));
       da64_emit(&a, da64_cmp_w_imm(12, ','));
-      size_t br_1d_a = a.len;
-      da64_emit(&a, da64_b_cond(0, 0)); /* B.EQ one_digit */
+      size_t br_1a = a.len;
+      da64_emit(&a, da64_b_cond(0, 0));
       da64_emit(&a, da64_cmp_w_imm(12, '}'));
-      size_t br_1d_b = a.len;
-      da64_emit(&a, da64_b_cond(0, 0)); /* B.EQ one_digit */
-      /* 2-digit check: d0 != 0 && '0' <= p[1] <= '9' && (p[2] == ',' || p[2] == '}') */
-      size_t br_zero_lead = a.len;
-      da64_emit(&a, da64_cbz(11, 0)); /* CBZ X11, slow_num (no leading zero!) */
-      da64_emit(&a, da64_sub_w_imm(12, 12, '0')); /* W12 = d1 */
+      size_t br_1b = a.len;
+      da64_emit(&a, da64_b_cond(0, 0));
+      da64_emit(&a, da64_cmp_w_imm(12, '\n'));
+      size_t br_1c = a.len;
+      da64_emit(&a, da64_b_cond(0, 0));
+      size_t br_zl = a.len;
+      da64_emit(&a, da64_cbz(11, 0));
+      da64_emit(&a, da64_sub_w_imm(12, 12, '0'));
       da64_emit(&a, da64_cmp_w_imm(12, 9));
-      size_t br_not_d2 = a.len;
+      size_t br_nd2 = a.len;
       da64_emit(&a, da64_b_cond(8, 0));
       da64_emit(&a, da64_ldurb(13, 20, 2));
       da64_emit(&a, da64_cmp_w_imm(13, ','));
-      size_t br_2d_a = a.len;
+      size_t br_2a = a.len;
       da64_emit(&a, da64_b_cond(0, 0));
       da64_emit(&a, da64_cmp_w_imm(13, '}'));
-      size_t br_2d_fail = a.len;
-      da64_emit(&a, da64_b_cond(1, 0)); /* B.NE slow_num */
-      /* two_digit: val = d0*10 + d1 */
-      a.buf[br_2d_a] = da64_b_cond(0, (int32_t)(a.len - br_2d_a));
+      size_t br_2b = a.len;
+      da64_emit(&a, da64_b_cond(0, 0));
+      da64_emit(&a, da64_cmp_w_imm(13, '\n'));
+      size_t br_2f = a.len;
+      da64_emit(&a, da64_b_cond(1, 0));
+      a.buf[br_2a] = da64_b_cond(0, (int32_t)(a.len - br_2a));
+      a.buf[br_2b] = da64_b_cond(0, (int32_t)(a.len - br_2b));
       da64_emit(&a, da64_movz(13, 10, 0));
-      /* MADD W11, W11, W13, W12 -> 0x1B0D316B */
       da64_emit(&a, 0x1B000000u | (13u << 16) | (12u << 10) | (11u << 5) | 11u);
       da64_emit(&a, da64_add_imm(20, 20, 2));
       da64_load_u64(&a, 14, (uint64_t)(uintptr_t)g_djit_small_ints);
-      /* LDR X0, [X14, X11, LSL #3] */
       da64_emit(&a, 0xF8607800u | (11u << 16) | (14u << 5) | 0u);
-      size_t br_ndone1 = a.len;
+      size_t br_d1 = a.len;
       da64_emit(&a, da64_b(0));
 
-      /* one_digit: p += 1; X0 = g_djit_small_ints[d0] */
-      a.buf[br_1d_a] = da64_b_cond(0, (int32_t)(a.len - br_1d_a));
-      a.buf[br_1d_b] = da64_b_cond(0, (int32_t)(a.len - br_1d_b));
+      a.buf[br_1a] = da64_b_cond(0, (int32_t)(a.len - br_1a));
+      a.buf[br_1b] = da64_b_cond(0, (int32_t)(a.len - br_1b));
+      a.buf[br_1c] = da64_b_cond(0, (int32_t)(a.len - br_1c));
       da64_emit(&a, da64_add_imm(20, 20, 1));
       da64_load_u64(&a, 14, (uint64_t)(uintptr_t)g_djit_small_ints);
       da64_emit(&a, 0xF8607800u | (11u << 16) | (14u << 5) | 0u);
-      size_t br_ndone2 = a.len;
+      size_t br_d2 = a.len;
       da64_emit(&a, da64_b(0));
 
-      /* not_dig: check '-' -> slow_num, else 'n' -> null, else any */
-      a.buf[br_not_dig] = da64_b_cond(8, (int32_t)(a.len - br_not_dig));
+      a.buf[br_nd] = da64_b_cond(8, (int32_t)(a.len - br_nd));
       da64_emit(&a, da64_cmp_w_imm(10, '-'));
       size_t br_neg = a.len;
-      da64_emit(&a, da64_b_cond(0, 0)); /* B.EQ slow_num */
+      da64_emit(&a, da64_b_cond(0, 0));
       da64_emit(&a, da64_ldur_w(10, 20, 0));
-      da64_load_u64(&a, 11, 0x6c6c756eULL); /* "null" */
+      da64_load_u64(&a, 11, 0x6c6c756eULL);
       da64_emit(&a, da64_cmp_w_reg(10, 11));
-      size_t br_nany = a.len;
+      size_t br_na = a.len;
       da64_emit(&a, da64_b_cond(1, 0));
       da64_emit(&a, da64_add_imm(20, 20, 4));
       da64_load_u64(&a, 0, (uint64_t)(uintptr_t)Py_None);
-      size_t br_ndone3 = a.len;
+      size_t br_d3 = a.len;
       da64_emit(&a, da64_b(0));
-      a.buf[br_nany] = da64_b_cond(1, (int32_t)(a.len - br_nany));
-      da64_emit_call_any(&a, child_slot, err_patches, &n_err);
-      size_t br_ndone4 = a.len;
+      a.buf[br_na] = da64_b_cond(1, (int32_t)(a.len - br_na));
+      da64_emit_call_5(&a, (uint64_t)(uintptr_t)&cjson_djit_parse_any, child_slot, err_patches, &n_err);
+      size_t br_d4 = a.len;
       da64_emit(&a, da64_b(0));
 
-      /* slow_num: call cjson_djit_parse_num(jp, &p_tmp, end) */
-      a.buf[br_zero_lead] = da64_cbz(11, (int32_t)(a.len - br_zero_lead));
-      a.buf[br_not_d2] = da64_b_cond(8, (int32_t)(a.len - br_not_d2));
-      a.buf[br_2d_fail] = da64_b_cond(1, (int32_t)(a.len - br_2d_fail));
+      a.buf[br_zl] = da64_cbz(11, (int32_t)(a.len - br_zl));
+      a.buf[br_nd2] = da64_b_cond(8, (int32_t)(a.len - br_nd2));
+      a.buf[br_2f] = da64_b_cond(1, (int32_t)(a.len - br_2f));
       a.buf[br_neg] = da64_b_cond(0, (int32_t)(a.len - br_neg));
       da64_emit(&a, da64_str_uoff(20, 31, 88));
       da64_emit(&a, da64_mov(0, 19));
@@ -620,15 +773,26 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(const ObjectSchema *sc
       err_patches[n_err++] = a.len;
       da64_emit(&a, da64_cbz(0, 0));
 
-      a.buf[br_ndone1] = da64_b((int32_t)(a.len - br_ndone1));
-      a.buf[br_ndone2] = da64_b((int32_t)(a.len - br_ndone2));
-      a.buf[br_ndone3] = da64_b((int32_t)(a.len - br_ndone3));
-      a.buf[br_ndone4] = da64_b((int32_t)(a.len - br_ndone4));
+      a.buf[br_d1] = da64_b((int32_t)(a.len - br_d1));
+      a.buf[br_d2] = da64_b((int32_t)(a.len - br_d2));
+      a.buf[br_d3] = da64_b((int32_t)(a.len - br_d3));
+      a.buf[br_d4] = da64_b((int32_t)(a.len - br_d4));
     } else if (vk == 0) {
-      /* String: direct parse_string_fast + inline null */
+      /* String: inline "" -> immortal empty str, else parse_string_fast, else null / any */
+      da64_emit(&a, da64_ldurh(10, 20, 0));
+      da64_emit(&a, da64_movz(11, 0x2222u, 0)); /* "" */
+      da64_emit(&a, da64_cmp_w_reg(10, 11));
+      size_t br_ne = a.len;
+      da64_emit(&a, da64_b_cond(1, 0));
+      da64_emit(&a, da64_add_imm(20, 20, 2));
+      da64_load_u64(&a, 0, (uint64_t)(uintptr_t)g_djit_empty_str);
+      size_t br_d0 = a.len;
+      da64_emit(&a, da64_b(0));
+
+      a.buf[br_ne] = da64_b_cond(1, (int32_t)(a.len - br_ne));
       da64_emit(&a, da64_ldurb(10, 20, 0));
       da64_emit(&a, da64_cmp_w_imm(10, '"'));
-      size_t br_not_str = a.len;
+      size_t br_ns = a.len;
       da64_emit(&a, da64_b_cond(1, 0));
       da64_emit(&a, da64_add_imm(20, 20, 1));
       da64_emit(&a, da64_str_uoff(20, 31, 88));
@@ -640,68 +804,183 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(const ObjectSchema *sc
       da64_emit(&a, da64_ldr_uoff(20, 31, 88));
       err_patches[n_err++] = a.len;
       da64_emit(&a, da64_cbz(0, 0));
-      size_t br_sdone1 = a.len;
+      size_t br_d1 = a.len;
       da64_emit(&a, da64_b(0));
 
-      a.buf[br_not_str] = da64_b_cond(1, (int32_t)(a.len - br_not_str));
+      a.buf[br_ns] = da64_b_cond(1, (int32_t)(a.len - br_ns));
       da64_emit(&a, da64_ldur_w(10, 20, 0));
-      da64_load_u64(&a, 11, 0x6c6c756eULL); /* "null" */
+      da64_load_u64(&a, 11, 0x6c6c756eULL);
       da64_emit(&a, da64_cmp_w_reg(10, 11));
-      size_t br_sany = a.len;
+      size_t br_sa = a.len;
       da64_emit(&a, da64_b_cond(1, 0));
       da64_emit(&a, da64_add_imm(20, 20, 4));
       da64_load_u64(&a, 0, (uint64_t)(uintptr_t)Py_None);
-      size_t br_sdone2 = a.len;
+      size_t br_d2 = a.len;
       da64_emit(&a, da64_b(0));
 
-      a.buf[br_sany] = da64_b_cond(1, (int32_t)(a.len - br_sany));
-      da64_emit_call_any(&a, child_slot, err_patches, &n_err);
-      a.buf[br_sdone1] = da64_b((int32_t)(a.len - br_sdone1));
-      a.buf[br_sdone2] = da64_b((int32_t)(a.len - br_sdone2));
+      a.buf[br_sa] = da64_b_cond(1, (int32_t)(a.len - br_sa));
+      da64_emit_call_5(&a, (uint64_t)(uintptr_t)&cjson_djit_parse_any, child_slot, err_patches, &n_err);
+      a.buf[br_d0] = da64_b((int32_t)(a.len - br_d0));
+      a.buf[br_d1] = da64_b((int32_t)(a.len - br_d1));
+      a.buf[br_d2] = da64_b((int32_t)(a.len - br_d2));
+    } else if (vk == 2) {
+      /* Nested dict: inline {}, direct parse_obj on '{', inline null, else any */
+      da64_emit(&a, da64_ldurh(10, 20, 0));
+      da64_emit(&a, da64_movz(11, 0x7D7Bu, 0)); /* "{}" */
+      da64_emit(&a, da64_cmp_w_reg(10, 11));
+      size_t br_ne = a.len;
+      da64_emit(&a, da64_b_cond(1, 0));
+      da64_emit(&a, da64_add_imm(20, 20, 2));
+      da64_load_u64(&a, 12, (uint64_t)(uintptr_t)&cjson_djit_new_empty_dict);
+      da64_emit(&a, da64_blr(12));
+      err_patches[n_err++] = a.len;
+      da64_emit(&a, da64_cbz(0, 0));
+      size_t br_d0 = a.len;
+      da64_emit(&a, da64_b(0));
+
+      a.buf[br_ne] = da64_b_cond(1, (int32_t)(a.len - br_ne));
+      da64_emit(&a, da64_ldurb(10, 20, 0));
+      da64_emit(&a, da64_cmp_w_imm(10, '{'));
+      size_t br_no = a.len;
+      da64_emit(&a, da64_b_cond(1, 0));
+      da64_emit(&a, da64_add_imm(20, 20, 1));
+      da64_emit_call_5(&a, (uint64_t)(uintptr_t)&cjson_djit_parse_obj, child_slot, err_patches, &n_err);
+      size_t br_d1 = a.len;
+      da64_emit(&a, da64_b(0));
+
+      a.buf[br_no] = da64_b_cond(1, (int32_t)(a.len - br_no));
+      da64_emit(&a, da64_ldur_w(10, 20, 0));
+      da64_load_u64(&a, 11, 0x6c6c756eULL);
+      da64_emit(&a, da64_cmp_w_reg(10, 11));
+      size_t br_oa = a.len;
+      da64_emit(&a, da64_b_cond(1, 0));
+      da64_emit(&a, da64_add_imm(20, 20, 4));
+      da64_load_u64(&a, 0, (uint64_t)(uintptr_t)Py_None);
+      size_t br_d2 = a.len;
+      da64_emit(&a, da64_b(0));
+
+      a.buf[br_oa] = da64_b_cond(1, (int32_t)(a.len - br_oa));
+      da64_emit_call_5(&a, (uint64_t)(uintptr_t)&cjson_djit_parse_any, child_slot, err_patches, &n_err);
+      a.buf[br_d0] = da64_b((int32_t)(a.len - br_d0));
+      a.buf[br_d1] = da64_b((int32_t)(a.len - br_d1));
+      a.buf[br_d2] = da64_b((int32_t)(a.len - br_d2));
+    } else if (vk == 3) {
+      /* Nested list: inline [], direct parse_arr on '[', inline null, else any */
+      da64_emit(&a, da64_ldurh(10, 20, 0));
+      da64_emit(&a, da64_movz(11, 0x5D5Bu, 0)); /* "[]" */
+      da64_emit(&a, da64_cmp_w_reg(10, 11));
+      size_t br_ne = a.len;
+      da64_emit(&a, da64_b_cond(1, 0));
+      da64_emit(&a, da64_add_imm(20, 20, 2));
+      da64_load_u64(&a, 12, (uint64_t)(uintptr_t)&cjson_djit_new_empty_list);
+      da64_emit(&a, da64_blr(12));
+      err_patches[n_err++] = a.len;
+      da64_emit(&a, da64_cbz(0, 0));
+      size_t br_d0 = a.len;
+      da64_emit(&a, da64_b(0));
+
+      a.buf[br_ne] = da64_b_cond(1, (int32_t)(a.len - br_ne));
+      da64_emit(&a, da64_ldurb(10, 20, 0));
+      da64_emit(&a, da64_cmp_w_imm(10, '['));
+      size_t br_nl = a.len;
+      da64_emit(&a, da64_b_cond(1, 0));
+      da64_emit(&a, da64_add_imm(20, 20, 1));
+      da64_emit_call_5(&a, (uint64_t)(uintptr_t)&cjson_djit_parse_arr, child_slot, err_patches, &n_err);
+      size_t br_d1 = a.len;
+      da64_emit(&a, da64_b(0));
+
+      a.buf[br_nl] = da64_b_cond(1, (int32_t)(a.len - br_nl));
+      da64_emit(&a, da64_ldur_w(10, 20, 0));
+      da64_load_u64(&a, 11, 0x6c6c756eULL);
+      da64_emit(&a, da64_cmp_w_reg(10, 11));
+      size_t br_la = a.len;
+      da64_emit(&a, da64_b_cond(1, 0));
+      da64_emit(&a, da64_add_imm(20, 20, 4));
+      da64_load_u64(&a, 0, (uint64_t)(uintptr_t)Py_None);
+      size_t br_d2 = a.len;
+      da64_emit(&a, da64_b(0));
+
+      a.buf[br_la] = da64_b_cond(1, (int32_t)(a.len - br_la));
+      da64_emit_call_5(&a, (uint64_t)(uintptr_t)&cjson_djit_parse_any, child_slot, err_patches, &n_err);
+      a.buf[br_d0] = da64_b((int32_t)(a.len - br_d0));
+      a.buf[br_d1] = da64_b((int32_t)(a.len - br_d1));
+      a.buf[br_d2] = da64_b((int32_t)(a.len - br_d2));
     } else {
-      /* Dict / List / other */
-      da64_emit_call_any(&a, child_slot, err_patches, &n_err);
+      da64_emit_call_5(&a, (uint64_t)(uintptr_t)&cjson_djit_parse_any, child_slot, err_patches, &n_err);
     }
 
-    /* Store parsed val into split_vals[j] and update X25 = j + 1 */
     da64_emit(&a, da64_str_uoff(0, 24, j * 8u));
     da64_emit(&a, da64_movz(25, (uint16_t)(j + 1u), 0));
   }
 
+  if (is_pretty) {
+    da64_emit_skip_ws(&a);
+  }
   /* Match closing '}' */
   da64_emit(&a, da64_cmp_reg(20, 21));
   bail_patches[n_bail++] = a.len;
-  da64_emit(&a, da64_b_cond(10, 0)); /* B.GE bail */
+  da64_emit(&a, da64_b_cond(10, 0));
   da64_emit(&a, da64_ldurb(10, 20, 0));
   da64_emit(&a, da64_cmp_w_imm(10, '}'));
   bail_patches[n_bail++] = a.len;
-  da64_emit(&a, da64_b_cond(1, 0)); /* B.NE bail */
+  da64_emit(&a, da64_b_cond(1, 0));
   da64_emit(&a, da64_add_imm(20, 20, 1));
 
-  /* Materialize split-table PyDictObject and append to jp->items[] */
+  /* Materialize split-table PyDictObject */
   da64_emit(&a, da64_mov(0, 19));
   da64_emit(&a, da64_mov(1, 22));
   da64_emit(&a, da64_movz(2, (uint16_t)n, 0));
   da64_emit(&a, da64_mov(3, 24));
-  da64_load_u64(&a, 12, (uint64_t)(uintptr_t)&cjson_djit_finish_split_dict);
+  da64_load_u64(&a, 12, is_single ? (uint64_t)(uintptr_t)&cjson_djit_finish_single_dict
+                                  : (uint64_t)(uintptr_t)&cjson_djit_finish_split_dict);
   da64_emit(&a, da64_blr(12));
   size_t br_finish_err = a.len;
-  da64_emit(&a, da64_cbnz_w(0, 0)); /* CBNZ W0, ret_err */
+  da64_emit(&a, da64_cbnz_w(0, 0));
 
-  /* Check if next bytes are ",{" -> advance past ',' and loop! */
-  da64_emit(&a, da64_add_imm(10, 20, 2));
-  da64_emit(&a, da64_cmp_reg(10, 21));
-  size_t br_done_end = a.len;
-  da64_emit(&a, da64_b_cond(8, 0)); /* B.HI ret_ok */
-  da64_emit(&a, da64_ldurh(10, 20, 0));
-  da64_emit(&a, da64_movz(11, 0x7B2Cu, 0)); /* ",{" little-endian */
-  da64_emit(&a, da64_cmp_w_reg(10, 11));
-  size_t br_done_sep = a.len;
-  da64_emit(&a, da64_b_cond(1, 0)); /* B.NE ret_ok */
-  da64_emit(&a, da64_add_imm(20, 20, 1)); /* advance past ',', now at '{' */
-  da64_emit(&a, da64_b((int32_t)(loop_top - a.len)));
+  size_t br_done_end = 0, br_done_sep = 0, br_done_sep2 = 0;
+  if (!is_single) {
+    if (!is_pretty) {
+      da64_emit(&a, da64_add_imm(10, 20, 2));
+      da64_emit(&a, da64_cmp_reg(10, 21));
+      br_done_end = a.len;
+      da64_emit(&a, da64_b_cond(8, 0));
+      da64_emit(&a, da64_ldurh(10, 20, 0));
+      da64_emit(&a, da64_movz(11, 0x7B2Cu, 0)); /* ",{" */
+      da64_emit(&a, da64_cmp_w_reg(10, 11));
+      br_done_sep = a.len;
+      da64_emit(&a, da64_b_cond(1, 0));
+      da64_emit(&a, da64_add_imm(20, 20, 1));
+      da64_emit(&a, da64_b((int32_t)(loop_top - a.len)));
+    } else {
+      /* Pretty array loop: skip ws, check ',', skip ws, check '{' */
+      da64_emit_skip_ws(&a);
+      da64_emit(&a, da64_cmp_reg(20, 21));
+      br_done_end = a.len;
+      da64_emit(&a, da64_b_cond(10, 0));
+      da64_emit(&a, da64_ldurb(10, 20, 0));
+      da64_emit(&a, da64_cmp_w_imm(10, ','));
+      br_done_sep = a.len;
+      da64_emit(&a, da64_b_cond(1, 0));
+      da64_emit(&a, da64_mov(15, 20)); /* save comma pos in case next isn't '{' */
+      da64_emit(&a, da64_add_imm(20, 20, 1));
+      da64_emit_skip_ws(&a);
+      da64_emit(&a, da64_cmp_reg(20, 21));
+      size_t br_restore1 = a.len;
+      da64_emit(&a, da64_b_cond(10, 0));
+      da64_emit(&a, da64_ldurb(10, 20, 0));
+      da64_emit(&a, da64_cmp_w_imm(10, '{'));
+      size_t br_restore2 = a.len;
+      da64_emit(&a, da64_b_cond(1, 0));
+      da64_emit(&a, da64_b((int32_t)(loop_top - a.len)));
+      a.buf[br_restore1] = da64_b_cond(10, (int32_t)(a.len - br_restore1));
+      a.buf[br_restore2] = da64_b_cond(1, (int32_t)(a.len - br_restore2));
+      da64_emit(&a, da64_mov(20, 15)); /* restore to ',' so after_item handles it */
+      br_done_sep2 = a.len;
+      da64_emit(&a, da64_b(0));
+    }
+  }
 
-  /* ret_ok: return X20 (current p after last completed object) */
+  /* ret_ok */
   size_t ret_ok = a.len;
   da64_emit(&a, da64_mov(0, 20));
   size_t epilogue = a.len;
@@ -709,11 +988,10 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(const ObjectSchema *sc
   da64_emit(&a, 0xA9400000u | (6u << 15) | (24u << 10) | (31u << 5) | 23u);
   da64_emit(&a, 0xA9400000u | (4u << 15) | (22u << 10) | (31u << 5) | 21u);
   da64_emit(&a, 0xA9400000u | (2u << 15) | (20u << 10) | (31u << 5) | 19u);
-  /* LDP X29, X30, [SP], #352 -> imm7 = +44 = 0x2C */
   da64_emit(&a, 0xA8C00000u | (0x2Cu << 15) | (30u << 10) | (31u << 5) | 29u);
-  da64_emit(&a, 0xD65F03C0u); /* RET */
+  da64_emit(&a, 0xD65F03C0u);
 
-  /* bail_label: decref split_vals[0..X25-1] and return X23 (row_start_p) */
+  /* bail_label */
   size_t bail_label = a.len;
   size_t br_no_decref = a.len;
   da64_emit(&a, da64_cbz(25, 0));
@@ -725,7 +1003,7 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(const ObjectSchema *sc
   da64_emit(&a, da64_mov(0, 23));
   da64_emit(&a, da64_b((int32_t)(epilogue - a.len)));
 
-  /* err_label: decref split_vals[0..X25-1], set ctx->error = 1, return NULL */
+  /* err_label */
   size_t err_label = a.len;
   size_t br_no_edecref = a.len;
   da64_emit(&a, da64_cbz(25, 0));
@@ -735,7 +1013,6 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(const ObjectSchema *sc
   da64_emit(&a, da64_blr(12));
   a.buf[br_no_edecref] = da64_cbz(25, (int32_t)(a.len - br_no_edecref));
   da64_emit(&a, da64_movz(10, 1, 0));
-  /* STR W10, [X22, #offsetof(JitDeserCtx, error)] */
   da64_emit(&a, 0xB8000000u | (((uint32_t)offsetof(JitDeserCtx, error) & 0x1FFu) << 12) | (22u << 5) | 10u);
   size_t ret_err = a.len;
   da64_emit(&a, da64_movz(0, 0, 0));
@@ -743,8 +1020,11 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(const ObjectSchema *sc
 
   if (a.len >= a.cap) { pthread_mutex_unlock(&g_djit_mu); return NULL; }
 
-  a.buf[br_done_end] = da64_b_cond(8, (int32_t)(ret_ok - br_done_end));
-  a.buf[br_done_sep] = da64_b_cond(1, (int32_t)(ret_ok - br_done_sep));
+  if (!is_single) {
+    a.buf[br_done_end] = da64_b_cond(is_pretty ? 10 : 8, (int32_t)(ret_ok - br_done_end));
+    a.buf[br_done_sep] = da64_b_cond(1, (int32_t)(ret_ok - br_done_sep));
+    if (is_pretty) a.buf[br_done_sep2] = da64_b((int32_t)(ret_ok - br_done_sep2));
+  }
   a.buf[br_finish_err] = da64_cbnz_w(0, (int32_t)(ret_err - br_finish_err));
 
   for (size_t k = 0; k < n_bail; k++) {
@@ -796,9 +1076,11 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(const ObjectSchema *sc
   CJsonJitDeserLoopFn fn = (CJsonJitDeserLoopFn)(uintptr_t)dest;
   DjitSchemaEntry *slot = &g_djit_cache[target_idx];
   slot->sig_hash = h;
-  sc->shared_keys->dk_refcnt++; /* pin dk so its address can never be reused (zero ABA) */
+  sc->shared_keys->dk_refcnt++;
   slot->dk = sc->shared_keys;
   slot->n = n;
+  slot->is_pretty = (uint8_t)is_pretty;
+  slot->is_single = (uint8_t)is_single;
   memcpy(slot->vkinds, vkinds, n);
   __atomic_store_n(&slot->fn, fn, __ATOMIC_RELEASE);
   g_djit_compiled++;
