@@ -756,10 +756,11 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
     for (int j = (int)n - 1; j >= 0; j--) {
       uint8_t vt = vtypes[j];
       uint32_t vmax = (vt == JIT_VT_INT) ? 24u : ((vt == JIT_VT_FLOAT) ? 34u :
-                      ((vt == JIT_VT_BOOL) ? 5u : ((vt == JIT_VT_NONE) ? 4u : 4u)));
+                      ((vt == JIT_VT_BOOL) ? 5u : ((vt == JIT_VT_NONE) ? 4u :
+                      ((vt == JIT_VT_STR) ? 20u : 4u))));
       total_row_need += (uint32_t)klen[j] + vmax;
       if (vt == JIT_VT_STR || vt == JIT_VT_DICT || vt == JIT_VT_LIST || vt == JIT_VT_ANY) {
-        acc = (uint32_t)klen[j] + 4u;
+        acc = (uint32_t)klen[j] + ((vt == JIT_VT_STR) ? 20u : 4u);
       } else {
         acc += (uint32_t)klen[j] + vmax;
       }
@@ -1198,6 +1199,29 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       x64_patch32(&a, br_end1, a.len);
       x64_patch32(&a, br_end2, a.len);
     } else if (vt == JIT_VT_STR) {
+      int has_const_str = 0;
+      size_t br_cstr_done = 0;
+      if (sample_vals != NULL && sample_vals[j] != NULL &&
+          Py_TYPE(sample_vals[j]) == &PyUnicode_Type &&
+          PyUnicode_IS_COMPACT_ASCII(sample_vals[j]) &&
+          Py_REFCNT(sample_vals[j]) > 2) {
+        Py_ssize_t slen = PyUnicode_GET_LENGTH(sample_vals[j]);
+        if (slen >= 0 && slen <= 16) {
+          char qbuf[20];
+          qbuf[0] = '"';
+          if (copy_if_clean_short(qbuf + 1, (const char *)PyUnicode_1BYTE_DATA(sample_vals[j]), slen)) {
+            qbuf[1 + slen] = '"';
+            Py_INCREF(sample_vals[j]);
+            x64_mov_rax_u64(&a, (uint64_t)(uintptr_t)sample_vals[j]);
+            x64_b(&a, 0x49); x64_b(&a, 0x39); x64_b(&a, 0xC1); /* cmp r9, rax */
+            size_t br_cstr_miss = x64_jcc32(&a, 0x85);
+            x64_emit_literal(&a, qbuf, (size_t)(slen + 2));
+            br_cstr_done = x64_jmp32(&a);
+            x64_patch32(&a, br_cstr_miss, a.len);
+            has_const_str = 1;
+          }
+        }
+      }
       x64_mov_rax_u64(&a, (uint64_t)(uintptr_t)&PyUnicode_Type);
       x64_b(&a, 0x49); x64_b(&a, 0x39); x64_b(&a, 0x41); x64_b(&a, (uint8_t)offsetof(PyObject, ob_type));
       size_t br_not_str = x64_jcc32(&a, 0x85);
@@ -1219,6 +1243,9 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       x64_emit_call_4(&a, (uint64_t)(uintptr_t)&cjson_jit_encode_any, err_patches, &n_err);
       x64_patch32(&a, br_end1, a.len);
       x64_patch32(&a, br_end2, a.len);
+      if (has_const_str) {
+        x64_patch32(&a, br_cstr_done, a.len);
+      }
     } else if (vt == JIT_VT_DICT) {
       x64_mov_rax_u64(&a, (uint64_t)(uintptr_t)&PyDict_Type);
       x64_b(&a, 0x49); x64_b(&a, 0x39); x64_b(&a, 0x41); x64_b(&a, (uint8_t)offsetof(PyObject, ob_type));

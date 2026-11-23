@@ -609,12 +609,14 @@ static PyObject *cjson_build_combined_dict_from_kvs(const KvEntry *kvs, size_t c
  * `val_kind`: 0 = str/other, 1 = number, 2 = dict, 3 = list, 4 = bool/null. */
 typedef struct {
   PyObject *key;
+  PyObject *sample_str;
   Py_hash_t py_hash;
   uint64_t w0;
   uint8_t klen;
   uint8_t mask_shift;
   uint8_t val_kind;
-  uint8_t _pad[5];
+  uint8_t sample_hits;
+  uint8_t _pad[4];
 } SchemaKey;
 
 typedef struct {
@@ -716,6 +718,24 @@ static void schema_record_from_dict(ObjectSchema *sc, PyObject *dict) {
     uint8_t vk = schema_val_kind(v);
     if (sk->key == k && sk->klen != 0) {
       sk->val_kind = vk;
+      /* Track repeated short clean ASCII string values (1..14B) for JIT enum-value folding */
+      if (vk == 0 && PyUnicode_CheckExact(v) && PyUnicode_IS_COMPACT_ASCII(v)) {
+        Py_ssize_t vlen = PyUnicode_GET_LENGTH(v);
+        if (vlen >= 1 && vlen <= 14 &&
+            is_clean_schema_ascii((const char *)PyUnicode_1BYTE_DATA(v), (uint32_t)vlen)) {
+          if (sk->sample_str != NULL &&
+              PyUnicode_GET_LENGTH(sk->sample_str) == vlen &&
+              memcmp(PyUnicode_1BYTE_DATA(sk->sample_str), PyUnicode_1BYTE_DATA(v), (size_t)vlen) == 0) {
+            if (sk->sample_hits < 255) sk->sample_hits++;
+          } else if (sk->sample_hits < 2) {
+            Py_INCREF(v);
+            PyObject *olds = sk->sample_str;
+            sk->sample_str = v;
+            sk->sample_hits = 1;
+            Py_XDECREF(olds);
+          }
+        }
+      }
       i++;
       continue;
     }
@@ -743,6 +763,19 @@ static void schema_record_from_dict(ObjectSchema *sc, PyObject *dict) {
             sk->klen = (uint8_t)len;
             sk->mask_shift = shift;
             sk->val_kind = vk;
+            PyObject *olds = sk->sample_str;
+            sk->sample_str = NULL;
+            sk->sample_hits = 0;
+            if (vk == 0 && PyUnicode_CheckExact(v) && PyUnicode_IS_COMPACT_ASCII(v)) {
+              Py_ssize_t vlen = PyUnicode_GET_LENGTH(v);
+              if (vlen >= 1 && vlen <= 14 &&
+                  is_clean_schema_ascii((const char *)PyUnicode_1BYTE_DATA(v), (uint32_t)vlen)) {
+                Py_INCREF(v);
+                sk->sample_str = v;
+                sk->sample_hits = 1;
+              }
+            }
+            Py_XDECREF(olds);
             Py_XDECREF(old);
             i++;
             continue;

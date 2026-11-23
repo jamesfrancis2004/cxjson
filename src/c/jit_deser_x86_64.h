@@ -674,6 +674,57 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(
       dx64_patch32(&a, br_d3, a.len);
       dx64_patch32(&a, br_d4, a.len);
     } else if (vk == 0) {
+      /* Speculative repeated enum-string fast path (1..14B) */
+      int has_enum = 0;
+      size_t br_enum_done = 0;
+      if (sk->sample_hits >= 2 && sk->sample_str != NULL &&
+          PyUnicode_IS_COMPACT_ASCII(sk->sample_str)) {
+        Py_ssize_t slen = PyUnicode_GET_LENGTH(sk->sample_str);
+        if (slen >= 1 && slen <= 14) {
+          char qlit[18];
+          qlit[0] = '"';
+          memcpy(qlit + 1, PyUnicode_1BYTE_DATA(sk->sample_str), (size_t)slen);
+          qlit[1 + slen] = '"';
+          uint32_t qlen = (uint32_t)(slen + 2);
+          size_t enum_miss[4];
+          size_t n_emiss = 0;
+          uint32_t eoff = 0;
+          while (eoff + 8 <= qlen) {
+            uint64_t w; memcpy(&w, qlit + eoff, 8);
+            dx64_mov_rax_u64(&a, w);
+            dx64_b(&a, 0x49); dx64_b(&a, 0x39); dx64_b(&a, 0x44); dx64_b(&a, 0x24); dx64_b(&a, (uint8_t)eoff);
+            enum_miss[n_emiss++] = dx64_jcc32(&a, 0x85);
+            eoff += 8;
+          }
+          if (eoff + 4 <= qlen) {
+            uint32_t w; memcpy(&w, qlit + eoff, 4);
+            dx64_b(&a, 0x41); dx64_b(&a, 0x81); dx64_b(&a, 0x7C); dx64_b(&a, 0x24); dx64_b(&a, (uint8_t)eoff); dx64_u32(&a, w);
+            enum_miss[n_emiss++] = dx64_jcc32(&a, 0x85);
+            eoff += 4;
+          }
+          if (eoff + 2 <= qlen) {
+            uint16_t w; memcpy(&w, qlit + eoff, 2);
+            dx64_b(&a, 0x66); dx64_b(&a, 0x41); dx64_b(&a, 0x81); dx64_b(&a, 0x7C); dx64_b(&a, 0x24); dx64_b(&a, (uint8_t)eoff); dx64_u16(&a, w);
+            enum_miss[n_emiss++] = dx64_jcc32(&a, 0x85);
+            eoff += 2;
+          }
+          if (eoff < qlen) {
+            dx64_b(&a, 0x41); dx64_b(&a, 0x80); dx64_b(&a, 0x7C); dx64_b(&a, 0x24); dx64_b(&a, (uint8_t)eoff); dx64_b(&a, (uint8_t)qlit[eoff]);
+            enum_miss[n_emiss++] = dx64_jcc32(&a, 0x85);
+          }
+          Py_INCREF(sk->sample_str);
+          dx64_b(&a, 0x49); dx64_b(&a, 0x83); dx64_b(&a, 0xC4); dx64_b(&a, (uint8_t)qlen);
+          dx64_mov_rax_u64(&a, (uint64_t)(uintptr_t)sk->sample_str);
+          dx64_b(&a, 0x83); dx64_b(&a, 0x38); dx64_b(&a, 0xFF); /* cmp dword [rax], -1 */
+          dx64_b(&a, 0x74); dx64_b(&a, 3); /* je +3 (skip inc if immortal) */
+          dx64_b(&a, 0x48); dx64_b(&a, 0xFF); dx64_b(&a, 0x00); /* inc qword [rax] */
+          br_enum_done = dx64_jmp32(&a);
+          for (size_t em = 0; em < n_emiss; em++) {
+            dx64_patch32(&a, enum_miss[em], a.len);
+          }
+          has_enum = 1;
+        }
+      }
       dx64_b(&a, 0x66); dx64_b(&a, 0x41); dx64_b(&a, 0x81); dx64_b(&a, 0x3C); dx64_b(&a, 0x24); dx64_u16(&a, 0x2222u);
       size_t br_ne = dx64_jcc32(&a, 0x85);
       dx64_b(&a, 0x49); dx64_b(&a, 0x83); dx64_b(&a, 0xC4); dx64_b(&a, 2);
@@ -699,6 +750,9 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(
       dx64_patch32(&a, br_d0, a.len);
       dx64_patch32(&a, br_d1, a.len);
       dx64_patch32(&a, br_d2, a.len);
+      if (has_enum) {
+        dx64_patch32(&a, br_enum_done, a.len);
+      }
     } else if (vk == 2) {
       dx64_b(&a, 0x66); dx64_b(&a, 0x41); dx64_b(&a, 0x81); dx64_b(&a, 0x3C); dx64_b(&a, 0x24); dx64_u16(&a, 0x7D7Bu);
       size_t br_ne = dx64_jcc32(&a, 0x85);

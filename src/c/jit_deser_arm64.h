@@ -778,7 +778,71 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(
       a.buf[br_d3] = da64_b((int32_t)(a.len - br_d3));
       a.buf[br_d4] = da64_b((int32_t)(a.len - br_d4));
     } else if (vk == 0) {
-      /* String: inline "" -> immortal empty str, else parse_string_fast, else null / any */
+      /* String: speculative repeated enum-string fast path (1..14B), inline "", else parse_string_fast / null / any */
+      int has_enum = 0;
+      size_t br_enum_done = 0;
+      if (sk->sample_hits >= 2 && sk->sample_str != NULL &&
+          PyUnicode_IS_COMPACT_ASCII(sk->sample_str)) {
+        Py_ssize_t slen = PyUnicode_GET_LENGTH(sk->sample_str);
+        if (slen >= 1 && slen <= 14) {
+          char qlit[18];
+          qlit[0] = '"';
+          memcpy(qlit + 1, PyUnicode_1BYTE_DATA(sk->sample_str), (size_t)slen);
+          qlit[1 + slen] = '"';
+          uint32_t qlen = (uint32_t)(slen + 2);
+          size_t enum_miss[4];
+          size_t n_emiss = 0;
+          uint32_t eoff = 0;
+          while (eoff + 8 <= qlen) {
+            uint64_t w; memcpy(&w, qlit + eoff, 8);
+            da64_emit(&a, da64_ldur_x(10, 20, (int32_t)eoff));
+            da64_load_u64(&a, 11, w);
+            da64_emit(&a, da64_cmp_reg(10, 11));
+            enum_miss[n_emiss++] = a.len;
+            da64_emit(&a, da64_b_cond(1, 0));
+            eoff += 8;
+          }
+          if (eoff + 4 <= qlen) {
+            uint32_t w; memcpy(&w, qlit + eoff, 4);
+            da64_emit(&a, da64_ldur_w(10, 20, (int32_t)eoff));
+            da64_load_u64(&a, 11, (uint64_t)w);
+            da64_emit(&a, da64_cmp_w_reg(10, 11));
+            enum_miss[n_emiss++] = a.len;
+            da64_emit(&a, da64_b_cond(1, 0));
+            eoff += 4;
+          }
+          if (eoff + 2 <= qlen) {
+            uint16_t w; memcpy(&w, qlit + eoff, 2);
+            da64_emit(&a, da64_ldurh(10, 20, (int32_t)eoff));
+            da64_emit(&a, da64_movz(11, w, 0));
+            da64_emit(&a, da64_cmp_w_reg(10, 11));
+            enum_miss[n_emiss++] = a.len;
+            da64_emit(&a, da64_b_cond(1, 0));
+            eoff += 2;
+          }
+          if (eoff < qlen) {
+            da64_emit(&a, da64_ldurb(10, 20, (int32_t)eoff));
+            da64_emit(&a, da64_cmp_w_imm(10, (uint8_t)qlit[eoff]));
+            enum_miss[n_emiss++] = a.len;
+            da64_emit(&a, da64_b_cond(1, 0));
+          }
+          /* Hit! Advance p += qlen, return pinned sample_str with mortal/immortal Py_INCREF */
+          Py_INCREF(sk->sample_str);
+          da64_emit(&a, da64_add_imm(20, 20, (uint16_t)qlen));
+          da64_load_u64(&a, 0, (uint64_t)(uintptr_t)sk->sample_str);
+          da64_emit(&a, da64_ldr_uoff(10, 0, 0)); /* LDR X10, [X0] (ob_refcnt) */
+          da64_emit(&a, 0x3100055Fu); /* ADDS WZR, W10, #1 (Z=1 iff immortal 0xFFFFFFFF) */
+          da64_emit(&a, da64_b_cond(0, 3)); /* B.EQ +3 (skip inc if immortal) */
+          da64_emit(&a, da64_add_imm(10, 10, 1));
+          da64_emit(&a, da64_str_uoff(10, 0, 0));
+          br_enum_done = a.len;
+          da64_emit(&a, da64_b(0));
+          for (size_t em = 0; em < n_emiss; em++) {
+            a.buf[enum_miss[em]] = da64_b_cond(1, (int32_t)(a.len - enum_miss[em]));
+          }
+          has_enum = 1;
+        }
+      }
       da64_emit(&a, da64_ldurh(10, 20, 0));
       da64_emit(&a, da64_movz(11, 0x2222u, 0)); /* "" */
       da64_emit(&a, da64_cmp_w_reg(10, 11));
@@ -823,6 +887,9 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(
       a.buf[br_d0] = da64_b((int32_t)(a.len - br_d0));
       a.buf[br_d1] = da64_b((int32_t)(a.len - br_d1));
       a.buf[br_d2] = da64_b((int32_t)(a.len - br_d2));
+      if (has_enum) {
+        a.buf[br_enum_done] = da64_b((int32_t)(a.len - br_enum_done));
+      }
     } else if (vk == 2) {
       /* Nested dict: inline {}, direct parse_obj on '{', inline null, else any */
       da64_emit(&a, da64_ldurh(10, 20, 0));
