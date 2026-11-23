@@ -168,9 +168,77 @@ def test_non_interned_combined_keys():
     print("PASS: test_non_interned_combined_keys (distinct ptrs len 1..17 + 1-byte diff guard)")
 
 
+def test_dict_of_dicts_and_inline_nested():
+    # 1. Dict-of-dicts (combined + split + tombstones + heterogeneous entries)
+    dod_comb = {
+        f"k{i:03d}": {
+            "id": i,
+            "name": f"pkg_{i}_" + ("x" * (i % 40)),
+            "score": round(i * 1.25, 2),
+            "ok": (i & 1) == 0,
+            "meta": {"sha": f"{i:064x}", "size": i * 1024, "yanked": False, "note": None, "ratio": 0.5},
+        }
+        for i in range(60)
+    }
+    # Delete several keys to introduce dict tombstones
+    for k in ("k005", "k019", "k033", "k047"):
+        del dod_comb[k]
+    # Mutate a few entries to test fallback paths (empty dict, None, different sub-dict shape, non-dict)
+    dod_comb["k010"]["meta"] = {}
+    dod_comb["k020"]["meta"] = None
+    dod_comb["k030"]["meta"] = {"other": "shape", "extra": 123}
+    dod_comb["k040"] = {"different": 1}
+    dod_comb["k050"] = [1, 2, 3]
+
+    expected = json.dumps(dod_comb, separators=(",", ":")).encode("utf-8")
+    out_comb = cxjson.dumps(dod_comb)
+    assert out_comb == expected, "combined dict-of-dicts + inline nested mismatch"
+
+    # Round-trip through cxjson.loads() to exercise split-table dicts + split sub-dicts
+    dod_split = cxjson.loads(out_comb)
+    out_split = cxjson.dumps(dod_split)
+    assert out_split == expected, "split dict-of-dicts + inline nested mismatch"
+
+    # 2. List-of-dicts with inline nested homogeneous dicts (split & combined)
+    rows = [
+        {
+            "id": i,
+            "sub": {"a": f"s_{i}", "b": i - 50, "c": i * 0.5, "d": (i & 1) == 0, "e": None},
+            "tag": f"t{i}",
+        }
+        for i in range(80)
+    ]
+    rows[15]["sub"] = {}
+    rows[25]["sub"] = None
+    rows[35]["sub"] = {"a": 'esc"quote\\slash\n', "b": 2**62, "c": float("nan"), "d": True, "e": "not_none"}
+    rows[45]["sub"] = {"x": 1, "y": 2}
+    # Check exact parity with CXJSON_JIT=0 (including NaN -> null)
+    b_jit = cxjson.dumps(rows)
+    b_split_jit = cxjson.dumps(cxjson.loads(b_jit))
+    assert b_jit == b_split_jit
+    raw_in = json.dumps(rows, separators=(",", ":"), allow_nan=True)
+    code = (
+        "import json, sys, cxjson; "
+        "rows = json.loads(sys.stdin.read()); "
+        "sys.stdout.buffer.write(cxjson.dumps(rows))"
+    )
+    env = dict(os.environ, CXJSON_JIT="0")
+    out_nojit = subprocess.check_output([sys.executable, "-c", code], input=raw_in.encode("utf-8"), env=env)
+    assert b_jit == out_nojit, "inline nested dict mismatch vs CXJSON_JIT=0"
+    # Verify >64-bit int inside inline nested dict properly propagates TypeError
+    rows[35]["sub"]["b"] = 10**20
+    try:
+        cxjson.dumps(rows)
+        assert False, "Expected TypeError for >64-bit int in inline nested dict"
+    except TypeError:
+        pass
+    print("PASS: test_dict_of_dicts_and_inline_nested (tombstones, split/combined, fallbacks, JIT=0 parity)")
+
+
 if __name__ == "__main__":
     test_buffer_boundaries_and_edge_values()
     test_differential_fuzz_vs_no_jit()
     test_concurrent_compile_and_execute()
     test_non_interned_combined_keys()
+    test_dict_of_dicts_and_inline_nested()
     print("\nALL JIT SECURITY & CONCURRENCY TESTS PASSED!")

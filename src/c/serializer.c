@@ -1816,6 +1816,203 @@ static char *encode_array_fast(JsonBuffer *b, char *dst, char **safe_end_p,
 #include "jit_ser_arm64.h"
 #include "jit_ser_x86_64.h"
 
+#ifdef CJSON_SCHEMA_JIT
+/* Out-of-line JIT schema probes so large stack buffers never bloat hot
+ * recursive encoders (encode_dict_fast / encode_dict_array_cached). */
+__attribute__((noinline)) static CJsonJitSplitLoopFn
+cjson_jit_try_compile_combined_arr(CJsonSerDictUnicodeEntry *ep,
+                                   Py_ssize_t nentries) {
+  uint32_t cn = (uint32_t)nentries;
+  uint32_t ckused = 0;
+  uint16_t ckoff[30], cklen[30];
+  uint8_t cvtypes[30];
+  PyObject *ckeys[30];
+  PyObject *cvals[30];
+  char ckbuf[1024];
+  for (uint32_t cj = 0; cj < cn; cj++) {
+    PyObject *ck = ep[cj].me_key;
+    PyObject *cv = ep[cj].me_value;
+    if (cv == NULL || !PyUnicode_IS_COMPACT_ASCII(ck)) return NULL;
+    Py_ssize_t ckl = PyUnicode_GET_LENGTH(ck);
+    if (ckl > 52 || ckused + (uint32_t)ckl + 4u > sizeof(ckbuf)) return NULL;
+    char *kdst = ckbuf + ckused;
+    kdst[0] = (cj == 0) ? '{' : ',';
+    kdst[1] = '"';
+    if (!copy_if_clean_short(kdst + 2, (const char *)PyUnicode_1BYTE_DATA(ck), ckl))
+      return NULL;
+    kdst[2 + ckl] = '"';
+    kdst[3 + ckl] = ':';
+    ckoff[cj] = (uint16_t)ckused;
+    cklen[cj] = (uint16_t)(ckl + 4);
+    ckeys[cj] = ck;
+    cvals[cj] = cv;
+    PyTypeObject *cvtp = Py_TYPE(cv);
+    if (cvtp == &PyLong_Type) cvtypes[cj] = JIT_VT_INT;
+    else if (cvtp == &PyFloat_Type) cvtypes[cj] = JIT_VT_FLOAT;
+    else if (cvtp == &PyUnicode_Type) cvtypes[cj] = JIT_VT_STR;
+    else if (cvtp == &PyBool_Type) cvtypes[cj] = JIT_VT_BOOL;
+    else if (cv == Py_None) cvtypes[cj] = JIT_VT_NONE;
+    else if (cvtp == &PyDict_Type) cvtypes[cj] = JIT_VT_DICT;
+    else if (cvtp == &PyList_Type) cvtypes[cj] = JIT_VT_LIST;
+    else cvtypes[cj] = JIT_VT_ANY;
+    ckused += (uint32_t)(ckl + 4);
+  }
+  return cjson_jit_get_or_compile_combined(cn, ckbuf, ckused, ckoff, cklen,
+                                           cvtypes, ckeys, cvals);
+}
+
+__attribute__((noinline)) static CJsonJitSplitLoopFn
+cjson_jit_try_compile_dod(CJsonSerDictUnicodeEntry *ep, Py_ssize_t nentries,
+                          PyDictKeysObject **out_split_dk, Py_ssize_t *out_sn,
+                          int *out_is_split) {
+  Py_ssize_t mid = nentries >> 1;
+  Py_ssize_t q3 = mid + (nentries >> 2);
+  PyObject *mv = ep[mid].me_value;
+  PyObject *mv2 = (mid + 1 < nentries) ? ep[mid + 1].me_value : NULL;
+  PyObject *mv3 = (q3 < nentries) ? ep[q3].me_value : mv2;
+  if (mv == NULL || mv2 == NULL || mv3 == NULL ||
+      Py_TYPE(mv) != &PyDict_Type || Py_TYPE(mv2) != &PyDict_Type ||
+      Py_TYPE(mv3) != &PyDict_Type) {
+    return NULL;
+  }
+  PyDictObject *dmp = (PyDictObject *)mv;
+  PyDictObject *dmp2 = (PyDictObject *)mv2;
+  PyDictObject *dmp3 = (PyDictObject *)mv3;
+  Py_ssize_t sn = dmp->ma_used;
+  if (sn <= 0 || sn > 30 || dmp2->ma_used != sn || dmp3->ma_used != sn) {
+    return NULL;
+  }
+  char dkbuf[1024];
+  uint16_t dkoff[30], dklen[30];
+  uint8_t dvtypes[30], dorder[30];
+#if PY_VERSION_HEX < 0x030D0000
+  uint8_t dprefix[32];
+#endif
+  PyObject *dkeys[30];
+  PyObject *dvals[30];
+  uint32_t dkused = 0;
+
+  if (dmp->ma_values != NULL && dmp2->ma_values != NULL &&
+      dmp3->ma_values != NULL && dmp->ma_keys == dmp2->ma_keys &&
+      dmp->ma_keys == dmp3->ma_keys) {
+#if PY_VERSION_HEX >= 0x030D0000
+    typedef struct {
+      uint8_t capacity;
+      uint8_t size;
+      uint8_t embedded;
+      uint8_t valid;
+      PyObject *values[1];
+    } DodDv313;
+    const DodDv313 *dv = (const DodDv313 *)dmp->ma_values;
+    const uint8_t *dv_order = (const uint8_t *)&dv->values[dv->capacity];
+    if (dv->valid != 1 || dv->size != (uint8_t)sn || dv->size > dv->capacity)
+      return NULL;
+    PyObject *const *svals = dv->values;
+#else
+    const uint8_t *vraw = (const uint8_t *)dmp->ma_values;
+    uint8_t psize = vraw[-1];
+    if (psize > 32 || (uint32_t)psize < 2u + (uint32_t)sn || vraw[-2] != (uint8_t)sn)
+      return NULL;
+    PyObject *const *svals = (PyObject *const *)dmp->ma_values;
+#endif
+    PyObject *tk, *tv;
+    Py_ssize_t tpos = 0;
+    uint32_t tj = 0;
+    while (PyDict_Next(mv, &tpos, &tk, &tv) && tj < (uint32_t)sn) {
+#if PY_VERSION_HEX >= 0x030D0000
+      uint8_t ix = dv_order[tj];
+      if (ix >= dv->capacity || tv != svals[ix]) return NULL;
+#else
+      uint8_t ix = vraw[-3 - (int)tj];
+      if (tv != svals[ix]) return NULL;
+#endif
+      dorder[tj] = ix;
+      if (!PyUnicode_IS_COMPACT_ASCII(tk)) return NULL;
+      Py_ssize_t tkl = PyUnicode_GET_LENGTH(tk);
+      if (tkl > 52 || dkused + (uint32_t)tkl + 4u > sizeof(dkbuf)) return NULL;
+      char *kdst = dkbuf + dkused;
+      kdst[0] = (tj == 0) ? '{' : ',';
+      kdst[1] = '"';
+      if (!copy_if_clean_short(kdst + 2, (const char *)PyUnicode_1BYTE_DATA(tk), tkl))
+        return NULL;
+      kdst[2 + tkl] = '"';
+      kdst[3 + tkl] = ':';
+      dkoff[tj] = (uint16_t)dkused;
+      dklen[tj] = (uint16_t)(tkl + 4);
+      PyTypeObject *tvtp = Py_TYPE(tv);
+      dvals[tj] = tv;
+      if (tvtp == &PyLong_Type) dvtypes[tj] = JIT_VT_INT;
+      else if (tvtp == &PyFloat_Type) dvtypes[tj] = JIT_VT_FLOAT;
+      else if (tvtp == &PyUnicode_Type) dvtypes[tj] = JIT_VT_STR;
+      else if (tvtp == &PyBool_Type) dvtypes[tj] = JIT_VT_BOOL;
+      else if (tv == Py_None) dvtypes[tj] = JIT_VT_NONE;
+      else if (tvtp == &PyDict_Type) dvtypes[tj] = JIT_VT_DICT;
+      else if (tvtp == &PyList_Type) dvtypes[tj] = JIT_VT_LIST;
+      else dvtypes[tj] = JIT_VT_ANY;
+      dkused += (uint32_t)(tkl + 4);
+      tj++;
+    }
+    if (tj != (uint32_t)sn) return NULL;
+#if PY_VERSION_HEX >= 0x030D0000
+    CJsonJitSplitLoopFn fn = cjson_jit_get_or_compile_dict_of_dicts(
+        0, (uint32_t)sn, dkbuf, dkused, dkoff, dklen, dvtypes, dorder, 0, NULL, NULL, dvals);
+#else
+    memcpy(dprefix, vraw - 2 - sn, (size_t)sn);
+    CJsonJitSplitLoopFn fn = cjson_jit_get_or_compile_dict_of_dicts(
+        0, (uint32_t)sn, dkbuf, dkused, dkoff, dklen, dvtypes, dorder, (uint8_t)sn, dprefix, NULL, dvals);
+#endif
+    if (fn != NULL) {
+      *out_split_dk = dmp->ma_keys;
+      *out_sn = sn;
+      *out_is_split = 1;
+    }
+    return fn;
+  } else if (dmp->ma_values == NULL && dmp2->ma_values == NULL &&
+             dmp3->ma_values == NULL &&
+             ((CJsonSerDictKeysObject *)dmp->ma_keys)->dk_kind == 1 &&
+             ((CJsonSerDictKeysObject *)dmp->ma_keys)->dk_nentries == sn) {
+    CJsonSerDictKeysObject *sdk = (CJsonSerDictKeysObject *)dmp->ma_keys;
+    CJsonSerDictUnicodeEntry *sep = (CJsonSerDictUnicodeEntry *)(sdk->dk_indices + ((size_t)1 << sdk->dk_log2_index_bytes));
+    for (uint32_t cj = 0; cj < (uint32_t)sn; cj++) {
+      PyObject *ck = sep[cj].me_key;
+      PyObject *cv = sep[cj].me_value;
+      if (cv == NULL || !PyUnicode_IS_COMPACT_ASCII(ck)) return NULL;
+      Py_ssize_t ckl = PyUnicode_GET_LENGTH(ck);
+      if (ckl > 52 || dkused + (uint32_t)ckl + 4u > sizeof(dkbuf)) return NULL;
+      char *kdst = dkbuf + dkused;
+      kdst[0] = (cj == 0) ? '{' : ',';
+      kdst[1] = '"';
+      if (!copy_if_clean_short(kdst + 2, (const char *)PyUnicode_1BYTE_DATA(ck), ckl))
+        return NULL;
+      kdst[2 + ckl] = '"';
+      kdst[3 + ckl] = ':';
+      dkoff[cj] = (uint16_t)dkused;
+      dklen[cj] = (uint16_t)(ckl + 4);
+      dkeys[cj] = ck;
+      dvals[cj] = cv;
+      PyTypeObject *cvtp = Py_TYPE(cv);
+      if (cvtp == &PyLong_Type) dvtypes[cj] = JIT_VT_INT;
+      else if (cvtp == &PyFloat_Type) dvtypes[cj] = JIT_VT_FLOAT;
+      else if (cvtp == &PyUnicode_Type) dvtypes[cj] = JIT_VT_STR;
+      else if (cvtp == &PyBool_Type) dvtypes[cj] = JIT_VT_BOOL;
+      else if (cv == Py_None) dvtypes[cj] = JIT_VT_NONE;
+      else if (cvtp == &PyDict_Type) dvtypes[cj] = JIT_VT_DICT;
+      else if (cvtp == &PyList_Type) dvtypes[cj] = JIT_VT_LIST;
+      else dvtypes[cj] = JIT_VT_ANY;
+      dkused += (uint32_t)(ckl + 4);
+    }
+    CJsonJitSplitLoopFn fn = cjson_jit_get_or_compile_dict_of_dicts(
+        1, (uint32_t)sn, dkbuf, dkused, dkoff, dklen, dvtypes, NULL, 0, NULL, dkeys, dvals);
+    if (fn != NULL) {
+      *out_sn = sn;
+      *out_is_split = 0;
+    }
+    return fn;
+  }
+  return NULL;
+}
+#endif
+
 /* Out-of-line homogeneous dict-array encoder with per-call pre-encoded key
  * cache. Kept noinline so its 3KB stack cache never bloats encode_array_fast's
  * frame (critical for deeply nested float arrays like canada.json). */
@@ -2099,7 +2296,8 @@ encode_dict_array_cached(JsonBuffer *b, char *dst, char **safe_end_p,
           int ok = 1;
 #ifdef CJSON_SCHEMA_JIT
           uint8_t jit_vtypes[30];
-          int jit_ok = (len >= 24 && sn <= 30 && b->default_fn == NULL &&
+          PyObject *jit_svals[30];
+          int jit_ok = (len >= 8 && sn <= 30 && b->default_fn == NULL &&
                         i + 1 < len &&
                         Py_TYPE(items[i + 1]) == &PyDict_Type &&
                         ((PyDictObject *)items[i + 1])->ma_keys == mp->ma_keys &&
@@ -2148,6 +2346,7 @@ encode_dict_array_cached(JsonBuffer *b, char *dst, char **safe_end_p,
                 jit_ok = 0;
               } else {
                 PyTypeObject *tvtp = Py_TYPE(tv);
+                jit_svals[tj] = tv;
                 if (tvtp == &PyLong_Type) jit_vtypes[tj] = JIT_VT_INT;
                 else if (tvtp == &PyFloat_Type) jit_vtypes[tj] = JIT_VT_FLOAT;
                 else if (tvtp == &PyUnicode_Type) jit_vtypes[tj] = JIT_VT_STR;
@@ -2173,11 +2372,11 @@ encode_dict_array_cached(JsonBuffer *b, char *dst, char **safe_end_p,
 #if PY_VERSION_HEX >= 0x030D0000
               jit_fn = cjson_jit_get_or_compile(sn, split_kbuf, kused,
                                                 split_koff, split_klen,
-                                                jit_vtypes, split_order, 0, NULL);
+                                                jit_vtypes, split_order, 0, NULL, jit_svals);
 #else
               jit_fn = cjson_jit_get_or_compile(
                   sn, split_kbuf, kused, split_koff, split_klen, jit_vtypes,
-                  split_order, (uint8_t)sn, split_prefix);
+                  split_order, (uint8_t)sn, split_prefix, jit_svals);
 #endif
             }
 #endif
@@ -2199,47 +2398,12 @@ encode_dict_array_cached(JsonBuffer *b, char *dst, char **safe_end_p,
         if (CJSON_UNLIKELY(i == 0 && jit_fn == NULL && len >= 32 && b->default_fn == NULL &&
                            mp->ma_used == nentries && nentries > 0 && nentries <= 30 &&
                            Py_TYPE(items[1]) == &PyDict_Type &&
+                           ((PyDictObject *)items[1])->ma_values == NULL &&
                            ((PyDictObject *)items[1])->ma_used == nentries &&
                            Py_TYPE(items[len >> 1]) == &PyDict_Type &&
+                           ((PyDictObject *)items[len >> 1])->ma_values == NULL &&
                            ((PyDictObject *)items[len >> 1])->ma_used == nentries)) {
-          uint32_t cn = (uint32_t)nentries;
-          uint32_t ckused = 0;
-          int cok = 1;
-          uint16_t ckoff[30], cklen[30];
-          uint8_t cvtypes[30];
-          PyObject *ckeys[30];
-          char ckbuf[1024];
-          for (uint32_t cj = 0; cj < cn; cj++) {
-            PyObject *ck = ep[cj].me_key;
-            PyObject *cv = ep[cj].me_value;
-            if (cv == NULL || !PyUnicode_IS_COMPACT_ASCII(ck)) { cok = 0; break; }
-            Py_ssize_t ckl = PyUnicode_GET_LENGTH(ck);
-            if (ckl > 52 || ckused + (uint32_t)ckl + 4u > sizeof(ckbuf)) { cok = 0; break; }
-            char *kdst = ckbuf + ckused;
-            kdst[0] = (cj == 0) ? '{' : ',';
-            kdst[1] = '"';
-            if (!copy_if_clean_short(kdst + 2, (const char *)PyUnicode_1BYTE_DATA(ck), ckl)) {
-              cok = 0; break;
-            }
-            kdst[2 + ckl] = '"';
-            kdst[3 + ckl] = ':';
-            ckoff[cj] = (uint16_t)ckused;
-            cklen[cj] = (uint16_t)(ckl + 4);
-            ckeys[cj] = ck;
-            PyTypeObject *cvtp = Py_TYPE(cv);
-            if (cvtp == &PyLong_Type) cvtypes[cj] = JIT_VT_INT;
-            else if (cvtp == &PyFloat_Type) cvtypes[cj] = JIT_VT_FLOAT;
-            else if (cvtp == &PyUnicode_Type) cvtypes[cj] = JIT_VT_STR;
-            else if (cvtp == &PyBool_Type) cvtypes[cj] = JIT_VT_BOOL;
-            else if (cv == Py_None) cvtypes[cj] = JIT_VT_NONE;
-            else if (cvtp == &PyDict_Type) cvtypes[cj] = JIT_VT_DICT;
-            else if (cvtp == &PyList_Type) cvtypes[cj] = JIT_VT_LIST;
-            else cvtypes[cj] = JIT_VT_ANY;
-            ckused += (uint32_t)(ckl + 4);
-          }
-          if (cok) {
-            jit_fn = cjson_jit_get_or_compile_combined(cn, ckbuf, ckused, ckoff, cklen, cvtypes, ckeys);
-          }
+          jit_fn = cjson_jit_try_compile_combined_arr(ep, nentries);
         }
 #endif
         for (Py_ssize_t di = 0; di < nentries; di++) {
@@ -3414,10 +3578,42 @@ static char *encode_dict_fast(JsonBuffer *b, char *dst, char **safe_end_p,
       CJsonSerDictUnicodeEntry *ep =
           (CJsonSerDictUnicodeEntry *)(dk->dk_indices +
                                        ((size_t)1 << log2_idx));
+#ifdef CJSON_SCHEMA_JIT
+      CJsonJitSplitLoopFn dod_jit_fn = NULL;
+      PyDictKeysObject *dod_split_dk = NULL;
+      Py_ssize_t dod_sn = 0;
+      int dod_is_split = 0;
+      int dod_stalls = 0;
+      if (CJSON_UNLIKELY(nentries >= 24 && b->default_fn == NULL &&
+                         b->depth < CJSON_REC_SER_DEPTH)) {
+        dod_jit_fn = cjson_jit_try_compile_dod(ep, nentries, &dod_split_dk,
+                                               &dod_sn, &dod_is_split);
+      }
+#endif
       for (Py_ssize_t di = 0; di < nentries; di++) {
         PyObject *dval = ep[di].me_value;
         if (CJSON_UNLIKELY(dval == NULL))
           continue;
+#ifdef CJSON_SCHEMA_JIT
+        if (CJSON_UNLIKELY(dod_jit_fn != NULL && Py_TYPE(dval) == &PyDict_Type &&
+                           ((PyDictObject *)dval)->ma_used == dod_sn &&
+                           (!dod_is_split || ((PyDictObject *)dval)->ma_keys == dod_split_dk))) {
+          JitRunCtx jctx = {b, &safe_end, dod_split_dk, NULL};
+          Py_ssize_t ji = di;
+          b->depth++;
+          char *jdst = dod_jit_fn((PyObject *const *)ep, nentries, &ji, dst, &jctx);
+          b->depth--;
+          if (CJSON_UNLIKELY(jdst == NULL)) { b->depth--; return NULL; }
+          dst = jdst;
+          if (ji > di) {
+            di = ji - 1;
+            continue;
+          }
+          if (++dod_stalls >= 4) {
+            dod_jit_fn = NULL;
+          }
+        }
+#endif
         PyObject *key = ep[di].me_key;
         if (CJSON_UNLIKELY(dst > safe_end)) {
           b->len = (Py_ssize_t)(dst - b->data);

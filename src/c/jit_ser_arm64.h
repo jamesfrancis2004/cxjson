@@ -384,14 +384,15 @@ static void a64_emit_buf_check(Arm64Asm *a, uint16_t need, size_t *err_patches, 
   a->buf[br_ok] = a64_b_cond(9, (int32_t)(a->len - br_ok));
 }
 
-#define CJSON_JIT_POOL_BYTES (256 * 1024)
-#define CJSON_JIT_CACHE_SLOTS 64
+#define CJSON_JIT_POOL_BYTES (1024 * 1024)
+#define CJSON_JIT_CACHE_SLOTS 256
 
 typedef struct {
   uint64_t sig_hash;
   uint32_t n;
   uint32_t kbuf_len;
   uint8_t is_combined;
+  uint8_t is_dict_of_dicts;
   uint8_t psize;
   uint8_t vtypes[30];
   uint8_t order[30];
@@ -410,6 +411,7 @@ static void *g_jit_stub_str_neon = NULL;
 static void *g_jit_stub_u32_long = NULL;
 static JitSchemaEntry g_jit_cache[CJSON_JIT_CACHE_SLOTS];
 static uint32_t g_jit_compiled_pages = 0;
+static int g_jit_pool_full = 0;
 static uint32_t g_jit_ascii_state_val = 0;
 static int g_jit_ascii_state_inited = 0;
 
@@ -460,11 +462,6 @@ static void cjson_jit_init_stubs_locked(void) {
   size_t slow_patches[16];
   size_t n_slow = 0;
 
-  /* Check dst <= safe_end (128B slack covers len <= 112 + 2 quotes = 114B) */
-  a64_emit(&a, a64_cmp_reg(20, 21));
-  slow_patches[n_slow++] = a.len;
-  a64_emit(&a, a64_b_cond(8, 0)); /* B.HI slow */
-
   /* Check compact ASCII (low byte & 0x7C: ignores interned, static, and upper 24b garbage) */
   a64_emit(&a, a64_ldurb(10, 9, (int32_t)offsetof(PyASCIIObject, state)));
   a64_emit(&a, 0x121E114Au); /* and w10, w10, #0x7c */
@@ -472,9 +469,15 @@ static void cjson_jit_init_stubs_locked(void) {
   slow_patches[n_slow++] = a.len;
   a64_emit(&a, a64_b_cond(1, 0)); /* B.NE slow */
 
-  /* X10 = length; if > 112 -> slow */
+  /* X10 = length; cap at 256 so long (>256B) escaped prose goes straight to C's 64B-unrolled
+   * copy_clean_prefix without discarding work, while all URLs/hashes/UUIDs/names stay in NEON! */
   a64_emit(&a, a64_ldr_uoff(10, 9, (uint32_t)offsetof(PyASCIIObject, length)));
-  a64_emit(&a, a64_cmp_x_imm(10, 112));
+  a64_emit(&a, a64_cmp_x_imm(10, 256));
+  slow_patches[n_slow++] = a.len;
+  a64_emit(&a, a64_b_cond(8, 0)); /* B.HI slow */
+  a64_emit(&a, a64_add_reg(12, 20, 10)); /* X12 = dst + len */
+  a64_emit(&a, a64_add_imm(12, 12, 1024)); /* X12 = dst + len + 1024 */
+  a64_emit(&a, a64_cmp_reg(12, 21));     /* cmp dst + len + 1024, safe_end */
   slow_patches[n_slow++] = a.len;
   a64_emit(&a, a64_b_cond(8, 0)); /* B.HI slow */
 
@@ -860,15 +863,16 @@ static void cjson_jit_init_stubs_locked(void) {
 }
 
 static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
-    int is_combined, uint32_t n, const char *kbuf, uint32_t kbuf_len,
+    int is_combined, int is_dict_of_dicts, uint32_t n, const char *kbuf, uint32_t kbuf_len,
     const uint16_t *koff, const uint16_t *klen,
     const uint8_t *vtypes, const uint8_t *order,
     uint8_t psize, const uint8_t *prefix,
-    PyObject *const *expected_keys) {
+    PyObject *const *expected_keys,
+    PyObject *const *sample_vals) {
   if (!cjson_jit_is_enabled() || n == 0 || n > 30 || kbuf_len > 1024) return NULL;
 
   uint64_t h = (uint64_t)n * 0x9E3779B97F4A7C15ULL ^ ((uint64_t)kbuf_len << 32) ^
-               ((uint64_t)is_combined << 48) ^ psize;
+               ((uint64_t)is_combined << 48) ^ ((uint64_t)is_dict_of_dicts << 49) ^ psize;
   for (uint32_t j = 0; j < n; j++) {
     uint64_t ktag = is_combined ? (uint64_t)(uintptr_t)expected_keys[j] : (uint64_t)order[j];
     h = (h ^ ((uint64_t)vtypes[j] << 8) ^ ktag) * 0xBF58476D1CE4E5B9ULL;
@@ -879,18 +883,27 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
 
   /* Lock-free O(1) 2-way set-associative lookup */
   uint32_t set_base = (uint32_t)(h & (CJSON_JIT_CACHE_SLOTS - 2u));
+  uint32_t occupied = 0;
   for (uint32_t w = 0; w < 2; w++) {
     JitSchemaEntry *e = &g_jit_cache[set_base + w];
     CJsonJitSplitLoopFn fn = __atomic_load_n(&e->fn, __ATOMIC_ACQUIRE);
-    if (fn != NULL && e->sig_hash == h && e->is_combined == (uint8_t)is_combined &&
-        e->n == n && e->kbuf_len == kbuf_len && e->psize == psize &&
-        memcmp(e->vtypes, vtypes, n) == 0 &&
-        (is_combined ? (memcmp(e->expected_keys, expected_keys, n * sizeof(PyObject *)) == 0)
-                     : (memcmp(e->order, order, n) == 0 &&
-                        (psize == 0 || memcmp(e->prefix, prefix, psize) == 0))) &&
-        memcmp(e->kbuf, kbuf, kbuf_len) == 0) {
-      return fn;
+    if (fn != NULL) {
+      occupied++;
+      if (e->sig_hash == h && e->is_combined == (uint8_t)is_combined &&
+          e->is_dict_of_dicts == (uint8_t)is_dict_of_dicts &&
+          e->n == n && e->kbuf_len == kbuf_len && e->psize == psize &&
+          memcmp(e->vtypes, vtypes, n) == 0 &&
+          (is_combined ? (memcmp(e->expected_keys, expected_keys, n * sizeof(PyObject *)) == 0)
+                       : (memcmp(e->order, order, n) == 0 &&
+                          (psize == 0 || memcmp(e->prefix, prefix, psize) == 0))) &&
+          memcmp(e->kbuf, kbuf, kbuf_len) == 0) {
+        return fn;
+      }
     }
+  }
+  /* Lock-free fast bailout when this 2-way set or global JIT pool is already full */
+  if (occupied == 2 || __atomic_load_n(&g_jit_pool_full, __ATOMIC_RELAXED)) {
+    return NULL;
   }
 
   pthread_mutex_lock(&g_jit_mu);
@@ -899,6 +912,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
   for (uint32_t w = 0; w < 2; w++) {
     JitSchemaEntry *e = &g_jit_cache[set_base + w];
     if (e->fn != NULL && e->sig_hash == h && e->is_combined == (uint8_t)is_combined &&
+        e->is_dict_of_dicts == (uint8_t)is_dict_of_dicts &&
         e->n == n && e->kbuf_len == kbuf_len && e->psize == psize &&
         memcmp(e->vtypes, vtypes, n) == 0 &&
         (is_combined ? (memcmp(e->expected_keys, expected_keys, n * sizeof(PyObject *)) == 0)
@@ -920,6 +934,9 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
     }
   }
   if (target_idx >= CJSON_JIT_CACHE_SLOTS || g_jit_compiled_pages >= CJSON_JIT_CACHE_SLOTS) {
+    if (g_jit_compiled_pages >= CJSON_JIT_CACHE_SLOTS) {
+      __atomic_store_n(&g_jit_pool_full, 1, __ATOMIC_RELAXED);
+    }
     pthread_mutex_unlock(&g_jit_mu);
     return NULL; /* bounded JIT code memory: fall back cleanly to C */
   }
@@ -935,6 +952,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
     g_jit_used = 0;
   }
   if (g_jit_used + 8192 > CJSON_JIT_POOL_BYTES) {
+    __atomic_store_n(&g_jit_pool_full, 1, __ATOMIC_RELAXED);
     pthread_mutex_unlock(&g_jit_mu);
     return NULL;
   }
@@ -953,8 +971,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
     for (int j = (int)n - 1; j >= 0; j--) {
       uint8_t vt = vtypes[j];
       uint32_t vmax = (vt == JIT_VT_INT) ? 24u : ((vt == JIT_VT_FLOAT) ? 34u :
-                      ((vt == JIT_VT_BOOL) ? 5u : ((vt == JIT_VT_NONE) ? 4u :
-                      ((vt == JIT_VT_STR) ? 114u : 4u))));
+                      ((vt == JIT_VT_BOOL) ? 5u : ((vt == JIT_VT_NONE) ? 4u : 4u)));
       total_row_need += (uint32_t)klen[j] + vmax;
       if (vt == JIT_VT_STR || vt == JIT_VT_DICT || vt == JIT_VT_LIST || vt == JIT_VT_ANY) {
         acc = (uint32_t)klen[j] + 4u;
@@ -966,11 +983,11 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
   }
   int single_row_check = (total_row_need <= 1024u);
 
-  uint32_t tmp_code[3072];
-  Arm64Asm a = {tmp_code, 0, 3072};
+  uint32_t tmp_code[4096];
+  Arm64Asm a = {tmp_code, 0, 4096};
 
-  /* Prologue */
-  a64_emit(&a, 0xA9800000u | (0x74u << 15) | (30u << 10) | (31u << 5) | 29u);
+  /* Prologue (112B frame: [SP, #96] is scratch slot for saving parent X22 across inline nested dicts) */
+  a64_emit(&a, 0xA9800000u | (0x72u << 15) | (30u << 10) | (31u << 5) | 29u);
   a64_emit(&a, 0xA9000000u | (2u << 15) | (20u << 10) | (31u << 5) | 19u);
   a64_emit(&a, 0xA9000000u | (4u << 15) | (22u << 10) | (31u << 5) | 21u);
   a64_emit(&a, 0xA9000000u | (6u << 15) | (24u << 10) | (31u << 5) | 23u);
@@ -987,9 +1004,9 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
   a64_emit(&a, a64_ldr_uoff(27, 4, (uint32_t)offsetof(JitRunCtx, dk)));
   a64_emit(&a, a64_ldr_uoff(21, 28, 0)); /* X21 = *safe_end_p */
 
-  size_t done_patches[128];
+  size_t done_patches[256];
   size_t n_done = 0;
-  size_t err_patches[192];
+  size_t err_patches[384];
   size_t n_err = 0;
 
   size_t loop_top = a.len;
@@ -999,8 +1016,17 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
   done_patches[n_done++] = a.len;
   a64_emit(&a, a64_b_cond(10, 0));
 
-  /* X9 = items[i] */
-  a64_emit(&a, a64_ldr_idx_lsl3(9, 19, 23));
+  /* Load current item (list: items[i], dict-of-dicts: ep[i].me_value with NULL tombstone skip) */
+  size_t br_tombstone = 0;
+  if (is_dict_of_dicts) {
+    /* X10 = (uint8_t *)X19 + (X23 << 4); X9 = ep[i].me_value */
+    a64_emit(&a, 0x8B001000u | (23u << 16) | (19u << 5) | 10u); /* ADD X10, X19, X23, LSL #4 */
+    a64_emit(&a, a64_ldr_uoff(9, 10, 8));
+    br_tombstone = a.len;
+    a64_emit(&a, a64_cbz(9, 0)); /* tombstone -> skip to next_iter */
+  } else {
+    a64_emit(&a, a64_ldr_idx_lsl3(9, 19, 23));
+  }
 
   /* Check Py_TYPE(item) == &PyDict_Type */
   a64_emit(&a, a64_ldr_uoff(10, 9, (uint32_t)offsetof(PyObject, ob_type)));
@@ -1207,6 +1233,33 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
   /* Hoisted row buffer check! */
   a64_emit_buf_check(&a, single_row_check ? (uint16_t)total_row_need : run_max[0], err_patches, &n_err);
 
+  if (is_dict_of_dicts) {
+    /* Emit outer key "k": via NEON string stub (preserves X22 = inner svals/ep and guarantees >= 1024B slack!) */
+    a64_emit(&a, 0x8B001000u | (23u << 16) | (19u << 5) | 10u); /* ADD X10, X19, X23, LSL #4 */
+    a64_emit(&a, a64_ldr_uoff(9, 10, 0)); /* X9 = ep[i].me_key */
+    if (g_jit_stub_str_neon != NULL) {
+      a64_emit_call_stub(&a, g_jit_stub_str_neon, planned_dest);
+      err_patches[n_err++] = a.len;
+      a64_emit(&a, a64_cbz(0, 0));
+    } else {
+      a64_emit(&a, a64_mov(0, 25));
+      a64_emit(&a, a64_mov(1, 20));
+      a64_emit(&a, a64_mov(2, 28));
+      a64_emit(&a, a64_mov(3, 9));
+      a64_load_u64(&a, 12, (uint64_t)(uintptr_t)&cjson_jit_emit_str);
+      a64_emit(&a, a64_blr(12));
+      err_patches[n_err++] = a.len;
+      a64_emit(&a, a64_cbz(0, 0));
+      a64_emit(&a, a64_mov(20, 0));
+      a64_emit(&a, a64_ldr_uoff(21, 28, 0));
+    }
+    a64_emit(&a, a64_movz(10, ':', 0));
+    a64_emit(&a, a64_strb_post(10, 20, 1));
+    if (!single_row_check) {
+      a64_emit_buf_check(&a, run_max[0], err_patches, &n_err);
+    }
+  }
+
   for (uint32_t j = 0; j < n; j++) {
     if (!single_row_check && j > 0) {
       uint8_t prev_vt = vtypes[j - 1];
@@ -1363,6 +1416,320 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       size_t br_end1 = a.len;
       a64_emit(&a, a64_b(0));
       a.buf[br_nonempty] = a64_cbnz(10, (int32_t)(a.len - br_nonempty));
+
+      /* Try to inline a 1-level homogeneous nested dict (1..8 clean ASCII keys, scalar values)
+       * directly into the parent JIT loop (e.g., pypi_numpy digests/core-metadata, gsoc sponsor/author)! */
+      int inlined_sub = 0;
+      size_t br_sub_done = 0;
+      if (sample_vals != NULL && sample_vals[j] != NULL &&
+          Py_TYPE(sample_vals[j]) == &PyDict_Type) {
+        PyDictObject *sub = (PyDictObject *)sample_vals[j];
+        Py_ssize_t sn = sub->ma_used;
+        if (sn >= 1 && sn <= 8) {
+          int sub_is_split = (sub->ma_values != NULL);
+          int sub_ok = 1;
+          char skbuf[320];
+          uint16_t skoff[8], sklen[8];
+          uint8_t svt[8], sorder[8];
+#if PY_VERSION_HEX < 0x030D0000
+          uint8_t sprefix[32];
+#endif
+          PyObject *skeys[8];
+          uint32_t skused = 0;
+          uint32_t sub_need = 2;
+          if (sub_is_split) {
+#if PY_VERSION_HEX >= 0x030D0000
+            typedef struct { uint8_t cap, sz, emb, valid; PyObject *values[1]; } SubDv313;
+            const SubDv313 *sdv = (const SubDv313 *)sub->ma_values;
+            const uint8_t *sdv_ord = (const uint8_t *)&sdv->values[sdv->cap];
+            if (sdv->valid != 1 || sdv->sz != (uint8_t)sn || sdv->sz > sdv->cap) sub_ok = 0;
+            PyObject *const *svals = sdv->values;
+#else
+            const uint8_t *svraw = (const uint8_t *)sub->ma_values;
+            uint8_t sps = svraw[-1];
+            if (sps > 32 || (uint32_t)sps < 2u + (uint32_t)sn || svraw[-2] != (uint8_t)sn) sub_ok = 0;
+            PyObject *const *svals = (PyObject *const *)sub->ma_values;
+#endif
+            CJsonSerDictKeysObject *sdk = (CJsonSerDictKeysObject *)sub->ma_keys;
+            if (sub_ok && (sdk->dk_kind != 2 || sdk->dk_nentries < sn)) sub_ok = 0;
+            PyObject *tk, *tv;
+            Py_ssize_t tpos = 0;
+            uint32_t tj = 0;
+            while (sub_ok && PyDict_Next((PyObject *)sub, &tpos, &tk, &tv) && tj < (uint32_t)sn) {
+#if PY_VERSION_HEX >= 0x030D0000
+              uint8_t ix = sdv_ord[tj];
+              if (ix >= sdv->cap || tv != svals[ix]) { sub_ok = 0; break; }
+#else
+              uint8_t ix = svraw[-3 - (int)tj];
+              if (tv != svals[ix]) { sub_ok = 0; break; }
+#endif
+              sorder[tj] = ix;
+              skeys[tj] = tk;
+              if (!PyUnicode_IS_COMPACT_ASCII(tk)) { sub_ok = 0; break; }
+              Py_ssize_t tkl = PyUnicode_GET_LENGTH(tk);
+              if (tkl > 32 || skused + (uint32_t)tkl + 4u > sizeof(skbuf)) { sub_ok = 0; break; }
+              char *kdst = skbuf + skused;
+              kdst[0] = (tj == 0) ? '{' : ',';
+              kdst[1] = '"';
+              if (!copy_if_clean_short(kdst + 2, (const char *)PyUnicode_1BYTE_DATA(tk), tkl)) { sub_ok = 0; break; }
+              kdst[2 + tkl] = '"';
+              kdst[3 + tkl] = ':';
+              skoff[tj] = (uint16_t)skused;
+              sklen[tj] = (uint16_t)(tkl + 4);
+              PyTypeObject *tvtp = Py_TYPE(tv);
+              if (tvtp == &PyLong_Type) { svt[tj] = JIT_VT_INT; sub_need += (uint32_t)tkl + 28u; }
+              else if (tvtp == &PyFloat_Type) { svt[tj] = JIT_VT_FLOAT; sub_need += (uint32_t)tkl + 38u; }
+              else if (tvtp == &PyUnicode_Type) { svt[tj] = JIT_VT_STR; sub_need += (uint32_t)tkl + 8u; }
+              else if (tvtp == &PyBool_Type) { svt[tj] = JIT_VT_BOOL; sub_need += (uint32_t)tkl + 9u; }
+              else if (tv == Py_None) { svt[tj] = JIT_VT_NONE; sub_need += (uint32_t)tkl + 8u; }
+              else { sub_ok = 0; break; }
+              skused += (uint32_t)(tkl + 4);
+              tj++;
+            }
+            if (tj != (uint32_t)sn) sub_ok = 0;
+#if PY_VERSION_HEX < 0x030D0000
+            if (sub_ok) memcpy(sprefix, svraw - 2 - sn, (size_t)sn);
+#endif
+          } else {
+            CJsonSerDictKeysObject *sdk = (CJsonSerDictKeysObject *)sub->ma_keys;
+            if (sdk->dk_kind != 1 || sdk->dk_nentries != sn) {
+              sub_ok = 0;
+            } else {
+              CJsonSerDictUnicodeEntry *sep = (CJsonSerDictUnicodeEntry *)(sdk->dk_indices + ((size_t)1 << sdk->dk_log2_index_bytes));
+              for (uint32_t tj = 0; tj < (uint32_t)sn; tj++) {
+                PyObject *tk = sep[tj].me_key;
+                PyObject *tv = sep[tj].me_value;
+                if (tv == NULL || !PyUnicode_IS_COMPACT_ASCII(tk)) { sub_ok = 0; break; }
+                Py_ssize_t tkl = PyUnicode_GET_LENGTH(tk);
+                if (tkl > 32 || skused + (uint32_t)tkl + 4u > sizeof(skbuf)) { sub_ok = 0; break; }
+                char *kdst = skbuf + skused;
+                kdst[0] = (tj == 0) ? '{' : ',';
+                kdst[1] = '"';
+                if (!copy_if_clean_short(kdst + 2, (const char *)PyUnicode_1BYTE_DATA(tk), tkl)) { sub_ok = 0; break; }
+                kdst[2 + tkl] = '"';
+                kdst[3 + tkl] = ':';
+                skoff[tj] = (uint16_t)skused;
+                sklen[tj] = (uint16_t)(tkl + 4);
+                skeys[tj] = tk;
+                PyTypeObject *tvtp = Py_TYPE(tv);
+                if (tvtp == &PyLong_Type) { svt[tj] = JIT_VT_INT; sub_need += (uint32_t)tkl + 28u; }
+                else if (tvtp == &PyFloat_Type) { svt[tj] = JIT_VT_FLOAT; sub_need += (uint32_t)tkl + 38u; }
+                else if (tvtp == &PyUnicode_Type) { svt[tj] = JIT_VT_STR; sub_need += (uint32_t)tkl + 8u; }
+                else if (tvtp == &PyBool_Type) { svt[tj] = JIT_VT_BOOL; sub_need += (uint32_t)tkl + 9u; }
+                else if (tv == Py_None) { svt[tj] = JIT_VT_NONE; sub_need += (uint32_t)tkl + 8u; }
+                else { sub_ok = 0; break; }
+                skused += (uint32_t)(tkl + 4);
+              }
+            }
+          }
+
+          if (sub_ok && sub_need <= 1024u) {
+            size_t sub_fail[32];
+            size_t n_sub_fail = 0;
+            /* Check ma_used == sn */
+            a64_emit(&a, a64_cmp_x_imm(10, (uint16_t)sn));
+            sub_fail[n_sub_fail++] = a.len;
+            a64_emit(&a, a64_b_cond(1, 0));
+
+            /* Load sub_dk (X13) and check dk_kind, dk_nentries, and compute sub_ep (X14) */
+            a64_emit(&a, a64_ldr_uoff(13, 9, (uint32_t)offsetof(PyDictObject, ma_keys)));
+            a64_emit(&a, a64_ldurb(10, 13, (int32_t)offsetof(CJsonSerDictKeysObject, dk_kind)));
+            a64_emit(&a, a64_cmp_w_imm(10, sub_is_split ? 2 : 1));
+            sub_fail[n_sub_fail++] = a.len;
+            a64_emit(&a, a64_b_cond(1, 0));
+            a64_emit(&a, a64_ldr_uoff(10, 13, (uint32_t)offsetof(CJsonSerDictKeysObject, dk_nentries)));
+            a64_emit(&a, a64_cmp_x_imm(10, (uint16_t)sn));
+            sub_fail[n_sub_fail++] = a.len;
+            a64_emit(&a, a64_b_cond(sub_is_split ? 3 : 1, 0)); /* split: B.LO; combined: B.NE */
+
+            /* X14 = sub_ep = dk->dk_indices + (1 << dk_log2_index_bytes) */
+            a64_emit(&a, a64_ldurb(10, 13, (int32_t)offsetof(CJsonSerDictKeysObject, dk_log2_index_bytes)));
+            a64_emit(&a, a64_movz(11, 1, 0));
+            a64_emit(&a, a64_lslv(11, 11, 10));
+            a64_emit(&a, a64_add_imm(14, 13, (uint16_t)offsetof(CJsonSerDictKeysObject, dk_indices)));
+            a64_emit(&a, a64_add_reg(14, 14, 11));
+
+            /* Verify all sub keys match pinned skeys[k] (zero ABA risk!) */
+            for (uint32_t k = 0; k < (uint32_t)sn; k++) {
+              Py_INCREF(skeys[k]);
+              uint32_t eidx = sub_is_split ? (uint32_t)sorder[k] : k;
+              a64_emit(&a, a64_ldr_uoff(10, 14, eidx * 16u));
+              a64_load_u64(&a, 11, (uint64_t)(uintptr_t)skeys[k]);
+              a64_emit(&a, a64_cmp_reg(10, 11));
+              sub_fail[n_sub_fail++] = a.len;
+              a64_emit(&a, a64_b_cond(1, 0));
+            }
+
+            if (sub_is_split) {
+              /* X15 = sub->ma_values; must be non-NULL and match order */
+              a64_emit(&a, a64_ldr_uoff(15, 9, (uint32_t)offsetof(PyDictObject, ma_values)));
+              sub_fail[n_sub_fail++] = a.len;
+              a64_emit(&a, a64_cbz(15, 0));
+#if PY_VERSION_HEX >= 0x030D0000
+              a64_emit(&a, a64_ldurb(10, 15, 1));
+              a64_emit(&a, a64_cmp_w_imm(10, (uint16_t)sn));
+              sub_fail[n_sub_fail++] = a.len;
+              a64_emit(&a, a64_b_cond(1, 0));
+              a64_emit(&a, a64_ldurb(10, 15, 3));
+              a64_emit(&a, a64_cmp_w_imm(10, 1));
+              sub_fail[n_sub_fail++] = a.len;
+              a64_emit(&a, a64_b_cond(1, 0));
+              a64_emit(&a, a64_ldurb(12, 15, 0));
+              a64_emit(&a, a64_cmp_w_imm(12, (uint16_t)sn));
+              sub_fail[n_sub_fail++] = a.len;
+              a64_emit(&a, a64_b_cond(3, 0));
+              a64_emit(&a, a64_add_imm(15, 15, 8));
+              a64_emit(&a, 0x8B000C00u | (12u << 16) | (15u << 5) | 13u);
+              for (uint32_t off = 0; off < (uint32_t)sn; off++) {
+                a64_emit(&a, a64_ldurb(10, 13, (int32_t)off));
+                a64_emit(&a, a64_cmp_w_imm(10, sorder[off]));
+                sub_fail[n_sub_fail++] = a.len;
+                a64_emit(&a, a64_b_cond(1, 0));
+              }
+#else
+              a64_emit(&a, a64_ldurb(10, 15, -1));
+              a64_emit(&a, a64_cmp_w_imm(10, 32));
+              sub_fail[n_sub_fail++] = a.len;
+              a64_emit(&a, a64_b_cond(8, 0));
+              a64_emit(&a, a64_cmp_w_imm(10, (uint16_t)(2u + (uint32_t)sn)));
+              sub_fail[n_sub_fail++] = a.len;
+              a64_emit(&a, a64_b_cond(3, 0));
+              a64_emit(&a, a64_ldurb(10, 15, -2));
+              a64_emit(&a, a64_cmp_w_imm(10, (uint16_t)sn));
+              sub_fail[n_sub_fail++] = a.len;
+              a64_emit(&a, a64_b_cond(1, 0));
+              for (int32_t off = -(int32_t)(2u + (uint32_t)sn); off < -2; off++) {
+                uint32_t idx = (uint32_t)(off + (int32_t)(2u + (uint32_t)sn));
+                a64_emit(&a, a64_ldurb(10, 15, off));
+                a64_emit(&a, a64_cmp_w_imm(10, sprefix[idx]));
+                sub_fail[n_sub_fail++] = a.len;
+                a64_emit(&a, a64_b_cond(1, 0));
+              }
+#endif
+            } else {
+              a64_emit(&a, a64_ldr_uoff(10, 9, (uint32_t)offsetof(PyDictObject, ma_values)));
+              sub_fail[n_sub_fail++] = a.len;
+              a64_emit(&a, a64_cbnz(10, 0));
+              a64_emit(&a, a64_mov(15, 14)); /* X15 = sub_ep */
+            }
+
+            /* All checks passed! Save parent X22 to [SP, #96], set X22 = X15 (sub values/ep) */
+            a64_emit(&a, a64_str_x_uoff(22, 31, 96));
+            a64_emit(&a, a64_mov(22, 15));
+            a64_emit_buf_check(&a, (uint16_t)sub_need, err_patches, &n_err);
+
+            for (uint32_t k = 0; k < (uint32_t)sn; k++) {
+              a64_emit_literal(&a, skbuf + skoff[k], sklen[k]);
+              uint32_t svoff = sub_is_split ? ((uint32_t)sorder[k] * 8u) : (k * 16u + 8u);
+              a64_emit(&a, a64_ldr_uoff(9, 22, svoff));
+              uint8_t sv = svt[k];
+              if (sv == JIT_VT_STR) {
+                a64_emit(&a, a64_ldr_uoff(10, 9, (uint32_t)offsetof(PyObject, ob_type)));
+                a64_load_u64(&a, 11, (uint64_t)(uintptr_t)&PyUnicode_Type);
+                a64_emit(&a, a64_cmp_reg(10, 11));
+                size_t sb_ns = a.len;
+                a64_emit(&a, a64_b_cond(1, 0));
+                if (g_jit_stub_str_neon != NULL) {
+                  a64_emit_call_stub(&a, g_jit_stub_str_neon, planned_dest);
+                  err_patches[n_err++] = a.len;
+                  a64_emit(&a, a64_cbz(0, 0));
+                } else {
+                  a64_emit_call_any(&a, err_patches, &n_err);
+                }
+                size_t sb_e = a.len;
+                a64_emit(&a, a64_b(0));
+                a.buf[sb_ns] = a64_b_cond(1, (int32_t)(a.len - sb_ns));
+                a64_emit_call_any(&a, err_patches, &n_err);
+                a.buf[sb_e] = a64_b((int32_t)(a.len - sb_e));
+              } else if (sv == JIT_VT_INT) {
+                a64_emit(&a, a64_ldr_uoff(10, 9, (uint32_t)offsetof(PyObject, ob_type)));
+                a64_load_u64(&a, 11, (uint64_t)(uintptr_t)&PyLong_Type);
+                a64_emit(&a, a64_cmp_reg(10, 11));
+                size_t sb_ni = a.len;
+                a64_emit(&a, a64_b_cond(1, 0));
+                if (g_jit_stub_u32_long != NULL) {
+                  a64_emit_call_stub(&a, g_jit_stub_u32_long, planned_dest);
+                  err_patches[n_err++] = a.len;
+                  a64_emit(&a, a64_cbz(0, 0));
+                } else {
+                  a64_emit_call_any(&a, err_patches, &n_err);
+                }
+                size_t sb_e = a.len;
+                a64_emit(&a, a64_b(0));
+                a.buf[sb_ni] = a64_b_cond(1, (int32_t)(a.len - sb_ni));
+                a64_emit_call_any(&a, err_patches, &n_err);
+                a.buf[sb_e] = a64_b((int32_t)(a.len - sb_e));
+              } else if (sv == JIT_VT_BOOL) {
+                a64_load_u64(&a, 10, (uint64_t)(uintptr_t)Py_True);
+                a64_emit(&a, a64_cmp_reg(9, 10));
+                size_t sb_t = a.len;
+                a64_emit(&a, a64_b_cond(0, 0));
+                a64_load_u64(&a, 10, (uint64_t)(uintptr_t)Py_False);
+                a64_emit(&a, a64_cmp_reg(9, 10));
+                size_t sb_a = a.len;
+                a64_emit(&a, a64_b_cond(1, 0));
+                a64_emit_literal(&a, "false", 5);
+                size_t sb_e1 = a.len;
+                a64_emit(&a, a64_b(0));
+                a.buf[sb_t] = a64_b_cond(0, (int32_t)(a.len - sb_t));
+                a64_emit_literal(&a, "true", 4);
+                size_t sb_e2 = a.len;
+                a64_emit(&a, a64_b(0));
+                a.buf[sb_a] = a64_b_cond(1, (int32_t)(a.len - sb_a));
+                a64_emit_call_any(&a, err_patches, &n_err);
+                a.buf[sb_e1] = a64_b((int32_t)(a.len - sb_e1));
+                a.buf[sb_e2] = a64_b((int32_t)(a.len - sb_e2));
+              } else if (sv == JIT_VT_FLOAT) {
+                a64_emit(&a, a64_ldr_uoff(10, 9, (uint32_t)offsetof(PyObject, ob_type)));
+                a64_load_u64(&a, 11, (uint64_t)(uintptr_t)&PyFloat_Type);
+                a64_emit(&a, a64_cmp_reg(10, 11));
+                size_t sb_nf = a.len;
+                a64_emit(&a, a64_b_cond(1, 0));
+                a64_emit(&a, 0xFD400000u | (((uint32_t)offsetof(PyFloatObject, ob_fval) >> 3) << 10) | (9u << 5) | 0u);
+                a64_emit(&a, a64_mov(0, 20));
+                a64_load_u64(&a, 12, (uint64_t)(uintptr_t)&cjson_jit_write_double);
+                a64_emit(&a, a64_blr(12));
+                a64_emit(&a, a64_mov(20, 0));
+                size_t sb_e = a.len;
+                a64_emit(&a, a64_b(0));
+                a.buf[sb_nf] = a64_b_cond(1, (int32_t)(a.len - sb_nf));
+                a64_emit_call_any(&a, err_patches, &n_err);
+                a.buf[sb_e] = a64_b((int32_t)(a.len - sb_e));
+              } else if (sv == JIT_VT_NONE) {
+                a64_load_u64(&a, 10, (uint64_t)(uintptr_t)Py_None);
+                a64_emit(&a, a64_cmp_reg(9, 10));
+                size_t sb_a = a.len;
+                a64_emit(&a, a64_b_cond(1, 0));
+                a64_emit_literal(&a, "null", 4);
+                size_t sb_e = a.len;
+                a64_emit(&a, a64_b(0));
+                a.buf[sb_a] = a64_b_cond(1, (int32_t)(a.len - sb_a));
+                a64_emit_call_any(&a, err_patches, &n_err);
+                a.buf[sb_e] = a64_b((int32_t)(a.len - sb_e));
+              } else {
+                a64_emit_call_any(&a, err_patches, &n_err);
+              }
+            }
+            a64_emit_literal(&a, "}", 1);
+            /* Restore parent X22 from [SP, #96] */
+            a64_emit(&a, a64_ldr_uoff(22, 31, 96));
+            br_sub_done = a.len;
+            a64_emit(&a, a64_b(0));
+
+            /* Patch all sub_fail branches to fall through to cjson_jit_encode_dict */
+            for (size_t f = 0; f < n_sub_fail; f++) {
+              size_t pos = sub_fail[f];
+              int32_t rel = (int32_t)(a.len - pos);
+              uint32_t orig = a.buf[pos];
+              if ((orig & 0xFF000000u) == 0xB4000000u) a.buf[pos] = a64_cbz((int)(orig & 0x1Fu), rel);
+              else if ((orig & 0xFF000000u) == 0xB5000000u) a.buf[pos] = a64_cbnz((int)(orig & 0x1Fu), rel);
+              else a.buf[pos] = a64_b_cond((int)(orig & 0xFu), rel);
+            }
+            inlined_sub = 1;
+          }
+        }
+      }
+
       a64_emit(&a, a64_mov(0, 25));
       a64_emit(&a, a64_mov(1, 20));
       a64_emit(&a, a64_mov(2, 28));
@@ -1388,6 +1755,9 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       a.buf[br_end1] = a64_b((int32_t)(a.len - br_end1));
       a.buf[br_end2] = a64_b((int32_t)(a.len - br_end2));
       a.buf[br_end3] = a64_b((int32_t)(a.len - br_end3));
+      if (inlined_sub) {
+        a.buf[br_sub_done] = a64_b((int32_t)(a.len - br_sub_done));
+      }
     } else if (vt == JIT_VT_LIST) {
       a64_emit(&a, a64_ldr_uoff(10, 9, (uint32_t)offsetof(PyObject, ob_type)));
       a64_load_u64(&a, 11, (uint64_t)(uintptr_t)&PyList_Type);
@@ -1433,6 +1803,9 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
 
   /* Write "}," and advance i */
   a64_emit_literal(&a, "},", 2);
+  if (is_dict_of_dicts) {
+    a.buf[br_tombstone] = a64_cbz(9, (int32_t)(a.len - br_tombstone));
+  }
   a64_emit(&a, a64_add_imm(23, 23, 1));
   a64_emit(&a, a64_b((int32_t)(loop_top - a.len)));
 
@@ -1446,7 +1819,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
   a64_emit(&a, 0xA9400000u | (6u << 15) | (24u << 10) | (31u << 5) | 23u);
   a64_emit(&a, 0xA9400000u | (4u << 15) | (22u << 10) | (31u << 5) | 21u);
   a64_emit(&a, 0xA9400000u | (2u << 15) | (20u << 10) | (31u << 5) | 19u);
-  a64_emit(&a, 0xA8C00000u | (12u << 15) | (30u << 10) | (31u << 5) | 29u);
+  a64_emit(&a, 0xA8C00000u | (14u << 15) | (30u << 10) | (31u << 5) | 29u);
   a64_emit(&a, 0xD65F03C0u);
 
   /* err_label */
@@ -1515,6 +1888,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
   slot->n = n;
   slot->kbuf_len = kbuf_len;
   slot->is_combined = (uint8_t)is_combined;
+  slot->is_dict_of_dicts = (uint8_t)is_dict_of_dicts;
   slot->psize = psize;
   memcpy(slot->vtypes, vtypes, n);
   if (is_combined) {
@@ -1538,15 +1912,26 @@ static inline CJsonJitSplitLoopFn cjson_jit_get_or_compile(
     uint32_t n, const char *kbuf, uint32_t kbuf_len,
     const uint16_t *koff, const uint16_t *klen,
     const uint8_t *vtypes, const uint8_t *order,
-    uint8_t psize, const uint8_t *prefix) {
-  return cjson_jit_get_or_compile_impl(0, n, kbuf, kbuf_len, koff, klen, vtypes, order, psize, prefix, NULL);
+    uint8_t psize, const uint8_t *prefix,
+    PyObject *const *sample_vals) {
+  return cjson_jit_get_or_compile_impl(0, 0, n, kbuf, kbuf_len, koff, klen, vtypes, order, psize, prefix, NULL, sample_vals);
 }
 
 static inline CJsonJitSplitLoopFn cjson_jit_get_or_compile_combined(
     uint32_t n, const char *kbuf, uint32_t kbuf_len,
     const uint16_t *koff, const uint16_t *klen,
-    const uint8_t *vtypes, PyObject *const *expected_keys) {
-  return cjson_jit_get_or_compile_impl(1, n, kbuf, kbuf_len, koff, klen, vtypes, NULL, 0, NULL, expected_keys);
+    const uint8_t *vtypes, PyObject *const *expected_keys,
+    PyObject *const *sample_vals) {
+  return cjson_jit_get_or_compile_impl(1, 0, n, kbuf, kbuf_len, koff, klen, vtypes, NULL, 0, NULL, expected_keys, sample_vals);
+}
+
+static inline CJsonJitSplitLoopFn cjson_jit_get_or_compile_dict_of_dicts(
+    int is_combined, uint32_t n, const char *kbuf, uint32_t kbuf_len,
+    const uint16_t *koff, const uint16_t *klen,
+    const uint8_t *vtypes, const uint8_t *order,
+    uint8_t psize, const uint8_t *prefix, PyObject *const *expected_keys,
+    PyObject *const *sample_vals) {
+  return cjson_jit_get_or_compile_impl(is_combined, 1, n, kbuf, kbuf_len, koff, klen, vtypes, order, psize, prefix, expected_keys, sample_vals);
 }
 
 #endif /* (__APPLE__ || __linux__) && __aarch64__ */
