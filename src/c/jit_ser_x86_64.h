@@ -804,6 +804,19 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
   x64_b(&a, 0x4C); x64_b(&a, 0x3B); x64_b(&a, 0x2C); x64_b(&a, 0x24);
   done_patches[n_done++] = x64_jcc32(&a, 0x8D);
 
+  /* Software prefetch items[i + 4] into L1 cache (PREFETCHT0 is fault-free even on NULL) */
+  x64_b(&a, 0x49); x64_b(&a, 0x8D); x64_b(&a, 0x45); x64_b(&a, 4); /* lea rax, [r13 + 4] */
+  x64_b(&a, 0x48); x64_b(&a, 0x3B); x64_b(&a, 0x04); x64_b(&a, 0x24); /* cmp rax, [rsp] */
+  size_t br_no_pf = x64_jcc32(&a, 0x8D); /* jge no_pf */
+  if (is_dict_of_dicts) {
+    x64_b(&a, 0x48); x64_b(&a, 0xC1); x64_b(&a, 0xE0); x64_b(&a, 4); /* shl rax, 4 */
+    x64_b(&a, 0x49); x64_b(&a, 0x8B); x64_b(&a, 0x44); x64_b(&a, 0x04); x64_b(&a, 8); /* mov rax, [r12 + rax + 8] */
+  } else {
+    x64_b(&a, 0x49); x64_b(&a, 0x8B); x64_b(&a, 0x04); x64_b(&a, 0xC4); /* mov rax, [r12 + rax*8] */
+  }
+  x64_b(&a, 0x0F); x64_b(&a, 0x18); x64_b(&a, 0x08); /* prefetcht0 [rax] */
+  x64_patch32(&a, br_no_pf, a.len);
+
   /* Load item (list: items[i], dict-of-dicts: ep[i].me_value with NULL tombstone skip) */
   size_t br_tombstone = 0;
   if (is_dict_of_dicts) {
@@ -900,7 +913,25 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
     x64_b(&a, 0x4D); x64_b(&a, 0x8D); x64_b(&a, 0x7C); x64_b(&a, 0x07); x64_b(&a, (uint8_t)offsetof(CJsonSerDictKeysObject, dk_indices));
 
     /* Verify every key matches expected_keys[j] (1-cycle ptr eq fast path + inline key-bytes fallback for <= 16B) */
+    /* Branchless batched pointer-equality check across all n keys (1 branch for interned keys!) */
     uint32_t ascii_st = cjson_jit_get_ascii_state();
+    size_t br_keys_all_ok = 0;
+    if (n >= 2) {
+      x64_b(&a, 0x31); x64_b(&a, 0xD2); /* xor edx, edx */
+      for (uint32_t j = 0; j < n; j++) {
+        uint32_t koff_e = j * 16u;
+        if (koff_e < 128u) {
+          x64_b(&a, 0x4D); x64_b(&a, 0x8B); x64_b(&a, 0x57); x64_b(&a, (uint8_t)koff_e);
+        } else {
+          x64_b(&a, 0x4D); x64_b(&a, 0x8B); x64_b(&a, 0x97); x64_u32(&a, koff_e);
+        }
+        x64_mov_rax_u64(&a, (uint64_t)(uintptr_t)expected_keys[j]);
+        x64_b(&a, 0x49); x64_b(&a, 0x31); x64_b(&a, 0xC2); /* xor r10, rax */
+        x64_b(&a, 0x4C); x64_b(&a, 0x09); x64_b(&a, 0xD2); /* or rdx, r10 */
+      }
+      x64_b(&a, 0x48); x64_b(&a, 0x85); x64_b(&a, 0xD2); /* test rdx, rdx */
+      br_keys_all_ok = x64_jcc32(&a, 0x84); /* jz keys_all_ok */
+    }
     for (uint32_t j = 0; j < n; j++) {
       uint32_t koff_e = j * 16u;
       if (koff_e < 128u) {
@@ -961,6 +992,55 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
         done_patches[n_done++] = x64_jcc32(&a, 0x85);
       }
     }
+    if (n >= 2) {
+      x64_patch32(&a, br_keys_all_ok, a.len);
+    }
+  }
+
+  /* Branchless Superblock Type Guard for dense all-scalar list-of-dicts rows (n >= 2) */
+  int all_scalar = (!is_dict_of_dicts && n >= 2 && single_row_check &&
+                    g_jit_stub_str_sse2 != NULL && g_jit_stub_u32_long != NULL);
+  for (uint32_t j = 0; j < n && all_scalar; j++) {
+    uint8_t vt = vtypes[j];
+    if (vt != JIT_VT_INT && vt != JIT_VT_FLOAT && vt != JIT_VT_STR &&
+        vt != JIT_VT_BOOL) {
+      all_scalar = 0;
+    }
+  }
+  if (all_scalar) {
+    x64_b(&a, 0x31); x64_b(&a, 0xD2); /* xor edx, edx */
+    static const uint8_t sgroups[5] = {JIT_VT_STR, JIT_VT_INT, JIT_VT_FLOAT, JIT_VT_BOOL, JIT_VT_NONE};
+    for (int g = 0; g < 5; g++) {
+      uint8_t gvt = sgroups[g];
+      int loaded = 0;
+      for (uint32_t j = 0; j < n; j++) {
+        if (vtypes[j] != gvt) continue;
+        if (!loaded) {
+          uint64_t exp_ptr = (gvt == JIT_VT_STR) ? (uint64_t)(uintptr_t)&PyUnicode_Type :
+                             (gvt == JIT_VT_INT) ? (uint64_t)(uintptr_t)&PyLong_Type :
+                             (gvt == JIT_VT_FLOAT) ? (uint64_t)(uintptr_t)&PyFloat_Type :
+                             (gvt == JIT_VT_BOOL) ? (uint64_t)(uintptr_t)&PyBool_Type :
+                             (uint64_t)(uintptr_t)Py_None;
+          x64_mov_rax_u64(&a, exp_ptr);
+          loaded = 1;
+        }
+        uint32_t val_off = is_combined ? (j * 16u + 8u) : ((uint32_t)order[j] * 8u);
+        if (val_off < 128u) {
+          x64_b(&a, 0x4D); x64_b(&a, 0x8B); x64_b(&a, 0x4F); x64_b(&a, (uint8_t)val_off);
+        } else {
+          x64_b(&a, 0x4D); x64_b(&a, 0x8B); x64_b(&a, 0x8F); x64_u32(&a, val_off);
+        }
+        if (gvt == JIT_VT_NONE) {
+          x64_b(&a, 0x4C); x64_b(&a, 0x89); x64_b(&a, 0xC9);
+        } else {
+          x64_b(&a, 0x49); x64_b(&a, 0x8B); x64_b(&a, 0x49); x64_b(&a, (uint8_t)offsetof(PyObject, ob_type));
+        }
+        x64_b(&a, 0x48); x64_b(&a, 0x31); x64_b(&a, 0xC1); /* xor rcx, rax */
+        x64_b(&a, 0x48); x64_b(&a, 0x09); x64_b(&a, 0xCA); /* or rdx, rcx */
+      }
+    }
+    x64_b(&a, 0x48); x64_b(&a, 0x85); x64_b(&a, 0xD2); /* test rdx, rdx */
+    done_patches[n_done++] = x64_jcc32(&a, 0x85); /* jnz done */
   }
 
   /* Hoisted row buffer check */
@@ -996,6 +1076,46 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
 
     x64_emit_literal(&a, kbuf + koff[j], klen[j]);
 
+    uint8_t vt = vtypes[j];
+    if (all_scalar) {
+      if (vt == JIT_VT_NONE) {
+        x64_emit_literal(&a, "null", 4);
+      } else {
+        uint32_t val_off = is_combined ? (j * 16u + 8u) : ((uint32_t)order[j] * 8u);
+        if (val_off < 128u) {
+          x64_b(&a, 0x4D); x64_b(&a, 0x8B); x64_b(&a, 0x4F); x64_b(&a, (uint8_t)val_off);
+        } else {
+          x64_b(&a, 0x4D); x64_b(&a, 0x8B); x64_b(&a, 0x8F); x64_u32(&a, val_off);
+        }
+        if (vt == JIT_VT_BOOL) {
+          x64_mov_rax_u64(&a, (uint64_t)(uintptr_t)Py_True);
+          x64_b(&a, 0x49); x64_b(&a, 0x39); x64_b(&a, 0xC1);
+          size_t br_true = x64_jcc32(&a, 0x84);
+          x64_emit_literal(&a, "false", 5);
+          size_t br_end = x64_jmp32(&a);
+          x64_patch32(&a, br_true, a.len);
+          x64_emit_literal(&a, "true", 4);
+          x64_patch32(&a, br_end, a.len);
+        } else if (vt == JIT_VT_INT) {
+          x64_mov_rax_u64(&a, (uint64_t)(uintptr_t)g_jit_stub_u32_long);
+          x64_call_rax(&a);
+          err_patches[n_err++] = x64_jz_rax(&a);
+        } else if (vt == JIT_VT_FLOAT) {
+          x64_b(&a, 0xF2); x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0x10);
+          x64_b(&a, 0x41); x64_b(&a, (uint8_t)offsetof(PyFloatObject, ob_fval));
+          x64_b(&a, 0x4C); x64_b(&a, 0x89); x64_b(&a, 0xF7);
+          x64_mov_rax_u64(&a, (uint64_t)(uintptr_t)&cjson_jit_write_double);
+          x64_call_rax(&a);
+          x64_b(&a, 0x49); x64_b(&a, 0x89); x64_b(&a, 0xC6);
+        } else { /* JIT_VT_STR */
+          x64_mov_rax_u64(&a, (uint64_t)(uintptr_t)g_jit_stub_str_sse2);
+          x64_call_rax(&a);
+          err_patches[n_err++] = x64_jz_rax(&a);
+        }
+      }
+      continue;
+    }
+
     /* MOV R9, [R15 + val_off] */
     uint32_t val_off = is_combined ? (j * 16u + 8u) : ((uint32_t)order[j] * 8u);
     if (val_off < 128u) {
@@ -1004,7 +1124,6 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       x64_b(&a, 0x4D); x64_b(&a, 0x8B); x64_b(&a, 0x8F); x64_u32(&a, val_off);
     }
 
-    uint8_t vt = vtypes[j];
     if (vt == JIT_VT_NONE) {
       x64_mov_rax_u64(&a, (uint64_t)(uintptr_t)Py_None);
       x64_b(&a, 0x49); x64_b(&a, 0x39); x64_b(&a, 0xC1);
