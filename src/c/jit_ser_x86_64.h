@@ -359,7 +359,7 @@ static void cjson_jit_init_stubs_locked(void) {
       '\\','\\','\\','\\','\\','\\','\\','\\','\\','\\','\\','\\','\\','\\','\\','\\',
   };
 
-  uint8_t buf[2048];
+  uint8_t buf[4096];
   X64Asm a = {buf, 0, sizeof(buf)};
 
   /* ---- Stub 1: g_jit_stub_str_sse2 ---- */
@@ -411,6 +411,46 @@ static void cjson_jit_init_stubs_locked(void) {
   x64_b(&a, 0x48); x64_b(&a, 0x85); x64_b(&a, 0xD2);
   size_t br_final16 = x64_jcc32(&a, 0x84);
 
+  /* 32-byte unrolled SSE2 loop (1 pmovmskb + 1 branch per 32 bytes!) */
+  size_t loop32 = a.len;
+  x64_b(&a, 0x48); x64_b(&a, 0x83); x64_b(&a, 0xFA); x64_b(&a, 32); /* cmp rdx, 32 */
+  size_t br_to_l16 = x64_jcc32(&a, 0x82); /* jb loop16 */
+  x64_b(&a, 0xF3); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0x06); /* movdqu xmm0, [rsi] */
+  x64_b(&a, 0xF3); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0x76); x64_b(&a, 16); /* movdqu xmm6, [rsi+16] */
+  /* Check block 0 -> xmm1 */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0xCB);
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x64); x64_b(&a, 0xC8);
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0xD0);
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x74); x64_b(&a, 0xD4);
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0xEB); x64_b(&a, 0xCA);
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0xD0);
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x74); x64_b(&a, 0xD5);
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0xEB); x64_b(&a, 0xCA);
+  /* Check block 1 -> xmm7, OR into xmm1 */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0xFB); /* movdqa xmm7, xmm3 */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x64); x64_b(&a, 0xFE); /* pcmpgtb xmm7, xmm6 */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0xEB); x64_b(&a, 0xCF); /* por xmm1, xmm7 */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0xD6); /* movdqa xmm2, xmm6 */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x74); x64_b(&a, 0xD4); /* pcmpeqb xmm2, xmm4 */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0xEB); x64_b(&a, 0xCA); /* por xmm1, xmm2 */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0xD6); /* movdqa xmm2, xmm6 */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x74); x64_b(&a, 0xD5); /* pcmpeqb xmm2, xmm5 */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0xEB); x64_b(&a, 0xCA); /* por xmm1, xmm2 */
+  x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0xD7); x64_b(&a, 0xC1); /* pmovmskb eax, xmm1 */
+  x64_b(&a, 0x85); x64_b(&a, 0xC0);
+  size_t br_esc_l32 = x64_jcc32(&a, 0x85);
+  x64_b(&a, 0xF3); x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0x7F); x64_b(&a, 0x06); /* movdqu [r14], xmm0 */
+  x64_b(&a, 0xF3); x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0x7F); x64_b(&a, 0x76); x64_b(&a, 16); /* movdqu [r14+16], xmm6 */
+  x64_b(&a, 0x48); x64_b(&a, 0x83); x64_b(&a, 0xC6); x64_b(&a, 32);
+  x64_b(&a, 0x49); x64_b(&a, 0x83); x64_b(&a, 0xC6); x64_b(&a, 32);
+  x64_b(&a, 0x48); x64_b(&a, 0x83); x64_b(&a, 0xEA); x64_b(&a, 32);
+  size_t br_l32 = x64_jmp32(&a);
+  x64_patch32(&a, br_l32, loop32);
+
+  x64_patch32(&a, br_to_l16, a.len);
+  x64_b(&a, 0x48); x64_b(&a, 0x85); x64_b(&a, 0xD2); /* test rdx, rdx */
+  size_t br_to_f16 = x64_jcc32(&a, 0x8E); /* jle final16 */
+
   size_t loop16 = a.len;
   x64_b(&a, 0xF3); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0x06); /* movdqu xmm0, [rsi] */
   x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0xCB); /* movdqa xmm1, xmm3 */
@@ -433,6 +473,7 @@ static void cjson_jit_init_stubs_locked(void) {
 
   /* final16: overlapping 16B tail at [r8 - 16] */
   x64_patch32(&a, br_final16, a.len);
+  x64_patch32(&a, br_to_f16, a.len);
   x64_b(&a, 0xF3); x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0x40); x64_b(&a, (uint8_t)-16); /* movdqu xmm0, [r8-16] */
   x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x6F); x64_b(&a, 0xCB);
   x64_b(&a, 0x66); x64_b(&a, 0x0F); x64_b(&a, 0x64); x64_b(&a, 0xC8);
@@ -549,6 +590,7 @@ static void cjson_jit_init_stubs_locked(void) {
   x64_b(&a, 0xC3);
 
   /* esc_restore: r14 = r11 */
+  x64_patch32(&a, br_esc_l32, a.len);
   x64_patch32(&a, br_esc_l16, a.len);
   x64_patch32(&a, br_esc_f16, a.len);
   x64_patch32(&a, br_esc_s1, a.len);
@@ -575,7 +617,7 @@ static void cjson_jit_init_stubs_locked(void) {
 
   while ((a.len & 15u) != 0) x64_b(&a, 0x90);
 
-  /* ---- Stub 2: g_jit_stub_u32_long (-9999 .. +9999 fast path, fallback to cjson_jit_write_long) ---- */
+  /* ---- Stub 2: g_jit_stub_u32_long (-99,999,999 .. +99,999,999 magic-multiply, ZERO DIV!) ---- */
   size_t int_off = a.len;
   /* mov rcx, [r9 + lv_tag]; cmp rcx, 1; je izero */
   x64_b(&a, 0x49); x64_b(&a, 0x8B); x64_b(&a, 0x49); x64_b(&a, (uint8_t)offsetof(PyLongObject, long_value.lv_tag));
@@ -586,9 +628,9 @@ static void cjson_jit_init_stubs_locked(void) {
   x64_b(&a, 0x48); x64_b(&a, 0x83); x64_b(&a, 0xE0); x64_b(&a, (uint8_t)-3);
   x64_b(&a, 0x48); x64_b(&a, 0x83); x64_b(&a, 0xF8); x64_b(&a, (uint8_t)(1u << _PyLong_NON_SIZE_BITS));
   size_t br_islow1 = x64_jcc32(&a, 0x85);
-  /* mov eax, [r9 + ob_digit]; cmp eax, 9999; ja islow */
+  /* mov eax, [r9 + ob_digit]; cmp eax, 99999999; ja islow */
   x64_b(&a, 0x41); x64_b(&a, 0x8B); x64_b(&a, 0x41); x64_b(&a, (uint8_t)offsetof(PyLongObject, long_value.ob_digit));
-  x64_b(&a, 0x3D); x64_u32(&a, 9999u);
+  x64_b(&a, 0x3D); x64_u32(&a, 99999999u);
   size_t br_islow2 = x64_jcc32(&a, 0x87);
   /* test cl, 2; jz pos; emit '-' */
   x64_b(&a, 0xF6); x64_b(&a, 0xC1); x64_b(&a, 2);
@@ -596,13 +638,16 @@ static void cjson_jit_init_stubs_locked(void) {
   x64_b(&a, 0x41); x64_b(&a, 0xC6); x64_b(&a, 0x06); x64_b(&a, '-');
   x64_b(&a, 0x49); x64_b(&a, 0xFF); x64_b(&a, 0xC6);
   x64_patch32(&a, br_pos, a.len);
+  /* cmp eax, 9999; ja d58 */
+  x64_b(&a, 0x3D); x64_u32(&a, 9999u);
+  size_t br_d58 = x64_jcc32(&a, 0x87);
   /* cmp eax, 99; ja d34 */
   x64_b(&a, 0x83); x64_b(&a, 0xF8); x64_b(&a, 99);
   size_t br_d34 = x64_jcc32(&a, 0x87);
   /* cmp eax, 9; ja d2 */
   x64_b(&a, 0x83); x64_b(&a, 0xF8); x64_b(&a, 9);
   size_t br_d2 = x64_jcc32(&a, 0x87);
-  x64_b(&a, 0x04); x64_b(&a, '0'); /* add al, '0' */
+  x64_b(&a, 0x04); x64_b(&a, '0');
   x64_b(&a, 0x41); x64_b(&a, 0x88); x64_b(&a, 0x06);
   x64_b(&a, 0x49); x64_b(&a, 0xFF); x64_b(&a, 0xC6);
   x64_b(&a, 0x4C); x64_b(&a, 0x89); x64_b(&a, 0xF0);
@@ -610,32 +655,89 @@ static void cjson_jit_init_stubs_locked(void) {
   /* d2 */
   x64_patch32(&a, br_d2, a.len);
   x64_mov_r10_u64(&a, (uint64_t)(uintptr_t)DIGIT_PAIRS);
+  x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0xB7); x64_b(&a, 0x04); x64_b(&a, 0x42);
+  x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x89); x64_b(&a, 0x06);
+  x64_b(&a, 0x49); x64_b(&a, 0x83); x64_b(&a, 0xC6); x64_b(&a, 2);
+  x64_b(&a, 0x4C); x64_b(&a, 0x89); x64_b(&a, 0xF0);
+  x64_b(&a, 0xC3);
+  /* d34: magic multiply q = (eax * 5243) >> 19, r = eax - q*100 (ZERO DIV!) */
+  x64_patch32(&a, br_d34, a.len);
+  x64_b(&a, 0x69); x64_b(&a, 0xD0); x64_u32(&a, 5243u); /* imul edx, eax, 5243 */
+  x64_b(&a, 0xC1); x64_b(&a, 0xEA); x64_b(&a, 19); /* shr edx, 19 (edx = q) */
+  x64_b(&a, 0x6B); x64_b(&a, 0xCA); x64_b(&a, 100); /* imul ecx, edx, 100 */
+  x64_b(&a, 0x29); x64_b(&a, 0xC8); /* sub eax, ecx (eax = r) */
+  x64_mov_r10_u64(&a, (uint64_t)(uintptr_t)DIGIT_PAIRS);
+  x64_b(&a, 0x83); x64_b(&a, 0xFA); x64_b(&a, 9); /* cmp edx, 9 */
+  size_t br_d4 = x64_jcc32(&a, 0x87);
+  x64_b(&a, 0x80); x64_b(&a, 0xC2); x64_b(&a, '0'); /* add dl, '0' */
+  x64_b(&a, 0x41); x64_b(&a, 0x88); x64_b(&a, 0x16); /* mov [r14], dl */
+  x64_b(&a, 0x49); x64_b(&a, 0xFF); x64_b(&a, 0xC6);
+  size_t br_emit_r = x64_jmp32(&a);
+  x64_patch32(&a, br_d4, a.len);
+  x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0xB7); x64_b(&a, 0x14); x64_b(&a, 0x52); /* movzx edx, word [r10+rdx*2] */
+  x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x89); x64_b(&a, 0x16); /* mov [r14], dx */
+  x64_b(&a, 0x49); x64_b(&a, 0x83); x64_b(&a, 0xC6); x64_b(&a, 2);
+  x64_patch32(&a, br_emit_r, a.len);
   x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0xB7); x64_b(&a, 0x04); x64_b(&a, 0x42); /* movzx eax, word [r10+rax*2] */
   x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x89); x64_b(&a, 0x06);
   x64_b(&a, 0x49); x64_b(&a, 0x83); x64_b(&a, 0xC6); x64_b(&a, 2);
   x64_b(&a, 0x4C); x64_b(&a, 0x89); x64_b(&a, 0xF0);
   x64_b(&a, 0xC3);
-  /* d34: q = eax / 100, r = edx */
-  x64_patch32(&a, br_d34, a.len);
-  x64_b(&a, 0x31); x64_b(&a, 0xD2); /* xor edx, edx */
-  x64_b(&a, 0xB9); x64_u32(&a, 100u); /* mov ecx, 100 */
-  x64_b(&a, 0xF7); x64_b(&a, 0xF1); /* div ecx -> eax=q, edx=r */
+
+  /* d58: 10,000..99,999,999 -> hi = (rax * 0xD1B71759) >> 45, lo = rax - hi*10000 */
+  x64_patch32(&a, br_d58, a.len);
+  x64_b(&a, 0x89); x64_b(&a, 0xC1); /* mov ecx, eax (save v in rcx) */
+  x64_b(&a, 0xBA); x64_u32(&a, 0xD1B71759u); /* mov edx, 0xD1B71759 */
+  x64_b(&a, 0x48); x64_b(&a, 0x0F); x64_b(&a, 0xAF); x64_b(&a, 0xC2); /* imul rax, rdx */
+  x64_b(&a, 0x48); x64_b(&a, 0xC1); x64_b(&a, 0xE8); x64_b(&a, 45); /* shr rax, 45 (eax = hi: 1..9999) */
+  x64_b(&a, 0x69); x64_b(&a, 0xD0); x64_u32(&a, 10000u); /* imul edx, eax, 10000 */
+  x64_b(&a, 0x29); x64_b(&a, 0xD1); /* sub ecx, edx (ecx = lo: 0..9999) */
   x64_mov_r10_u64(&a, (uint64_t)(uintptr_t)DIGIT_PAIRS);
+  /* Emit hi (eax = 1..9999) */
+  x64_b(&a, 0x83); x64_b(&a, 0xF8); x64_b(&a, 99);
+  size_t br_hi34 = x64_jcc32(&a, 0x87);
   x64_b(&a, 0x83); x64_b(&a, 0xF8); x64_b(&a, 9);
-  size_t br_d4 = x64_jcc32(&a, 0x87);
+  size_t br_hi2 = x64_jcc32(&a, 0x87);
   x64_b(&a, 0x04); x64_b(&a, '0');
   x64_b(&a, 0x41); x64_b(&a, 0x88); x64_b(&a, 0x06);
   x64_b(&a, 0x49); x64_b(&a, 0xFF); x64_b(&a, 0xC6);
-  size_t br_emit_r = x64_jmp32(&a);
-  x64_patch32(&a, br_d4, a.len);
+  size_t br_do_lo1 = x64_jmp32(&a);
+  x64_patch32(&a, br_hi2, a.len);
   x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0xB7); x64_b(&a, 0x04); x64_b(&a, 0x42);
   x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x89); x64_b(&a, 0x06);
   x64_b(&a, 0x49); x64_b(&a, 0x83); x64_b(&a, 0xC6); x64_b(&a, 2);
-  x64_patch32(&a, br_emit_r, a.len);
-  /* emit r (edx) as 2 digits */
-  x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0xB7); x64_b(&a, 0x04); x64_b(&a, 0x52); /* movzx eax, word [r10+rdx*2] */
+  size_t br_do_lo2 = x64_jmp32(&a);
+  x64_patch32(&a, br_hi34, a.len);
+  x64_b(&a, 0x69); x64_b(&a, 0xD0); x64_u32(&a, 5243u);
+  x64_b(&a, 0xC1); x64_b(&a, 0xEA); x64_b(&a, 19); /* edx = hi / 100 */
+  x64_b(&a, 0x6B); x64_b(&a, 0xF2); x64_b(&a, 100); /* imul esi, edx, 100 */
+  x64_b(&a, 0x29); x64_b(&a, 0xF0); /* sub eax, esi (eax = hi % 100) */
+  x64_b(&a, 0x83); x64_b(&a, 0xFA); x64_b(&a, 9);
+  size_t br_hi4 = x64_jcc32(&a, 0x87);
+  x64_b(&a, 0x80); x64_b(&a, 0xC2); x64_b(&a, '0');
+  x64_b(&a, 0x41); x64_b(&a, 0x88); x64_b(&a, 0x16);
+  x64_b(&a, 0x49); x64_b(&a, 0xFF); x64_b(&a, 0xC6);
+  size_t br_hir = x64_jmp32(&a);
+  x64_patch32(&a, br_hi4, a.len);
+  x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0xB7); x64_b(&a, 0x14); x64_b(&a, 0x52);
+  x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x89); x64_b(&a, 0x16);
+  x64_b(&a, 0x49); x64_b(&a, 0x83); x64_b(&a, 0xC6); x64_b(&a, 2);
+  x64_patch32(&a, br_hir, a.len);
+  x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0xB7); x64_b(&a, 0x04); x64_b(&a, 0x42);
   x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x89); x64_b(&a, 0x06);
   x64_b(&a, 0x49); x64_b(&a, 0x83); x64_b(&a, 0xC6); x64_b(&a, 2);
+  /* Emit lo (ecx = 0..9999) as 4 digits */
+  x64_patch32(&a, br_do_lo1, a.len);
+  x64_patch32(&a, br_do_lo2, a.len);
+  x64_b(&a, 0x69); x64_b(&a, 0xD1); x64_u32(&a, 5243u); /* imul edx, ecx, 5243 */
+  x64_b(&a, 0xC1); x64_b(&a, 0xEA); x64_b(&a, 19); /* shr edx, 19 (lo_hi) */
+  x64_b(&a, 0x6B); x64_b(&a, 0xC2); x64_b(&a, 100); /* imul eax, edx, 100 */
+  x64_b(&a, 0x29); x64_b(&a, 0xC1); /* sub ecx, eax (lo_lo) */
+  x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0xB7); x64_b(&a, 0x14); x64_b(&a, 0x52);
+  x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x89); x64_b(&a, 0x16);
+  x64_b(&a, 0x41); x64_b(&a, 0x0F); x64_b(&a, 0xB7); x64_b(&a, 0x04); x64_b(&a, 0x4A); /* movzx eax, word [r10+rcx*2] */
+  x64_b(&a, 0x66); x64_b(&a, 0x41); x64_b(&a, 0x89); x64_b(&a, 0x46); x64_b(&a, 2); /* mov [r14+2], ax */
+  x64_b(&a, 0x49); x64_b(&a, 0x83); x64_b(&a, 0xC6); x64_b(&a, 4);
   x64_b(&a, 0x4C); x64_b(&a, 0x89); x64_b(&a, 0xF0);
   x64_b(&a, 0xC3);
   /* izero */
