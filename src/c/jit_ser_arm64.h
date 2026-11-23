@@ -366,6 +366,70 @@ static inline uint32_t a64_cbz(int rt, int32_t rel_insns) {
 static inline uint32_t a64_cbnz(int rt, int32_t rel_insns) {
   return 0xB5000000u | (((uint32_t)rel_insns & 0x7FFFFu) << 5) | (uint32_t)rt;
 }
+static inline uint32_t a64_eor_reg(int rd, int rn, int rm) {
+  return 0xCA000000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd;
+}
+static inline uint32_t a64_orr_reg(int rd, int rn, int rm) {
+  return 0xAA000000u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rd;
+}
+
+static inline int cjson_a64_try_const_val(PyObject *v, char *out_buf,
+                                          size_t *out_len, PyObject **out_ptr,
+                                          int *needs_incref) {
+  if (v == NULL) return 0;
+  *needs_incref = 0;
+  if (v == Py_None) {
+    memcpy(out_buf, "null", 4);
+    *out_len = 4;
+    *out_ptr = Py_None;
+    return 1;
+  }
+  if (v == Py_True) {
+    memcpy(out_buf, "true", 4);
+    *out_len = 4;
+    *out_ptr = Py_True;
+    return 1;
+  }
+  if (v == Py_False) {
+    memcpy(out_buf, "false", 5);
+    *out_len = 5;
+    *out_ptr = Py_False;
+    return 1;
+  }
+  PyTypeObject *tp = Py_TYPE(v);
+  if (tp == &PyLong_Type) {
+    long sval = PyLong_AsLong(v);
+    if (PyErr_Occurred()) {
+      PyErr_Clear();
+      return 0;
+    }
+    if (sval >= -5 && sval <= 256) {
+      int ilen = snprintf(out_buf, 8, "%ld", sval);
+      if (ilen > 0 && ilen <= 4) {
+        *out_len = (size_t)ilen;
+        *out_ptr = v;
+        return 1;
+      }
+    }
+    return 0;
+  }
+  if (tp == &PyUnicode_Type && PyUnicode_IS_COMPACT_ASCII(v) &&
+      Py_REFCNT(v) > 2) {
+    Py_ssize_t slen = PyUnicode_GET_LENGTH(v);
+    if (slen >= 0 && slen <= 16) {
+      out_buf[0] = '"';
+      if (copy_if_clean_short(out_buf + 1,
+                              (const char *)PyUnicode_1BYTE_DATA(v), slen)) {
+        out_buf[1 + slen] = '"';
+        *out_len = (size_t)(slen + 2);
+        *out_ptr = v;
+        *needs_incref = 1;
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
 static inline uint32_t a64_cbnz_w(int rt, int32_t rel_insns) {
   return 0x35000000u | (((uint32_t)rel_insns & 0x7FFFFu) << 5) | (uint32_t)rt;
 }
@@ -1491,12 +1555,70 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
     }
   }
 
+  int has_fused = 0;
+  uint32_t fused_end = 0;
+  size_t br_fused_done = 0;
   for (uint32_t j = 0; j < n; j++) {
     if (!single_row_check && j > 0) {
       uint8_t prev_vt = vtypes[j - 1];
       if (prev_vt == JIT_VT_DICT || prev_vt == JIT_VT_LIST ||
           prev_vt == JIT_VT_ANY || prev_vt == JIT_VT_STR) {
         a64_emit_buf_check(&a, run_max[j], err_patches, &n_err);
+      }
+    }
+
+    /* Tier-2 Constant-Folding & Literal Fusion: fuse >= 2 consecutive constant
+     * fields (None/True/False/small-int/repeated-str) into 1 branchless XOR+OR
+     * guard + 1 fused literal blit! */
+    if (!all_scalar && !has_fused && sample_vals != NULL && j + 1 < n) {
+      char fbuf[256];
+      size_t flen = 0;
+      PyObject *fptrs[16];
+      int finc[16];
+      uint32_t r = j;
+      while (r < n && (r - j) < 16) {
+        char vbuf[24];
+        size_t vlen = 0;
+        PyObject *vptr = NULL;
+        int vinc = 0;
+        if (!cjson_a64_try_const_val(sample_vals[r], vbuf, &vlen, &vptr, &vinc))
+          break;
+        if (flen + (size_t)klen[r] + vlen > sizeof(fbuf))
+          break;
+        memcpy(fbuf + flen, kbuf + koff[r], klen[r]);
+        flen += klen[r];
+        memcpy(fbuf + flen, vbuf, vlen);
+        flen += vlen;
+        fptrs[r - j] = vptr;
+        finc[r - j] = vinc;
+        r++;
+        if (!single_row_check && vtypes[r - 1] == JIT_VT_STR)
+          break;
+      }
+      uint32_t rlen = r - j;
+      if (rlen >= 2) {
+        a64_emit(&a, a64_movz(13, 0, 0)); /* X13 = 0 */
+        PyObject *last_ptr = NULL;
+        for (uint32_t k = 0; k < rlen; k++) {
+          if (finc[k]) Py_INCREF(fptrs[k]);
+          uint32_t voff = is_combined ? ((j + k) * 16u + 8u)
+                                      : ((uint32_t)order[j + k] * 8u);
+          a64_emit(&a, a64_ldr_uoff(9, 22, voff));
+          if (fptrs[k] != last_ptr) {
+            a64_load_u64(&a, 10, (uint64_t)(uintptr_t)fptrs[k]);
+            last_ptr = fptrs[k];
+          }
+          a64_emit(&a, a64_eor_reg(9, 9, 10));
+          a64_emit(&a, a64_orr_reg(13, 13, 9));
+        }
+        size_t br_fmiss = a.len;
+        a64_emit(&a, a64_cbnz(13, 0));
+        a64_emit_literal(&a, fbuf, flen);
+        br_fused_done = a.len;
+        a64_emit(&a, a64_b(0));
+        a.buf[br_fmiss] = a64_cbnz(13, (int32_t)(a.len - br_fmiss));
+        has_fused = 1;
+        fused_end = j + rlen - 1;
       }
     }
 
@@ -1769,6 +1891,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
           uint8_t sprefix[32];
 #endif
           PyObject *skeys[30];
+          PyObject *ssvals[30];
           uint32_t skused = 0;
           uint32_t sub_need = 2;
           if (sub_is_split) {
@@ -1814,6 +1937,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
 #endif
               sorder[tj] = ix;
               skeys[tj] = tk;
+              ssvals[tj] = tv;
               if (!PyUnicode_IS_COMPACT_ASCII(tk)) {
                 sub_ok = 0;
                 break;
@@ -1844,7 +1968,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
                 sub_need += (uint32_t)tkl + 38u;
               } else if (tvtp == &PyUnicode_Type) {
                 svt[tj] = JIT_VT_STR;
-                sub_need += (uint32_t)tkl + 8u;
+                sub_need += (uint32_t)tkl + 22u;
               } else if (tvtp == &PyBool_Type) {
                 svt[tj] = JIT_VT_BOOL;
                 sub_need += (uint32_t)tkl + 9u;
@@ -1903,6 +2027,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
                 skoff[tj] = (uint16_t)skused;
                 sklen[tj] = (uint16_t)(tkl + 4);
                 skeys[tj] = tk;
+                ssvals[tj] = tv;
                 PyTypeObject *tvtp = Py_TYPE(tv);
                 if (tvtp == &PyLong_Type) {
                   svt[tj] = JIT_VT_INT;
@@ -1912,7 +2037,7 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
                   sub_need += (uint32_t)tkl + 38u;
                 } else if (tvtp == &PyUnicode_Type) {
                   svt[tj] = JIT_VT_STR;
-                  sub_need += (uint32_t)tkl + 8u;
+                  sub_need += (uint32_t)tkl + 22u;
                 } else if (tvtp == &PyBool_Type) {
                   svt[tj] = JIT_VT_BOOL;
                   sub_need += (uint32_t)tkl + 9u;
@@ -2043,7 +2168,59 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
             a64_emit(&a, a64_mov(22, 15));
             a64_emit_buf_check(&a, (uint16_t)sub_need, err_patches, &n_err);
 
+            int sub_has_fused = 0;
+            uint32_t sub_fused_end = 0;
+            size_t br_sub_fused_done = 0;
             for (uint32_t k = 0; k < (uint32_t)sn; k++) {
+              if (!sub_has_fused && k + 1 < (uint32_t)sn) {
+                char fbuf[256];
+                size_t flen = 0;
+                PyObject *fptrs[16];
+                int finc[16];
+                uint32_t r = k;
+                while (r < (uint32_t)sn && (r - k) < 16) {
+                  char vbuf[24];
+                  size_t vlen = 0;
+                  PyObject *vptr = NULL;
+                  int vinc = 0;
+                  if (!cjson_a64_try_const_val(ssvals[r], vbuf, &vlen, &vptr, &vinc))
+                    break;
+                  if (flen + (size_t)sklen[r] + vlen > sizeof(fbuf))
+                    break;
+                  memcpy(fbuf + flen, skbuf + skoff[r], sklen[r]);
+                  flen += sklen[r];
+                  memcpy(fbuf + flen, vbuf, vlen);
+                  flen += vlen;
+                  fptrs[r - k] = vptr;
+                  finc[r - k] = vinc;
+                  r++;
+                }
+                uint32_t rlen = r - k;
+                if (rlen >= 2) {
+                  a64_emit(&a, a64_movz(13, 0, 0));
+                  PyObject *last_ptr = NULL;
+                  for (uint32_t m = 0; m < rlen; m++) {
+                    if (finc[m]) Py_INCREF(fptrs[m]);
+                    uint32_t svoff = sub_is_split ? ((uint32_t)sorder[k + m] * 8u)
+                                                  : ((k + m) * 16u + 8u);
+                    a64_emit(&a, a64_ldr_uoff(9, 22, svoff));
+                    if (fptrs[m] != last_ptr) {
+                      a64_load_u64(&a, 10, (uint64_t)(uintptr_t)fptrs[m]);
+                      last_ptr = fptrs[m];
+                    }
+                    a64_emit(&a, a64_eor_reg(9, 9, 10));
+                    a64_emit(&a, a64_orr_reg(13, 13, 9));
+                  }
+                  size_t br_sfmiss = a.len;
+                  a64_emit(&a, a64_cbnz(13, 0));
+                  a64_emit_literal(&a, fbuf, flen);
+                  br_sub_fused_done = a.len;
+                  a64_emit(&a, a64_b(0));
+                  a.buf[br_sfmiss] = a64_cbnz(13, (int32_t)(a.len - br_sfmiss));
+                  sub_has_fused = 1;
+                  sub_fused_end = k + rlen - 1;
+                }
+              }
               a64_emit_literal(&a, skbuf + skoff[k], sklen[k]);
               uint32_t svoff =
                   sub_is_split ? ((uint32_t)sorder[k] * 8u) : (k * 16u + 8u);
@@ -2142,6 +2319,10 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
                 a.buf[sb_e] = a64_b((int32_t)(a.len - sb_e));
               } else {
                 a64_emit_call_any(&a, err_patches, &n_err);
+              }
+              if (sub_has_fused && k == sub_fused_end) {
+                a.buf[br_sub_fused_done] = a64_b((int32_t)(a.len - br_sub_fused_done));
+                sub_has_fused = 0;
               }
             }
             a64_emit_literal(&a, "}", 1);
@@ -2318,6 +2499,10 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       }
     } else {
       a64_emit_call_any(&a, err_patches, &n_err);
+    }
+    if (has_fused && j == fused_end) {
+      a.buf[br_fused_done] = a64_b((int32_t)(a.len - br_fused_done));
+      has_fused = 0;
     }
   }
 
