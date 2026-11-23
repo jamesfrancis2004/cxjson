@@ -3086,6 +3086,9 @@ static char *encode_array_fast(JsonBuffer *b, char *dst, char **safe_end_p,
         }
         Py_ssize_t end_i = i + chunk;
         for (; i < end_i; i++) {
+#if defined(__GNUC__) || defined(__clang__)
+          if (i + 4 < end_i) __builtin_prefetch(items[i + 4], 0, 0);
+#endif
           PyObject *item = items[i];
           if (CJSON_UNLIKELY(Py_TYPE(item) != &PyFloat_Type))
             goto general_loop;
@@ -3097,6 +3100,63 @@ static char *encode_array_fast(JsonBuffer *b, char *dst, char **safe_end_p,
             dst += 4;
           }
           *dst++ = ',';
+        }
+      }
+      dst[-1] = ']';
+      b->depth--;
+      *safe_end_p = safe_end;
+      return dst;
+    }
+    if (tp0 == &PyList_Type && PyList_GET_SIZE(items[0]) == 2 &&
+        Py_TYPE(PyList_GET_ITEM(items[0], 0)) == &PyFloat_Type &&
+        Py_TYPE(PyList_GET_ITEM(items[0], 1)) == &PyFloat_Type) {
+      /* Fast path for GeoJSON / geometry coordinate rings: [[lon, lat], ...] */
+      while (i < len) {
+        Py_ssize_t rem = len - i;
+        Py_ssize_t chunk = (rem > 32) ? 32 : rem;
+        if (CJSON_UNLIKELY(dst + chunk * 80 + 128 > b->data + b->cap)) {
+          b->len = (Py_ssize_t)(dst - b->data);
+          if (json_buffer_grow(b, b->len + chunk * 80 + 256) < 0) {
+            b->depth--;
+            return NULL;
+          }
+          dst = b->data + b->len;
+          safe_end = b->data + b->cap - 128;
+        }
+        Py_ssize_t end_i = i + chunk;
+        for (; i < end_i; i++) {
+#if defined(__GNUC__) || defined(__clang__)
+          if (i + 4 < end_i) __builtin_prefetch(items[i + 4], 0, 0);
+#endif
+          PyObject *item = items[i];
+          if (CJSON_UNLIKELY(Py_TYPE(item) != &PyList_Type ||
+                             PyList_GET_SIZE(item) != 2))
+            goto general_loop;
+          PyObject **p2 = ((PyListObject *)item)->ob_item;
+          PyObject *f0 = p2[0];
+          PyObject *f1 = p2[1];
+          if (CJSON_UNLIKELY(Py_TYPE(f0) != &PyFloat_Type ||
+                             Py_TYPE(f1) != &PyFloat_Type))
+            goto general_loop;
+          *dst++ = '[';
+          double d0 = PyFloat_AS_DOUBLE(f0);
+          if (CJSON_LIKELY(!isnan(d0) && !isinf(d0))) {
+            dst = write_double_fast(d0, dst);
+          } else {
+            memcpy(dst, "null", 4);
+            dst += 4;
+          }
+          *dst++ = ',';
+          double d1 = PyFloat_AS_DOUBLE(f1);
+          if (CJSON_LIKELY(!isnan(d1) && !isinf(d1))) {
+            dst = write_double_fast(d1, dst);
+          } else {
+            memcpy(dst, "null", 4);
+            dst += 4;
+          }
+          dst[0] = ']';
+          dst[1] = ',';
+          dst += 2;
         }
       }
       dst[-1] = ']';

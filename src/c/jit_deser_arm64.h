@@ -440,8 +440,8 @@ static void da64_emit_call_5(DjitAsm *a, uint64_t fn_addr, uint32_t child_slot,
   da64_emit(a, da64_cbz(0, 0));
 }
 
-#define CJSON_DJIT_POOL_BYTES (1024 * 1024)
-#define CJSON_DJIT_CACHE_SLOTS 256
+#define CJSON_DJIT_POOL_BYTES (2 * 1024 * 1024)
+#define CJSON_DJIT_CACHE_SLOTS 512
 
 typedef struct {
   uint64_t sig_hash;
@@ -477,9 +477,9 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(
     h = (h ^ ((uint64_t)vkinds[j] << 8) ^ sc->keys[j].w0) * 0xBF58476D1CE4E5B9ULL;
   }
 
-  uint32_t set_base = (uint32_t)(h & (CJSON_DJIT_CACHE_SLOTS - 2u));
+  uint32_t set_base = (uint32_t)(h & (CJSON_DJIT_CACHE_SLOTS - 4u));
   uint32_t occupied = 0;
-  for (uint32_t w = 0; w < 2; w++) {
+  for (uint32_t w = 0; w < 4; w++) {
     DjitSchemaEntry *e = &g_djit_cache[set_base + w];
     CJsonJitDeserLoopFn fn = __atomic_load_n(&e->fn, __ATOMIC_ACQUIRE);
     if (fn != NULL) {
@@ -491,14 +491,14 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(
       }
     }
   }
-  if (occupied == 2 || __atomic_load_n(&g_djit_pool_full, __ATOMIC_RELAXED)) {
+  if (occupied == 4 || __atomic_load_n(&g_djit_pool_full, __ATOMIC_RELAXED)) {
     return NULL;
   }
 
   pthread_mutex_lock(&g_djit_mu);
   cjson_djit_init_globals();
 
-  for (uint32_t w = 0; w < 2; w++) {
+  for (uint32_t w = 0; w < 4; w++) {
     DjitSchemaEntry *e = &g_djit_cache[set_base + w];
     if (e->fn != NULL && e->sig_hash == h && e->dk == sc->shared_keys && e->n == n &&
         e->is_pretty == (uint8_t)is_pretty && e->is_single == (uint8_t)is_single &&
@@ -510,7 +510,7 @@ static CJsonJitDeserLoopFn cjson_deser_jit_get_or_compile(
   }
 
   uint32_t target_idx = CJSON_DJIT_CACHE_SLOTS;
-  for (uint32_t w = 0; w < 2; w++) {
+  for (uint32_t w = 0; w < 4; w++) {
     if (g_djit_cache[set_base + w].fn == NULL) {
       target_idx = set_base + w;
       break;
