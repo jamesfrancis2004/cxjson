@@ -1579,6 +1579,30 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       a.buf[br_end1] = a64_b((int32_t)(a.len - br_end1));
       a.buf[br_end2] = a64_b((int32_t)(a.len - br_end2));
     } else if (vt == JIT_VT_INT) {
+      /* Speculative immortal small-int folding (-5..256): 1-cycle ptr compare skips ob_type + int stub! */
+      int has_cint = 0;
+      size_t br_cint_done = 0;
+      if (sample_vals != NULL && sample_vals[j] != NULL &&
+          Py_TYPE(sample_vals[j]) == &PyLong_Type) {
+        long sval = PyLong_AsLong(sample_vals[j]);
+        if (PyErr_Occurred()) {
+          PyErr_Clear();
+        } else if (sval >= -5 && sval <= 256) {
+          char ibuf[8];
+          int ilen = snprintf(ibuf, sizeof(ibuf), "%ld", sval);
+          if (ilen > 0 && ilen <= 4) {
+            a64_load_u64(&a, 10, (uint64_t)(uintptr_t)sample_vals[j]);
+            a64_emit(&a, a64_cmp_reg(9, 10));
+            size_t br_cint_miss = a.len;
+            a64_emit(&a, a64_b_cond(1, 0));
+            a64_emit_literal(&a, ibuf, (size_t)ilen);
+            br_cint_done = a.len;
+            a64_emit(&a, a64_b(0));
+            a.buf[br_cint_miss] = a64_b_cond(1, (int32_t)(a.len - br_cint_miss));
+            has_cint = 1;
+          }
+        }
+      }
       a64_emit(&a, a64_ldr_uoff(10, 9, (uint32_t)offsetof(PyObject, ob_type)));
       a64_load_u64(&a, 11, (uint64_t)(uintptr_t)&PyLong_Type);
       a64_emit(&a, a64_cmp_reg(10, 11));
@@ -1613,6 +1637,9 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       a64_emit_call_any(&a, err_patches, &n_err);
       a.buf[br_end1] = a64_b((int32_t)(a.len - br_end1));
       a.buf[br_end2] = a64_b((int32_t)(a.len - br_end2));
+      if (has_cint) {
+        a.buf[br_cint_done] = a64_b((int32_t)(a.len - br_cint_done));
+      }
     } else if (vt == JIT_VT_FLOAT) {
       a64_emit(&a, a64_ldr_uoff(10, 9, (uint32_t)offsetof(PyObject, ob_type)));
       a64_load_u64(&a, 11, (uint64_t)(uintptr_t)&PyFloat_Type);
@@ -2177,6 +2204,83 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       size_t br_end1 = a.len;
       a64_emit(&a, a64_b(0));
       a.buf[br_nonempty] = a64_cbnz(10, (int32_t)(a.len - br_nonempty));
+      /* Inline 1..2 element homogeneous list[str] or list[int] (zero C call!) */
+      int inlined_list = 0;
+      size_t br_l_done1 = 0, br_l_done2 = 0;
+      if (sample_vals != NULL && sample_vals[j] != NULL &&
+          Py_TYPE(sample_vals[j]) == &PyList_Type &&
+          PyList_GET_SIZE(sample_vals[j]) >= 1) {
+        PyTypeObject *etp = Py_TYPE(PyList_GET_ITEM(sample_vals[j], 0));
+        void *estub = (etp == &PyUnicode_Type) ? g_jit_stub_str_neon :
+                      (etp == &PyLong_Type) ? g_jit_stub_u32_long : NULL;
+        if (estub != NULL) {
+          /* X10 = ob_size (already loaded!). Check ob_size == 1 or == 2 */
+          a64_emit(&a, a64_cmp_x_imm(10, 1));
+          size_t br_not_1 = a.len;
+          a64_emit(&a, a64_b_cond(1, 0));
+          /* len == 1 fast path */
+          a64_emit(&a, a64_ldr_uoff(13, 9, (uint32_t)offsetof(PyListObject, ob_item)));
+          a64_emit(&a, a64_ldr_uoff(14, 13, 0)); /* X14 = items[0] */
+          a64_emit(&a, a64_ldr_uoff(11, 14, (uint32_t)offsetof(PyObject, ob_type)));
+          a64_load_u64(&a, 12, (uint64_t)(uintptr_t)etp);
+          a64_emit(&a, a64_cmp_reg(11, 12));
+          size_t br_f1 = a.len;
+          a64_emit(&a, a64_b_cond(1, 0));
+          a64_emit(&a, a64_str_x_uoff(22, 31, 96)); /* save parent X22 */
+          a64_emit(&a, a64_mov(22, 14)); /* callee-saved across buf_check */
+          a64_emit_buf_check(&a, 64, err_patches, &n_err);
+          a64_emit_literal(&a, "[", 1);
+          a64_emit(&a, a64_mov(9, 22));
+          a64_emit_call_stub(&a, estub, planned_dest);
+          err_patches[n_err++] = a.len;
+          a64_emit(&a, a64_cbz(0, 0));
+          a64_emit_literal(&a, "]", 1);
+          a64_emit(&a, a64_ldr_uoff(22, 31, 96)); /* restore parent X22 */
+          br_l_done1 = a.len;
+          a64_emit(&a, a64_b(0));
+
+          /* len == 2 fast path */
+          a.buf[br_not_1] = a64_b_cond(1, (int32_t)(a.len - br_not_1));
+          a64_emit(&a, a64_cmp_x_imm(10, 2));
+          size_t br_not_2 = a.len;
+          a64_emit(&a, a64_b_cond(1, 0));
+          a64_emit(&a, a64_ldr_uoff(13, 9, (uint32_t)offsetof(PyListObject, ob_item)));
+          a64_emit(&a, a64_ldr_uoff(14, 13, 0));
+          a64_emit(&a, a64_ldr_uoff(15, 13, 8));
+          a64_load_u64(&a, 12, (uint64_t)(uintptr_t)etp);
+          a64_emit(&a, a64_ldr_uoff(11, 14, (uint32_t)offsetof(PyObject, ob_type)));
+          a64_emit(&a, a64_cmp_reg(11, 12));
+          size_t br_f2a = a.len;
+          a64_emit(&a, a64_b_cond(1, 0));
+          a64_emit(&a, a64_ldr_uoff(11, 15, (uint32_t)offsetof(PyObject, ob_type)));
+          a64_emit(&a, a64_cmp_reg(11, 12));
+          size_t br_f2b = a.len;
+          a64_emit(&a, a64_b_cond(1, 0));
+          a64_emit(&a, a64_str_x_uoff(22, 31, 96)); /* save parent X22 */
+          a64_emit(&a, a64_mov(22, 13)); /* X22 = ob_item */
+          a64_emit_buf_check(&a, 96, err_patches, &n_err);
+          a64_emit_literal(&a, "[", 1);
+          a64_emit(&a, a64_ldr_uoff(9, 22, 0));
+          a64_emit_call_stub(&a, estub, planned_dest);
+          err_patches[n_err++] = a.len;
+          a64_emit(&a, a64_cbz(0, 0));
+          a64_emit_literal(&a, ",", 1);
+          a64_emit(&a, a64_ldr_uoff(9, 22, 8));
+          a64_emit_call_stub(&a, estub, planned_dest);
+          err_patches[n_err++] = a.len;
+          a64_emit(&a, a64_cbz(0, 0));
+          a64_emit_literal(&a, "]", 1);
+          a64_emit(&a, a64_ldr_uoff(22, 31, 96)); /* restore parent X22 */
+          br_l_done2 = a.len;
+          a64_emit(&a, a64_b(0));
+
+          a.buf[br_f1] = a64_b_cond(1, (int32_t)(a.len - br_f1));
+          a.buf[br_not_2] = a64_b_cond(1, (int32_t)(a.len - br_not_2));
+          a.buf[br_f2a] = a64_b_cond(1, (int32_t)(a.len - br_f2a));
+          a.buf[br_f2b] = a64_b_cond(1, (int32_t)(a.len - br_f2b));
+          inlined_list = 1;
+        }
+      }
       a64_emit(&a, a64_mov(0, 25));
       a64_emit(&a, a64_mov(1, 20));
       a64_emit(&a, a64_mov(2, 28));
@@ -2202,6 +2306,10 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       a.buf[br_end1] = a64_b((int32_t)(a.len - br_end1));
       a.buf[br_end2] = a64_b((int32_t)(a.len - br_end2));
       a.buf[br_end3] = a64_b((int32_t)(a.len - br_end3));
+      if (inlined_list) {
+        a.buf[br_l_done1] = a64_b((int32_t)(a.len - br_l_done1));
+        a.buf[br_l_done2] = a64_b((int32_t)(a.len - br_l_done2));
+      }
     } else {
       a64_emit_call_any(&a, err_patches, &n_err);
     }

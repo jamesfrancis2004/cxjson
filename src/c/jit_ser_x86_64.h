@@ -1151,6 +1151,27 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       x64_patch32(&a, br_end1, a.len);
       x64_patch32(&a, br_end2, a.len);
     } else if (vt == JIT_VT_INT) {
+      int has_cint = 0;
+      size_t br_cint_done = 0;
+      if (sample_vals != NULL && sample_vals[j] != NULL &&
+          Py_TYPE(sample_vals[j]) == &PyLong_Type) {
+        long sval = PyLong_AsLong(sample_vals[j]);
+        if (PyErr_Occurred()) {
+          PyErr_Clear();
+        } else if (sval >= -5 && sval <= 256) {
+          char ibuf[8];
+          int ilen = snprintf(ibuf, sizeof(ibuf), "%ld", sval);
+          if (ilen > 0 && ilen <= 4) {
+            x64_mov_rax_u64(&a, (uint64_t)(uintptr_t)sample_vals[j]);
+            x64_b(&a, 0x49); x64_b(&a, 0x39); x64_b(&a, 0xC1); /* cmp r9, rax */
+            size_t br_cint_miss = x64_jcc32(&a, 0x85);
+            x64_emit_literal(&a, ibuf, (size_t)ilen);
+            br_cint_done = x64_jmp32(&a);
+            x64_patch32(&a, br_cint_miss, a.len);
+            has_cint = 1;
+          }
+        }
+      }
       x64_mov_rax_u64(&a, (uint64_t)(uintptr_t)&PyLong_Type);
       x64_b(&a, 0x49); x64_b(&a, 0x39); x64_b(&a, 0x41); x64_b(&a, (uint8_t)offsetof(PyObject, ob_type));
       size_t br_not_int = x64_jcc32(&a, 0x85);
@@ -1177,6 +1198,9 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       x64_emit_call_4(&a, (uint64_t)(uintptr_t)&cjson_jit_encode_any, err_patches, &n_err);
       x64_patch32(&a, br_end1, a.len);
       x64_patch32(&a, br_end2, a.len);
+      if (has_cint) {
+        x64_patch32(&a, br_cint_done, a.len);
+      }
     } else if (vt == JIT_VT_FLOAT) {
       x64_mov_rax_u64(&a, (uint64_t)(uintptr_t)&PyFloat_Type);
       x64_b(&a, 0x49); x64_b(&a, 0x39); x64_b(&a, 0x41); x64_b(&a, (uint8_t)offsetof(PyObject, ob_type));
@@ -1556,6 +1580,72 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       x64_emit_literal(&a, "[]", 2);
       size_t br_end1 = x64_jmp32(&a);
       x64_patch32(&a, br_ne, a.len);
+      /* Inline 1..2 element homogeneous list[str] or list[int] (zero C call!) */
+      int inlined_list = 0;
+      size_t br_l_done1 = 0, br_l_done2 = 0;
+      if (sample_vals != NULL && sample_vals[j] != NULL &&
+          Py_TYPE(sample_vals[j]) == &PyList_Type &&
+          PyList_GET_SIZE(sample_vals[j]) >= 1) {
+        PyTypeObject *etp = Py_TYPE(PyList_GET_ITEM(sample_vals[j], 0));
+        void *estub = (etp == &PyUnicode_Type) ? g_jit_stub_str_sse2 :
+                      (etp == &PyLong_Type) ? g_jit_stub_u32_long : NULL;
+        if (estub != NULL) {
+          /* len == 1 */
+          x64_b(&a, 0x49); x64_b(&a, 0x83); x64_b(&a, 0x79); x64_b(&a, (uint8_t)offsetof(PyVarObject, ob_size)); x64_b(&a, 1);
+          size_t br_not_1 = x64_jcc32(&a, 0x85);
+          x64_b(&a, 0x4D); x64_b(&a, 0x8B); x64_b(&a, 0x51); x64_b(&a, (uint8_t)offsetof(PyListObject, ob_item)); /* mov r10, [r9+ob_item] */
+          x64_b(&a, 0x4D); x64_b(&a, 0x8B); x64_b(&a, 0x1A); /* mov r11, [r10] */
+          x64_mov_rax_u64(&a, (uint64_t)(uintptr_t)etp);
+          x64_b(&a, 0x49); x64_b(&a, 0x39); x64_b(&a, 0x43); x64_b(&a, (uint8_t)offsetof(PyObject, ob_type)); /* cmp [r11+ob_type], rax */
+          size_t br_f1 = x64_jcc32(&a, 0x85);
+          x64_b(&a, 0x4C); x64_b(&a, 0x89); x64_b(&a, 0x7C); x64_b(&a, 0x24); x64_b(&a, 32); /* save r15 */
+          x64_b(&a, 0x4D); x64_b(&a, 0x89); x64_b(&a, 0xDF); /* mov r15, r11 (callee-saved across buf_check) */
+          x64_emit_buf_check(&a, 64, err_patches, &n_err);
+          x64_emit_literal(&a, "[", 1);
+          x64_b(&a, 0x4D); x64_b(&a, 0x89); x64_b(&a, 0xF9); /* mov r9, r15 */
+          x64_mov_rax_u64(&a, (uint64_t)(uintptr_t)estub);
+          x64_call_rax(&a);
+          err_patches[n_err++] = x64_jz_rax(&a);
+          x64_emit_literal(&a, "]", 1);
+          x64_b(&a, 0x4C); x64_b(&a, 0x8B); x64_b(&a, 0x7C); x64_b(&a, 0x24); x64_b(&a, 32); /* restore r15 */
+          br_l_done1 = x64_jmp32(&a);
+
+          /* len == 2 */
+          x64_patch32(&a, br_not_1, a.len);
+          x64_b(&a, 0x49); x64_b(&a, 0x83); x64_b(&a, 0x79); x64_b(&a, (uint8_t)offsetof(PyVarObject, ob_size)); x64_b(&a, 2);
+          size_t br_not_2 = x64_jcc32(&a, 0x85);
+          x64_b(&a, 0x4D); x64_b(&a, 0x8B); x64_b(&a, 0x51); x64_b(&a, (uint8_t)offsetof(PyListObject, ob_item)); /* mov r10, [r9+ob_item] */
+          x64_b(&a, 0x4D); x64_b(&a, 0x8B); x64_b(&a, 0x1A); /* mov r11, [r10] */
+          x64_mov_rax_u64(&a, (uint64_t)(uintptr_t)etp);
+          x64_b(&a, 0x49); x64_b(&a, 0x39); x64_b(&a, 0x43); x64_b(&a, (uint8_t)offsetof(PyObject, ob_type));
+          size_t br_f2a = x64_jcc32(&a, 0x85);
+          x64_b(&a, 0x4D); x64_b(&a, 0x8B); x64_b(&a, 0x5A); x64_b(&a, 8); /* mov r11, [r10+8] */
+          x64_b(&a, 0x49); x64_b(&a, 0x39); x64_b(&a, 0x43); x64_b(&a, (uint8_t)offsetof(PyObject, ob_type));
+          size_t br_f2b = x64_jcc32(&a, 0x85);
+          x64_b(&a, 0x4C); x64_b(&a, 0x89); x64_b(&a, 0x7C); x64_b(&a, 0x24); x64_b(&a, 32); /* mov [rsp+32], r15 */
+          x64_b(&a, 0x4D); x64_b(&a, 0x89); x64_b(&a, 0xD7); /* mov r15, r10 (ob_item) */
+          x64_emit_buf_check(&a, 96, err_patches, &n_err);
+          x64_emit_literal(&a, "[", 1);
+          x64_b(&a, 0x4D); x64_b(&a, 0x8B); x64_b(&a, 0x0F); /* mov r9, [r15] */
+          x64_mov_rax_u64(&a, (uint64_t)(uintptr_t)estub);
+          x64_call_rax(&a);
+          err_patches[n_err++] = x64_jz_rax(&a);
+          x64_emit_literal(&a, ",", 1);
+          x64_b(&a, 0x4D); x64_b(&a, 0x8B); x64_b(&a, 0x4F); x64_b(&a, 8); /* mov r9, [r15+8] */
+          x64_mov_rax_u64(&a, (uint64_t)(uintptr_t)estub);
+          x64_call_rax(&a);
+          err_patches[n_err++] = x64_jz_rax(&a);
+          x64_emit_literal(&a, "]", 1);
+          x64_b(&a, 0x4C); x64_b(&a, 0x8B); x64_b(&a, 0x7C); x64_b(&a, 0x24); x64_b(&a, 32); /* restore r15 */
+          br_l_done2 = x64_jmp32(&a);
+
+          x64_patch32(&a, br_f1, a.len);
+          x64_patch32(&a, br_not_2, a.len);
+          x64_patch32(&a, br_f2a, a.len);
+          x64_patch32(&a, br_f2b, a.len);
+          inlined_list = 1;
+        }
+      }
       x64_emit_call_4(&a, (uint64_t)(uintptr_t)&cjson_jit_encode_array, err_patches, &n_err);
       size_t br_end2 = x64_jmp32(&a);
       x64_patch32(&a, br_not_list, a.len);
@@ -1569,6 +1659,10 @@ static CJsonJitSplitLoopFn cjson_jit_get_or_compile_impl(
       x64_patch32(&a, br_end1, a.len);
       x64_patch32(&a, br_end2, a.len);
       x64_patch32(&a, br_end3, a.len);
+      if (inlined_list) {
+        x64_patch32(&a, br_l_done1, a.len);
+        x64_patch32(&a, br_l_done2, a.len);
+      }
     } else {
       x64_emit_call_4(&a, (uint64_t)(uintptr_t)&cjson_jit_encode_any, err_patches, &n_err);
     }
